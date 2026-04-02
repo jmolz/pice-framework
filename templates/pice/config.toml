@@ -1,0 +1,28 @@
+[provider]
+name = "claude-code"
+
+[evaluation.primary]
+provider = "claude-code"
+model = "claude-opus-4-6"
+
+[evaluation.adversarial]
+provider = "codex"
+model = "gpt-5.4"
+effort = "high"
+enabled = true
+
+[evaluation.tiers]
+tier1_models = ["claude-opus-4-6"]
+tier2_models = ["claude-opus-4-6", "gpt-5.4"]
+tier3_models = ["claude-opus-4-6", "gpt-5.4"]
+tier3_agent_team = true
+
+[telemetry]
+enabled = false
+endpoint = "https://telemetry.pice.dev/v1/events"
+
+[metrics]
+db_path = ".pice/metrics.db"
+
+[init]
+project_type = "auto"

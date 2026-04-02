@@ -1,0 +1,99 @@
+use crate::config::PiceConfig;
+use std::path::PathBuf;
+
+/// A resolved provider command and args.
+/// Used by workflow commands (plan, execute, evaluate) in Phase 2+.
+#[allow(dead_code)]
+pub struct ResolvedProvider {
+    pub command: String,
+    pub args: Vec<String>,
+}
+
+/// Find the workspace root by looking for `packages/` relative to the binary.
+///
+/// Falls back to the current working directory if the binary location
+/// cannot be determined (e.g., running via `cargo run`).
+#[allow(dead_code)]
+fn find_provider_base() -> PathBuf {
+    // Try relative to the binary itself (works for installed binaries)
+    if let Ok(exe) = std::env::current_exe() {
+        // exe is at target/debug/pice or target/release/pice or /usr/local/bin/pice
+        // Walk up looking for packages/ directory
+        let mut dir = exe.parent().map(|p| p.to_path_buf());
+        for _ in 0..5 {
+            if let Some(ref d) = dir {
+                if d.join("packages").is_dir() {
+                    return d.clone();
+                }
+                dir = d.parent().map(|p| p.to_path_buf());
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Fall back to CWD (works during development with `cargo run`)
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Resolve a provider name to its command/args for spawning.
+///
+/// Locates provider binaries relative to the pice binary's own location,
+/// falling back to CWD for development. In the future, this could scan
+/// node_modules, a plugin directory, or a provider registry.
+/// Used by workflow commands in Phase 2+.
+#[allow(dead_code)]
+pub fn resolve(name: &str, _config: &PiceConfig) -> Option<ResolvedProvider> {
+    let base = find_provider_base();
+
+    let provider_path = |pkg: &str| -> String {
+        base.join(format!("packages/{pkg}/dist/bin.js"))
+            .to_string_lossy()
+            .to_string()
+    };
+
+    match name {
+        "stub" => Some(ResolvedProvider {
+            command: "node".to_string(),
+            args: vec![provider_path("provider-stub")],
+        }),
+        "claude-code" => Some(ResolvedProvider {
+            command: "node".to_string(),
+            args: vec![provider_path("provider-claude-code")],
+        }),
+        "codex" => Some(ResolvedProvider {
+            command: "node".to_string(),
+            args: vec![provider_path("provider-codex")],
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_stub_provider() {
+        let config = PiceConfig::default();
+        let resolved = resolve("stub", &config);
+        assert!(resolved.is_some());
+        let r = resolved.unwrap();
+        assert_eq!(r.command, "node");
+        assert!(r.args[0].contains("provider-stub"));
+        assert!(r.args[0].contains("dist/bin.js"));
+    }
+
+    #[test]
+    fn resolve_unknown_provider_returns_none() {
+        let config = PiceConfig::default();
+        assert!(resolve("nonexistent", &config).is_none());
+    }
+
+    #[test]
+    fn find_provider_base_returns_a_path() {
+        let base = find_provider_base();
+        // Should return something (either workspace root or CWD)
+        assert!(base.is_absolute() || base == PathBuf::from("."));
+    }
+}

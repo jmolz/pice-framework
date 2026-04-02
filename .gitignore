@@ -1,0 +1,29 @@
+# Rust
+target/
+Cargo.lock
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# PICE local state
+.pice/
+
+# Claude Code user-local files
+.remember/
+.claude/skills/
+
+# Environment
+.env
+.env.local

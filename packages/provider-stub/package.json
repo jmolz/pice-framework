@@ -1,0 +1,31 @@
+{
+  "name": "@pice/provider-stub",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Echo provider for testing the PICE protocol without an AI SDK",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "pice-provider-stub": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pice/provider-protocol": "workspace:*",
+    "@pice/provider-base": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

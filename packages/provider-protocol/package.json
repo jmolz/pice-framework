@@ -1,0 +1,24 @@
+{
+  "name": "@pice/provider-protocol",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "JSON-RPC 2.0 protocol types for the PICE provider interface",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

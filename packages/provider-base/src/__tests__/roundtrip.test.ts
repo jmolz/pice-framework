@@ -1,0 +1,232 @@
+import { describe, it, expect } from 'vitest';
+import type {
+  JsonRpcRequest,
+  JsonRpcResponse,
+  JsonRpcErrorResponse,
+  JsonRpcNotification,
+  InitializeParams,
+  InitializeResult,
+  ProviderCapabilities,
+  SessionCreateParams,
+  SessionCreateResult,
+  SessionSendParams,
+  ResponseChunkParams,
+  ResponseCompleteParams,
+  EvaluateCreateParams,
+  CriterionScore,
+  EvaluateResultParams,
+} from '@pice/provider-protocol';
+import {
+  PARSE_ERROR,
+  METHOD_NOT_FOUND,
+  PROVIDER_NOT_INITIALIZED,
+  SESSION_NOT_FOUND,
+} from '@pice/provider-protocol';
+
+// These tests verify that our TS types can correctly serialize/deserialize
+// the exact same wire format that the Rust pice-protocol crate produces.
+
+describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
+  it('JsonRpcRequest roundtrip', () => {
+    const req: JsonRpcRequest = {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'session/create',
+      params: { workingDirectory: '/tmp/project' },
+    };
+    const json = JSON.stringify(req);
+    const parsed: JsonRpcRequest = JSON.parse(json);
+    expect(parsed.jsonrpc).toBe('2.0');
+    expect(parsed.id).toBe(1);
+    expect(parsed.method).toBe('session/create');
+  });
+
+  it('JsonRpcRequest with string id', () => {
+    const req: JsonRpcRequest = {
+      jsonrpc: '2.0',
+      id: 'abc-123',
+      method: 'initialize',
+      params: { config: {} },
+    };
+    const json = JSON.stringify(req);
+    const parsed: JsonRpcRequest = JSON.parse(json);
+    expect(parsed.id).toBe('abc-123');
+  });
+
+  it('JsonRpcResponse roundtrip', () => {
+    const resp: JsonRpcResponse = {
+      jsonrpc: '2.0',
+      id: 1,
+      result: { sessionId: 'abc-123' },
+    };
+    const json = JSON.stringify(resp);
+    const parsed: JsonRpcResponse = JSON.parse(json);
+    expect(parsed.id).toBe(1);
+    expect((parsed.result as { sessionId: string }).sessionId).toBe('abc-123');
+  });
+
+  it('JsonRpcErrorResponse roundtrip', () => {
+    const resp: JsonRpcErrorResponse = {
+      jsonrpc: '2.0',
+      id: 1,
+      error: { code: METHOD_NOT_FOUND, message: 'method not found: foo/bar' },
+    };
+    const json = JSON.stringify(resp);
+    const parsed: JsonRpcErrorResponse = JSON.parse(json);
+    expect(parsed.error.code).toBe(-32601);
+  });
+
+  it('JsonRpcErrorResponse with null id', () => {
+    const resp: JsonRpcErrorResponse = {
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: PARSE_ERROR, message: 'invalid JSON' },
+    };
+    const json = JSON.stringify(resp);
+    expect(json).toContain('"id":null');
+  });
+
+  it('JsonRpcNotification roundtrip (no id)', () => {
+    const notif: JsonRpcNotification = {
+      jsonrpc: '2.0',
+      method: 'response/chunk',
+      params: { sessionId: 'abc-123', text: 'Hello' },
+    };
+    const json = JSON.stringify(notif);
+    expect(json).not.toContain('"id"');
+    const parsed: JsonRpcNotification = JSON.parse(json);
+    expect(parsed.method).toBe('response/chunk');
+  });
+
+  it('InitializeParams/Result roundtrip', () => {
+    const params: InitializeParams = { config: { apiKey: 'test' } };
+    const result: InitializeResult = {
+      capabilities: {
+        workflow: true,
+        evaluation: true,
+        agentTeams: false,
+        models: ['claude-opus-4-6'],
+        defaultEvalModel: 'claude-opus-4-6',
+      },
+      version: '0.1.0',
+    };
+    const paramsJson = JSON.stringify(params);
+    const resultJson = JSON.stringify(result);
+    expect(JSON.parse(paramsJson)).toEqual(params);
+    expect(JSON.parse(resultJson)).toEqual(result);
+  });
+
+  it('ProviderCapabilities uses camelCase keys', () => {
+    const caps: ProviderCapabilities = {
+      workflow: true,
+      evaluation: false,
+      agentTeams: true,
+      models: [],
+    };
+    const json = JSON.stringify(caps);
+    expect(json).toContain('"agentTeams"');
+    expect(json).not.toContain('"agent_teams"');
+  });
+
+  it('SessionCreate params/result roundtrip', () => {
+    const params: SessionCreateParams = { workingDirectory: '/tmp/project' };
+    const result: SessionCreateResult = { sessionId: 'session-abc' };
+    const paramsJson = JSON.stringify(params);
+    expect(paramsJson).toContain('"workingDirectory"');
+    const resultJson = JSON.stringify(result);
+    expect(resultJson).toContain('"sessionId"');
+  });
+
+  it('SessionSend params roundtrip', () => {
+    const params: SessionSendParams = { sessionId: 's1', message: 'test' };
+    const json = JSON.stringify(params);
+    const parsed: SessionSendParams = JSON.parse(json);
+    expect(parsed.sessionId).toBe('s1');
+    expect(parsed.message).toBe('test');
+  });
+
+  it('ResponseChunk params roundtrip', () => {
+    const params: ResponseChunkParams = { sessionId: 's1', text: 'Hello world' };
+    const json = JSON.stringify(params);
+    const parsed: ResponseChunkParams = JSON.parse(json);
+    expect(parsed.text).toBe('Hello world');
+  });
+
+  it('ResponseComplete params roundtrip', () => {
+    const params: ResponseCompleteParams = {
+      sessionId: 's1',
+      result: { planPath: '.claude/plans/auth.md' },
+    };
+    const json = JSON.stringify(params);
+    const parsed: ResponseCompleteParams = JSON.parse(json);
+    expect(parsed.sessionId).toBe('s1');
+  });
+
+  it('EvaluateCreate params roundtrip', () => {
+    const params: EvaluateCreateParams = {
+      contract: { criteria: [] },
+      diff: '+added line',
+      claudeMd: '# Rules',
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"claudeMd"');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.diff).toBe('+added line');
+  });
+
+  it('CriterionScore roundtrip', () => {
+    const score: CriterionScore = {
+      name: 'Tests pass',
+      score: 8,
+      threshold: 7,
+      passed: true,
+      findings: 'All 42 tests pass',
+    };
+    const json = JSON.stringify(score);
+    const parsed: CriterionScore = JSON.parse(json);
+    expect(parsed.score).toBe(8);
+    expect(parsed.passed).toBe(true);
+  });
+
+  it('EvaluateResult params roundtrip', () => {
+    const params: EvaluateResultParams = {
+      sessionId: 'eval-1',
+      scores: [
+        { name: 'Build succeeds', score: 9, threshold: 7, passed: true },
+      ],
+      passed: true,
+      summary: 'All criteria met',
+    };
+    const json = JSON.stringify(params);
+    const parsed: EvaluateResultParams = JSON.parse(json);
+    expect(parsed.passed).toBe(true);
+    expect(parsed.scores).toHaveLength(1);
+  });
+
+  it('error codes match between TS and Rust', () => {
+    // These must match the values in pice-protocol/src/lib.rs
+    expect(PARSE_ERROR).toBe(-32700);
+    expect(METHOD_NOT_FOUND).toBe(-32601);
+    expect(PROVIDER_NOT_INITIALIZED).toBe(-32000);
+    expect(SESSION_NOT_FOUND).toBe(-32001);
+  });
+
+  it('full request/response wire format matches Rust', () => {
+    // This is the exact JSON that the Rust side produces/expects
+    const rustReq =
+      '{"jsonrpc":"2.0","id":1,"method":"session/create","params":{"workingDirectory":"/path/to/project"}}';
+    const parsed: JsonRpcRequest = JSON.parse(rustReq);
+    expect(parsed.method).toBe('session/create');
+    const params = parsed.params as SessionCreateParams;
+    expect(params.workingDirectory).toBe('/path/to/project');
+
+    // Produce a response in the format Rust expects
+    const resp: JsonRpcResponse = {
+      jsonrpc: '2.0',
+      id: parsed.id,
+      result: { sessionId: 'abc-123' } satisfies SessionCreateResult,
+    };
+    const respJson = JSON.stringify(resp);
+    expect(respJson).toContain('"sessionId":"abc-123"');
+  });
+});
