@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a Question
+    url: https://github.com/jmolz/pice-framework/discussions/categories/q-a
+    about: Use GitHub Discussions for questions and help

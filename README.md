@@ -57,6 +57,36 @@ pice review
 pice commit
 ```
 
+## Example
+
+Here's what a Tier 2 dual-model evaluation looks like after implementing a user authentication feature:
+
+```
+$ pice evaluate .claude/plans/auth-plan.md
+
+╔══════════════════════════════════════╗
+║   Evaluation Report — Tier 2         ║
+╠══════════════════════════════════════╣
+║ ✅ Auth endpoints return 401     8/7 ║
+║   All protected routes verified      ║
+║ ✅ Password hashing uses bcrypt  9/7 ║
+║   bcrypt with cost factor 12         ║
+║ ✅ Session tokens expire in 24h  8/8 ║
+║   24h expiry confirmed in tests      ║
+║ ✅ No secrets in git history     7/7 ║
+║   Clean scan across all commits      ║
+╠══════════════════════════════════════╣
+║  Adversarial Review                  ║
+║  [consider] Rate limiting on logi... ║
+║  [consider] Token rotation strate... ║
+╠══════════════════════════════════════╣
+║  Overall: PASS ✅                    ║
+║  All contract criteria met           ║
+╚══════════════════════════════════════╝
+```
+
+Claude grades each contract criterion with a numeric score against a threshold. GPT-5.4 independently challenges the approach as an adversary — surfacing blind spots neither model would catch alone.
+
 ## Commands
 
 | Command | Description |
@@ -175,6 +205,24 @@ Telemetry data is fully inspectable in `.pice/telemetry-log.jsonl` before any da
 [telemetry]
 enabled = true
 ```
+
+## FAQ
+
+### Why not just use aider/cursor/copilot?
+
+PICE is the orchestration layer, not a replacement for your AI coding tool. It works *with* tools like Claude Code, Cursor, or Copilot through a provider protocol — managing the lifecycle, enforcing contracts, and measuring quality while your preferred tool does the coding. Think of it as the CI/CD for AI coding sessions.
+
+### Why Rust + TypeScript?
+
+Rust for the CLI core — it's fast, compiles to a single binary, and handles process orchestration well. TypeScript for providers — AI SDKs (Anthropic, OpenAI) are JavaScript-first, and the provider protocol lets each side use its natural language. The two communicate over JSON-RPC on stdio.
+
+### Is the telemetry sketchy?
+
+No. Telemetry is opt-in and off by default. When enabled, it collects anonymous usage metrics (command frequency, evaluation pass rates, timing) — never code, prompts, or personal information. All telemetry data is written to `.pice/telemetry-log.jsonl` where you can inspect every event before anything leaves your machine.
+
+### Does this actually improve code quality?
+
+That's what the metrics engine is designed to answer. PICE tracks evaluation scores, pass rates, and workflow timing across your sessions so you can see whether structured workflows produce measurably better results than ad-hoc AI coding. Data over vibes.
 
 ## Contributing
 

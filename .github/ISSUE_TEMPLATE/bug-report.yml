@@ -1,0 +1,65 @@
+name: Bug Report
+description: Report a bug in PICE CLI
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: PICE Version
+      description: "Output of `pice --version`"
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux (x64)
+        - Linux (arm64)
+        - Windows (x64)
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider
+      description: "Which AI provider were you using?"
+      options:
+        - claude-code
+        - codex
+        - Other
+        - N/A
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: "Minimal steps to trigger the bug"
+      placeholder: |
+        1. Run `pice evaluate plan.md`
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs
+      description: "Paste any error output (use `--verbose` for more detail)"
+      render: shell

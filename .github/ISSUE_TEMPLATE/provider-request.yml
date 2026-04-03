@@ -1,0 +1,31 @@
+name: Provider Request
+description: Request support for a new AI coding tool
+labels: [provider]
+body:
+  - type: input
+    id: tool-name
+    attributes:
+      label: AI Tool Name
+      description: "Which AI coding tool should PICE support?"
+      placeholder: "e.g., Cursor, Copilot, Windsurf"
+    validations:
+      required: true
+  - type: input
+    id: sdk-link
+    attributes:
+      label: SDK / API Documentation
+      description: "Link to the tool's SDK or API docs (if available)"
+  - type: checkboxes
+    id: capabilities
+    attributes:
+      label: Desired Capabilities
+      description: "Which PICE commands should this provider support?"
+      options:
+        - label: "Workflow (plan, execute, review, commit)"
+        - label: "Evaluation (evaluate — contract grading)"
+        - label: "Both"
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: "Anything else that would help (auth mechanism, SDK maturity, etc.)"
