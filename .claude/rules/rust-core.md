@@ -28,7 +28,7 @@ paths:
 
 - The PICE loop state is managed in `engine/`. States: `Idle`, `Planning`, `Executing`, `Evaluating`, `Reviewing`.
 - State transitions are explicit. Never skip states (e.g., no executing without a plan file).
-- `pice status` currently derives state from filesystem scanning (plan files, git status) rather than a state file. A formal `.pice/state.json` can be added in Phase 4 when metrics provide a reason to track transitions.
+- `pice status` derives state from filesystem scanning (plan files, git status) enriched with metrics DB lookups (latest evaluation per plan). A formal `.pice/state.json` for state transitions was deferred — filesystem + metrics DB remains sufficient.
 
 ## Binary Embedding
 
