@@ -56,6 +56,16 @@ Plan paths stored in metrics DB must be normalized to project-relative canonical
 - **Inspectable.** `pice telemetry show` displays recent payloads.
 - Telemetry endpoint failures are silent (logged to debug, never user-facing errors).
 
+### HTTP Sending
+
+Telemetry events are sent via HTTP POST using `telemetry::send_batch()` — the single implementation of the HTTP logic. Both the library/test path (`TelemetryClient::flush_inner()`) and the production path (`commands::evaluate::flush_telemetry()`) call this function.
+
+- **Batch size:** Up to 50 pending events per flush
+- **Timeout:** 10 seconds (`HTTP_TIMEOUT` constant)
+- **TLS:** `reqwest` with `rustls-tls` (pure Rust, no OpenSSL dependency)
+- **Production path:** `flush_telemetry()` reads pending events synchronously, then spawns a detached `tokio::spawn` for the HTTP POST so it never blocks CLI output. If the process exits before the spawn completes, unsent events stay in the SQLite queue and retry on the next `pice evaluate` invocation.
+- **DB reopening:** The spawned task reopens `MetricsDb` to mark events as sent because `rusqlite::Connection` isn't `Sync` and can't cross the spawn boundary.
+
 ### Wire-Format Safety
 
 Telemetry uses a separate `AnonymizedPayload` struct (not `TelemetryEvent` itself) as the wire format. The `anonymize()` function destructures `TelemetryEvent` exhaustively — adding a new field to `TelemetryEvent` causes a compile error, forcing an explicit decision about whether to include it in the wire format. This is a compile-time guarantee against accidental data leakage.
