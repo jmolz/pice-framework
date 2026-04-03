@@ -29,10 +29,13 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - run: pnpm install
+      - run: pnpm build
+
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
-      - run: pnpm install
+
       - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
