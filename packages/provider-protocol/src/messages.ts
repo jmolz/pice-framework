@@ -54,6 +54,8 @@ export interface ProviderCapabilities {
 
 export interface SessionCreateParams {
   workingDirectory: string;
+  model?: string;
+  systemPrompt?: string;
 }
 
 export interface SessionCreateResult {
@@ -65,8 +67,19 @@ export interface SessionSendParams {
   message: string;
 }
 
+export interface SessionSendResult {
+  ok: boolean;
+}
+
 export interface SessionDestroyParams {
   sessionId: string;
+}
+
+export interface ResponseToolUseParams {
+  sessionId: string;
+  toolName: string;
+  toolInput: unknown;
+  toolResult?: unknown;
 }
 
 export interface ResponseChunkParams {
@@ -83,6 +96,8 @@ export interface EvaluateCreateParams {
   contract: unknown;
   diff: string;
   claudeMd: string;
+  model?: string;
+  effort?: string;
 }
 
 export interface EvaluateCreateResult {
@@ -91,6 +106,10 @@ export interface EvaluateCreateResult {
 
 export interface EvaluateScoreParams {
   sessionId: string;
+}
+
+export interface EvaluateScoreResult {
+  ok: boolean;
 }
 
 export interface CriterionScore {

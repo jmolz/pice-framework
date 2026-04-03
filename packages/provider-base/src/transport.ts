@@ -6,7 +6,7 @@ import type {
   JsonRpcNotification,
   RequestId,
 } from '@pice/provider-protocol';
-import { PARSE_ERROR, INVALID_REQUEST } from '@pice/provider-protocol';
+import { PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND } from '@pice/provider-protocol';
 
 export type MethodHandler = (
   params: unknown,
@@ -119,7 +119,7 @@ export class StdioTransport {
     const handler = this.handlers.get(method);
     if (!handler) {
       this.sendError(id, {
-        code: -32601, // METHOD_NOT_FOUND
+        code: METHOD_NOT_FOUND,
         message: `method not found: ${method}`,
       });
       return;

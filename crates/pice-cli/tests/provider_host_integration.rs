@@ -57,7 +57,7 @@ async fn provider_host_initialize_and_shutdown() {
 
     let result: InitializeResult = serde_json::from_value(resp["result"].clone()).unwrap();
     assert_eq!(result.version, "0.1.0");
-    assert!(!result.capabilities.workflow);
+    assert!(result.capabilities.workflow);
 
     // Send shutdown
     let shutdown_req = serde_json::json!({

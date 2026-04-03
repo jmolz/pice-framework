@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod engine;
 mod provider;
 mod templates;
 
@@ -64,31 +65,31 @@ enum Commands {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Set up tracing
     let filter = if cli.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .with_writer(std::io::stderr)
         .init();
 
     match &cli.command {
-        Commands::Init(args) => commands::init::run(args),
-        Commands::Prime(args) => commands::prime::run(args),
-        Commands::Plan(args) => commands::plan::run(args),
-        Commands::Execute(args) => commands::execute::run(args),
-        Commands::Evaluate(args) => commands::evaluate::run(args),
-        Commands::Review(args) => commands::review::run(args),
-        Commands::Commit(args) => commands::commit::run(args),
-        Commands::Handoff(args) => commands::handoff::run(args),
-        Commands::Status(args) => commands::status::run(args),
-        Commands::Metrics(args) => commands::metrics::run(args),
-        Commands::Benchmark(args) => commands::benchmark::run(args),
+        Commands::Init(args) => commands::init::run(args).await,
+        Commands::Prime(args) => commands::prime::run(args).await,
+        Commands::Plan(args) => commands::plan::run(args).await,
+        Commands::Execute(args) => commands::execute::run(args).await,
+        Commands::Evaluate(args) => commands::evaluate::run(args).await,
+        Commands::Review(args) => commands::review::run(args).await,
+        Commands::Commit(args) => commands::commit::run(args).await,
+        Commands::Handoff(args) => commands::handoff::run(args).await,
+        Commands::Status(args) => commands::status::run(args).await,
+        Commands::Metrics(args) => commands::metrics::run(args).await,
+        Commands::Benchmark(args) => commands::benchmark::run(args).await,
         Commands::Completions { shell } => {
             let mut cmd = <Cli as clap::CommandFactory>::command();
             generate(*shell, &mut cmd, "pice", &mut std::io::stdout());

@@ -1,0 +1,173 @@
+use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanContract {
+    pub feature: String,
+    pub tier: u8,
+    /// Minimum aggregate score for contract-level pass. Enforced in Phase 3+
+    /// when weighted scoring is implemented. Currently, pass/fail is computed
+    /// per-criterion (all must meet their individual threshold).
+    #[allow(dead_code)]
+    pub pass_threshold: u8,
+    pub criteria: Vec<ContractCriterion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractCriterion {
+    pub name: String,
+    pub threshold: u8,
+    pub validation: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsedPlan {
+    pub path: String,
+    pub title: String,
+    pub content: String,
+    pub contract: Option<PlanContract>,
+}
+
+impl ParsedPlan {
+    pub fn load(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read plan file: {}", path.display()))?;
+
+        let title = content
+            .lines()
+            .find(|line| line.starts_with("# "))
+            .map(|line| line.trim_start_matches("# ").to_string())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Untitled Plan".to_string())
+            });
+
+        let contract = Self::extract_contract(&content)?;
+
+        Ok(Self {
+            path: path.to_string_lossy().to_string(),
+            title,
+            content,
+            contract,
+        })
+    }
+
+    /// Used by status/metrics commands in Phase 3+.
+    #[allow(dead_code)]
+    pub fn tier(&self) -> u8 {
+        self.contract.as_ref().map(|c| c.tier).unwrap_or(1)
+    }
+
+    fn extract_contract(content: &str) -> Result<Option<PlanContract>> {
+        // Find the ## Contract section
+        let contract_start = match content.find("## Contract") {
+            Some(pos) => pos,
+            None => return Ok(None),
+        };
+
+        let contract_section = &content[contract_start..];
+
+        // Find the JSON code fence within the contract section
+        let json_start = match contract_section.find("```json") {
+            Some(pos) => pos + "```json".len(),
+            None => return Ok(None),
+        };
+
+        let json_section = &contract_section[json_start..];
+        let json_end = match json_section.find("```") {
+            Some(pos) => pos,
+            None => bail!("contract section has unclosed JSON code fence"),
+        };
+
+        let json_str = json_section[..json_end].trim();
+        let contract: PlanContract =
+            serde_json::from_str(json_str).context("failed to parse contract JSON")?;
+
+        Ok(Some(contract))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_plan_with_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("test-plan.md");
+        std::fs::write(
+            &plan_path,
+            r#"# Feature: Add Auth
+
+## Overview
+Add authentication to the API.
+
+## Contract
+
+```json
+{
+  "feature": "Add Auth",
+  "tier": 2,
+  "pass_threshold": 7,
+  "criteria": [
+    {
+      "name": "Tests pass",
+      "threshold": 7,
+      "validation": "cargo test"
+    }
+  ]
+}
+```
+
+## Notes
+Some follow-up notes.
+"#,
+        )
+        .unwrap();
+
+        let plan = ParsedPlan::load(&plan_path).unwrap();
+        assert_eq!(plan.title, "Feature: Add Auth");
+        assert!(plan.contract.is_some());
+        let contract = plan.contract.unwrap();
+        assert_eq!(contract.feature, "Add Auth");
+        assert_eq!(contract.tier, 2);
+        assert_eq!(contract.criteria.len(), 1);
+        assert_eq!(contract.criteria[0].name, "Tests pass");
+    }
+
+    #[test]
+    fn parse_plan_without_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("simple-plan.md");
+        std::fs::write(&plan_path, "# Simple Plan\n\nJust do the thing.\n").unwrap();
+
+        let plan = ParsedPlan::load(&plan_path).unwrap();
+        assert_eq!(plan.title, "Simple Plan");
+        assert!(plan.contract.is_none());
+        assert_eq!(plan.tier(), 1);
+    }
+
+    #[test]
+    fn parse_plan_malformed_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan_path = dir.path().join("bad-plan.md");
+        std::fs::write(
+            &plan_path,
+            "# Bad Plan\n\n## Contract\n\n```json\n{invalid}\n```\n",
+        )
+        .unwrap();
+
+        let result = ParsedPlan::load(&plan_path);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("failed to parse contract JSON"));
+    }
+
+    #[test]
+    fn parse_plan_missing_file() {
+        let result = ParsedPlan::load(Path::new("/nonexistent/plan.md"));
+        assert!(result.is_err());
+    }
+}

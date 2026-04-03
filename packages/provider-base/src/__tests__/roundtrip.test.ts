@@ -10,9 +10,12 @@ import type {
   SessionCreateParams,
   SessionCreateResult,
   SessionSendParams,
+  SessionSendResult,
   ResponseChunkParams,
   ResponseCompleteParams,
+  ResponseToolUseParams,
   EvaluateCreateParams,
+  EvaluateScoreResult,
   CriterionScore,
   EvaluateResultParams,
 } from '@pice/provider-protocol';
@@ -201,6 +204,77 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     const parsed: EvaluateResultParams = JSON.parse(json);
     expect(parsed.passed).toBe(true);
     expect(parsed.scores).toHaveLength(1);
+  });
+
+  it('SessionSendResult roundtrip', () => {
+    const result: SessionSendResult = { ok: true };
+    const json = JSON.stringify(result);
+    const parsed: SessionSendResult = JSON.parse(json);
+    expect(parsed.ok).toBe(true);
+  });
+
+  it('EvaluateScoreResult roundtrip', () => {
+    const result: EvaluateScoreResult = { ok: true };
+    const json = JSON.stringify(result);
+    const parsed: EvaluateScoreResult = JSON.parse(json);
+    expect(parsed.ok).toBe(true);
+  });
+
+  it('ResponseToolUseParams roundtrip', () => {
+    const params: ResponseToolUseParams = {
+      sessionId: 's1',
+      toolName: 'Read',
+      toolInput: { path: '/tmp/file.rs' },
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"toolName"');
+    expect(json).toContain('"toolInput"');
+    expect(json).not.toContain('"toolResult"');
+    const parsed: ResponseToolUseParams = JSON.parse(json);
+    expect(parsed.toolName).toBe('Read');
+  });
+
+  it('ResponseToolUseParams with toolResult', () => {
+    const params: ResponseToolUseParams = {
+      sessionId: 's1',
+      toolName: 'Bash',
+      toolInput: { command: 'ls' },
+      toolResult: { output: 'file.txt' },
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"toolResult"');
+    const parsed: ResponseToolUseParams = JSON.parse(json);
+    expect(parsed.toolResult).toBeDefined();
+  });
+
+  it('SessionCreateParams with optional fields', () => {
+    const params: SessionCreateParams = {
+      workingDirectory: '/tmp',
+      model: 'claude-opus-4-6',
+      systemPrompt: 'You are a planner.',
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"model"');
+    expect(json).toContain('"systemPrompt"');
+    const parsed: SessionCreateParams = JSON.parse(json);
+    expect(parsed.model).toBe('claude-opus-4-6');
+    expect(parsed.systemPrompt).toBe('You are a planner.');
+  });
+
+  it('EvaluateCreateParams with optional fields', () => {
+    const params: EvaluateCreateParams = {
+      contract: { criteria: [] },
+      diff: '+line',
+      claudeMd: '# Rules',
+      model: 'gpt-5.4',
+      effort: 'high',
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"model"');
+    expect(json).toContain('"effort"');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.model).toBe('gpt-5.4');
+    expect(parsed.effort).toBe('high');
   });
 
   it('error codes match between TS and Rust', () => {

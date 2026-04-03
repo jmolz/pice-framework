@@ -95,14 +95,8 @@ impl Default for PiceConfig {
                 },
                 tiers: TiersConfig {
                     tier1_models: vec!["claude-opus-4-6".to_string()],
-                    tier2_models: vec![
-                        "claude-opus-4-6".to_string(),
-                        "gpt-5.4".to_string(),
-                    ],
-                    tier3_models: vec![
-                        "claude-opus-4-6".to_string(),
-                        "gpt-5.4".to_string(),
-                    ],
+                    tier2_models: vec!["claude-opus-4-6".to_string(), "gpt-5.4".to_string()],
+                    tier3_models: vec!["claude-opus-4-6".to_string(), "gpt-5.4".to_string()],
                     tier3_agent_team: true,
                 },
             },
@@ -130,8 +124,7 @@ impl PiceConfig {
     /// Save is used by future config-editing commands (Phase 3+).
     #[allow(dead_code)]
     pub fn save(&self, path: &Path) -> Result<()> {
-        let content = toml::to_string_pretty(self)
-            .context("failed to serialize config")?;
+        let content = toml::to_string_pretty(self).context("failed to serialize config")?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create directory {}", parent.display()))?;
@@ -164,7 +157,10 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: PiceConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.provider.name, config.provider.name);
-        assert_eq!(parsed.evaluation.primary.model, config.evaluation.primary.model);
+        assert_eq!(
+            parsed.evaluation.primary.model,
+            config.evaluation.primary.model
+        );
         assert_eq!(parsed.evaluation.tiers.tier2_models.len(), 2);
     }
 

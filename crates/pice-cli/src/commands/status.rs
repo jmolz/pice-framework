@@ -8,7 +8,7 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
-pub fn run(args: &StatusArgs) -> Result<()> {
+pub async fn run(args: &StatusArgs) -> Result<()> {
     let _ = args;
     println!("Not yet implemented -- coming in Phase 3");
     Ok(())

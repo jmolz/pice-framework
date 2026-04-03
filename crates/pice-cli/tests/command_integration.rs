@@ -1,0 +1,358 @@
+//! Integration tests for Phase 2 commands (plan, execute, evaluate).
+//!
+//! These tests use `assert_cmd` to invoke the pice binary with the stub provider.
+//! They verify the full CLI pipeline without requiring real API keys.
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use std::fs;
+
+fn pice_cmd() -> Command {
+    Command::cargo_bin("pice").unwrap()
+}
+
+/// Helper: create a temp directory with a minimal .pice/config.toml
+/// pointing at the stub provider.
+fn setup_stub_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Config that uses the stub provider
+    let pice_dir = dir.path().join(".pice");
+    fs::create_dir_all(&pice_dir).unwrap();
+    fs::write(
+        pice_dir.join("config.toml"),
+        r#"
+[provider]
+name = "stub"
+
+[evaluation]
+[evaluation.primary]
+provider = "stub"
+model = "stub-echo"
+
+[evaluation.adversarial]
+provider = "stub"
+model = "stub-echo"
+effort = "high"
+enabled = true
+
+[evaluation.tiers]
+tier1_models = ["stub-echo"]
+tier2_models = ["stub-echo"]
+tier3_models = ["stub-echo"]
+tier3_agent_team = false
+
+[telemetry]
+enabled = false
+endpoint = "https://telemetry.pice.dev/v1/events"
+
+[metrics]
+db_path = ".pice/metrics.db"
+"#,
+    )
+    .unwrap();
+
+    dir
+}
+
+/// Helper: create a plan file with a contract section.
+fn create_plan_with_contract(dir: &std::path::Path) -> std::path::PathBuf {
+    let plans_dir = dir.join(".claude/plans");
+    fs::create_dir_all(&plans_dir).unwrap();
+    let plan_path = plans_dir.join("test-plan.md");
+    fs::write(
+        &plan_path,
+        r#"# Feature: Test Plan
+
+## Overview
+A simple test plan.
+
+## Contract
+
+```json
+{
+  "feature": "Test Plan",
+  "tier": 2,
+  "pass_threshold": 7,
+  "criteria": [
+    {
+      "name": "Build passes",
+      "threshold": 7,
+      "validation": "cargo build"
+    }
+  ]
+}
+```
+"#,
+    )
+    .unwrap();
+    plan_path
+}
+
+// ─── Help / Flag Tests ─────────────────────────────────────────────────────
+
+#[test]
+fn plan_command_shows_json_flag_in_help() {
+    pice_cmd()
+        .arg("plan")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn execute_command_shows_json_flag_in_help() {
+    pice_cmd()
+        .arg("execute")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn evaluate_command_shows_json_flag_in_help() {
+    pice_cmd()
+        .arg("evaluate")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"));
+}
+
+// ─── Error Path Tests ──────────────────────────────────────────────────────
+
+#[test]
+fn execute_with_missing_plan_file_fails() {
+    pice_cmd()
+        .arg("execute")
+        .arg("/nonexistent/plan.md")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn evaluate_with_missing_plan_file_fails() {
+    pice_cmd()
+        .arg("evaluate")
+        .arg("/nonexistent/plan.md")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn evaluate_plan_without_contract_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = dir.path().join("no-contract.md");
+    fs::write(&plan_path, "# No Contract Plan\n\nJust text.\n").unwrap();
+
+    // Set up config with adversarial disabled to avoid spawning a second provider
+    let pice_dir = dir.path().join(".pice");
+    fs::create_dir_all(&pice_dir).unwrap();
+    fs::write(
+        pice_dir.join("config.toml"),
+        r#"
+[provider]
+name = "stub"
+
+[evaluation]
+[evaluation.primary]
+provider = "stub"
+model = "stub-echo"
+
+[evaluation.adversarial]
+provider = "stub"
+model = "stub-echo"
+effort = "high"
+enabled = false
+
+[evaluation.tiers]
+tier1_models = ["stub-echo"]
+tier2_models = ["stub-echo"]
+tier3_models = ["stub-echo"]
+tier3_agent_team = false
+
+[telemetry]
+enabled = false
+endpoint = "https://telemetry.pice.dev/v1/events"
+
+[metrics]
+db_path = ".pice/metrics.db"
+"#,
+    )
+    .unwrap();
+
+    pice_cmd()
+        .current_dir(dir.path())
+        .arg("evaluate")
+        .arg(plan_path.to_string_lossy().to_string())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no contract section"));
+}
+
+// ─── Stub Provider Pipeline Tests ──────────────────────────────────────────
+//
+// These tests spawn the stub provider as a real child process.
+// They require `pnpm build` to have been run so the stub JS is available.
+// The binary locates providers via find_provider_base() which walks up from
+// the binary location looking for packages/.
+
+#[test]
+fn plan_command_with_stub_provider() {
+    let dir = setup_stub_project();
+
+    // Plan command should succeed with the stub provider:
+    // config load → provider spawn → session create → send → destroy → shutdown
+    pice_cmd()
+        .current_dir(dir.path())
+        .arg("plan")
+        .arg("test feature")
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"complete\""));
+}
+
+#[test]
+fn execute_command_with_stub_provider() {
+    let dir = setup_stub_project();
+    let plan_path = create_plan_with_contract(dir.path());
+
+    // Execute command should succeed with the stub provider:
+    // plan file load → provider spawn → session create → send → destroy → shutdown
+    pice_cmd()
+        .current_dir(dir.path())
+        .arg("execute")
+        .arg(plan_path.to_string_lossy().to_string())
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"complete\""))
+        .stdout(predicate::str::contains("\"plan\": \"Feature: Test Plan\""));
+}
+
+#[test]
+fn evaluate_command_with_stub_provider() {
+    let dir = setup_stub_project();
+    let plan_path = create_plan_with_contract(dir.path());
+
+    // Initialize a git repo so get_git_diff() works
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@test.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Evaluate with stub provider — stub returns mock scores that pass
+    // Uses --json so we can verify the structured output
+    pice_cmd()
+        .current_dir(dir.path())
+        .arg("evaluate")
+        .arg(plan_path.to_string_lossy().to_string())
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": true"))
+        .stdout(predicate::str::contains("\"tier\": 2"));
+}
+
+#[test]
+fn evaluate_graceful_degradation() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Config with adversarial pointing to a nonexistent provider
+    let pice_dir = dir.path().join(".pice");
+    fs::create_dir_all(&pice_dir).unwrap();
+    fs::write(
+        pice_dir.join("config.toml"),
+        r#"
+[provider]
+name = "stub"
+
+[evaluation]
+[evaluation.primary]
+provider = "stub"
+model = "stub-echo"
+
+[evaluation.adversarial]
+provider = "nonexistent-provider"
+model = "fake-model"
+effort = "high"
+enabled = true
+
+[evaluation.tiers]
+tier1_models = ["stub-echo"]
+tier2_models = ["stub-echo", "fake-model"]
+tier3_models = ["stub-echo", "fake-model"]
+tier3_agent_team = false
+
+[telemetry]
+enabled = false
+endpoint = "https://telemetry.pice.dev/v1/events"
+
+[metrics]
+db_path = ".pice/metrics.db"
+"#,
+    )
+    .unwrap();
+
+    // Create plan with contract (tier 2 — triggers adversarial path)
+    let plan_path = create_plan_with_contract(dir.path());
+
+    // Initialize a git repo
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@test.com",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    // Evaluate should complete with primary results only, not crash.
+    // The adversarial provider fails to resolve, but the primary (stub) succeeds.
+    // Exit code 0 because primary passes.
+    pice_cmd()
+        .current_dir(dir.path())
+        .arg("evaluate")
+        .arg(plan_path.to_string_lossy().to_string())
+        .arg("--json")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"passed\": true"));
+}

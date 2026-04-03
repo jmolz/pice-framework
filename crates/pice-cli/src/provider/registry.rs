@@ -2,8 +2,6 @@ use crate::config::PiceConfig;
 use std::path::PathBuf;
 
 /// A resolved provider command and args.
-/// Used by workflow commands (plan, execute, evaluate) in Phase 2+.
-#[allow(dead_code)]
 pub struct ResolvedProvider {
     pub command: String,
     pub args: Vec<String>,
@@ -13,7 +11,6 @@ pub struct ResolvedProvider {
 ///
 /// Falls back to the current working directory if the binary location
 /// cannot be determined (e.g., running via `cargo run`).
-#[allow(dead_code)]
 fn find_provider_base() -> PathBuf {
     // Try relative to the binary itself (works for installed binaries)
     if let Ok(exe) = std::env::current_exe() {
@@ -41,8 +38,6 @@ fn find_provider_base() -> PathBuf {
 /// Locates provider binaries relative to the pice binary's own location,
 /// falling back to CWD for development. In the future, this could scan
 /// node_modules, a plugin directory, or a provider registry.
-/// Used by workflow commands in Phase 2+.
-#[allow(dead_code)]
 pub fn resolve(name: &str, _config: &PiceConfig) -> Option<ResolvedProvider> {
     let base = find_provider_base();
 

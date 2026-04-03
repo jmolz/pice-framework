@@ -17,7 +17,7 @@ pub struct InitArgs {
     pub json: bool,
 }
 
-pub fn run(args: &InitArgs) -> Result<()> {
+pub async fn run(args: &InitArgs) -> Result<()> {
     let cwd = std::env::current_dir()?;
     run_in(&cwd, args.force, args.json)
 }
@@ -122,7 +122,10 @@ mod tests {
         run_in(dir.path(), false, false).unwrap();
 
         assert!(dir.path().join(".claude/commands/plan-feature.md").exists());
-        assert!(dir.path().join(".claude/templates/plan-template.md").exists());
+        assert!(dir
+            .path()
+            .join(".claude/templates/plan-template.md")
+            .exists());
         assert!(dir.path().join(".claude/docs/PLAYBOOK.md").exists());
         assert!(dir.path().join(".pice/config.toml").exists());
         assert!(dir.path().join(".pice/metrics.db").exists());

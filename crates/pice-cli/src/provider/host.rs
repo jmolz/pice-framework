@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use pice_protocol::{
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, JsonRpcErrorResponse, RequestId,
+    JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, RequestId,
 };
 use serde_json::Value;
 use std::process::Stdio;
@@ -13,8 +13,6 @@ use tracing::{debug, trace, warn};
 pub type NotificationHandler = Box<dyn Fn(String, Option<Value>) + Send>;
 
 /// Manages a single provider process lifecycle and JSON-RPC communication.
-/// Used by workflow commands (plan, execute, evaluate) in Phase 2+.
-#[allow(dead_code)]
 pub struct ProviderHost {
     child: Child,
     stdin: tokio::process::ChildStdin,
@@ -23,7 +21,6 @@ pub struct ProviderHost {
     notification_handler: Option<NotificationHandler>,
 }
 
-#[allow(dead_code)]
 impl ProviderHost {
     /// Spawn a provider process with piped stdin/stdout and inherited stderr.
     pub async fn spawn(command: &str, args: &[&str]) -> Result<Self> {
@@ -36,8 +33,14 @@ impl ProviderHost {
             .spawn()
             .with_context(|| format!("failed to spawn provider: {command}"))?;
 
-        let stdin = child.stdin.take().context("failed to capture provider stdin")?;
-        let stdout = child.stdout.take().context("failed to capture provider stdout")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("failed to capture provider stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("failed to capture provider stdout")?;
         let reader = BufReader::new(stdout);
 
         Ok(Self {
@@ -71,11 +74,16 @@ impl ProviderHost {
         let result = tokio::time::timeout(timeout, self.read_response(id)).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => bail!("provider request timed out after {}ms: {method}", timeout.as_millis()),
+            Err(_) => bail!(
+                "provider request timed out after {}ms: {method}",
+                timeout.as_millis()
+            ),
         }
     }
 
     /// Send a JSON-RPC notification (fire-and-forget, no response expected).
+    /// Used by interactive session commands in Phase 3+.
+    #[allow(dead_code)]
     pub async fn notify(&mut self, method: &str, params: Option<Value>) -> Result<()> {
         let notification = JsonRpcNotification::new(method, params);
         let json = serde_json::to_string(&notification)?;
@@ -95,9 +103,7 @@ impl ProviderHost {
 
         // Send shutdown request within the overall timeout budget
         let rpc_timeout = timeout.min(Duration::from_secs(5));
-        let shutdown_result = self
-            .request("shutdown", None, rpc_timeout)
-            .await;
+        let shutdown_result = self.request("shutdown", None, rpc_timeout).await;
         if let Err(e) = shutdown_result {
             warn!("shutdown request failed (provider may have already exited): {e}");
         }

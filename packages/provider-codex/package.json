@@ -1,0 +1,33 @@
+{
+  "name": "@pice/provider-codex",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Codex/OpenAI adversarial evaluator provider for PICE",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "pice-provider-codex": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pice/provider-protocol": "workspace:*",
+    "@pice/provider-base": "workspace:*",
+    "openai": "^5.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}

@@ -15,7 +15,7 @@ class TestProvider extends BaseProvider {
 
   protected registerHandlers(transport: StdioTransport): void {
     transport.registerMethod('test/echo', async (params: unknown) => {
-      this.requireInitialized(params, 0);
+      this.requireInitialized();
       return params;
     });
   }

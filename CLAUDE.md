@@ -22,8 +22,8 @@ See `.claude/PRD.md` for the full product requirements document.
 | rusqlite (SQLite 3) | Local metrics storage |
 | serde / serde_json | Serialization for JSON-RPC protocol and TOML config |
 | rust-embed | Embed template files in binary at build time |
-| @anthropic-ai/claude-code | Claude Code SDK (workflow + evaluation provider) |
-| OpenAI SDK | Codex/GPT adversarial evaluation provider |
+| @anthropic-ai/claude-agent-sdk | Claude Agent SDK (workflow + evaluation provider). Requires `ANTHROPIC_API_KEY` — subscription/OAuth auth is NOT available for third-party SDK consumers. |
+| OpenAI SDK | Codex/GPT adversarial evaluation provider. Requires `OPENAI_API_KEY`. |
 | pnpm | TypeScript workspace manager |
 
 ---
@@ -48,7 +48,7 @@ pnpm typecheck                 # Type check (tsc --noEmit)
 cargo fmt --check && cargo clippy -- -D warnings && cargo test && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo build --release
 ```
 
-**Expected baseline:** 42 Rust tests, 31 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
+**Expected baseline:** 76 Rust tests, 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
 
 ---
 
@@ -139,7 +139,10 @@ pice (Rust binary)
 - Exit codes: 0 = success, 1 = failure, 2 = evaluation failed (contract criteria not met).
 
 ### Phase Scaffolding
-- Code intended for future phases uses `#[allow(dead_code)]` with a comment explaining which phase will use it (e.g., `/// Used by workflow commands in Phase 2+.`). This keeps the codebase warning-free while allowing architectural scaffolding.
+- Code intended for future phases uses `#[allow(dead_code)]` with a comment explaining which phase will use it (e.g., `/// Used by interactive sessions in Phase 3+.`). This keeps the codebase warning-free while allowing architectural scaffolding.
+
+### Async Commands
+- All CLI commands are `async fn` and run on the tokio runtime (`#[tokio::main]`). Phase 1/3/4 commands that don't need async yet are trivially async (same body, `async fn` signature).
 
 ### Logging
 - Rust: Use `tracing` with structured fields. Levels: `error` (user-facing failures), `warn` (degraded behavior), `info` (lifecycle events), `debug` (detailed flow), `trace` (protocol messages). Tracing output goes to stderr via `.with_writer(std::io::stderr)`.

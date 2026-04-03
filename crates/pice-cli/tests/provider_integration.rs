@@ -1,6 +1,5 @@
 use pice_protocol::{
-    InitializeResult, JsonRpcRequest, JsonRpcResponse, RequestId,
-    SessionCreateResult,
+    InitializeResult, JsonRpcRequest, JsonRpcResponse, RequestId, SessionCreateResult,
 };
 use serde_json::json;
 use std::io::{BufRead, BufReader, Write};
@@ -11,7 +10,12 @@ fn workspace_root() -> std::path::PathBuf {
     // from the workspace, but from the crate root when using `-p pice-cli`.
     // Use CARGO_MANIFEST_DIR to find the crate, then navigate to workspace root.
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir.parent().unwrap().parent().unwrap().to_path_buf()
+    manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn spawn_stub_provider() -> std::process::Child {
@@ -53,8 +57,8 @@ fn provider_initialize_and_capabilities() {
 
     let result: InitializeResult = serde_json::from_value(resp.result).unwrap();
     assert_eq!(result.version, "0.1.0");
-    assert!(!result.capabilities.workflow);
-    assert!(!result.capabilities.evaluation);
+    assert!(result.capabilities.workflow);
+    assert!(result.capabilities.evaluation);
 
     // Clean up
     drop(stdin);

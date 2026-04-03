@@ -12,7 +12,7 @@ pub struct MetricsArgs {
     pub csv: bool,
 }
 
-pub fn run(args: &MetricsArgs) -> Result<()> {
+pub async fn run(args: &MetricsArgs) -> Result<()> {
     let _ = args;
     println!("Not yet implemented -- coming in Phase 4");
     Ok(())

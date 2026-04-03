@@ -17,11 +17,7 @@ pub struct ExtractionResult {
 ///
 /// Files that already exist at the target path are skipped (idempotent)
 /// unless `force` is true. Directories are created as needed.
-pub fn extract_templates(
-    target_dir: &Path,
-    prefix: &str,
-    force: bool,
-) -> Result<ExtractionResult> {
+pub fn extract_templates(target_dir: &Path, prefix: &str, force: bool) -> Result<ExtractionResult> {
     let mut result = ExtractionResult {
         created: Vec::new(),
         skipped: Vec::new(),
@@ -47,16 +43,14 @@ pub fn extract_templates(
         }
 
         if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create directory {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
 
         let asset = TemplateAssets::get(file_path_str)
             .with_context(|| format!("embedded asset not found: {file_path_str}"))?;
-        std::fs::write(&target_path, asset.data.as_ref()).with_context(|| {
-            format!("failed to write {}", target_path.display())
-        })?;
+        std::fs::write(&target_path, asset.data.as_ref())
+            .with_context(|| format!("failed to write {}", target_path.display()))?;
 
         info!(path = %target_path.display(), "created");
         result.created.push(relative.to_string());

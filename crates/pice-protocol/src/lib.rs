@@ -106,7 +106,11 @@ pub struct JsonRpcRequest {
 }
 
 impl JsonRpcRequest {
-    pub fn new(id: RequestId, method: impl Into<String>, params: Option<serde_json::Value>) -> Self {
+    pub fn new(
+        id: RequestId,
+        method: impl Into<String>,
+        params: Option<serde_json::Value>,
+    ) -> Self {
         Self {
             jsonrpc: "2.0".to_string(),
             id,
@@ -205,7 +209,11 @@ pub struct ProviderCapabilities {
     pub agent_teams: bool,
     #[serde(default)]
     pub models: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "defaultEvalModel")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "defaultEvalModel"
+    )]
     pub default_eval_model: Option<String>,
 }
 
@@ -214,6 +222,14 @@ pub struct ProviderCapabilities {
 pub struct SessionCreateParams {
     #[serde(rename = "workingDirectory")]
     pub working_directory: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "systemPrompt"
+    )]
+    pub system_prompt: Option<String>,
 }
 
 /// Result of the `session/create` method.
@@ -231,11 +247,34 @@ pub struct SessionSendParams {
     pub message: String,
 }
 
+/// Result of the `session/send` method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSendResult {
+    pub ok: bool,
+}
+
 /// Parameters for the `session/destroy` method.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDestroyParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+}
+
+/// Parameters for the `response/tool_use` notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResponseToolUseParams {
+    #[serde(rename = "sessionId")]
+    pub session_id: String,
+    #[serde(rename = "toolName")]
+    pub tool_name: String,
+    #[serde(rename = "toolInput")]
+    pub tool_input: serde_json::Value,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "toolResult"
+    )]
+    pub tool_result: Option<serde_json::Value>,
 }
 
 /// Parameters for the `response/chunk` notification.
@@ -261,6 +300,10 @@ pub struct EvaluateCreateParams {
     pub diff: String,
     #[serde(rename = "claudeMd")]
     pub claude_md: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 /// Result of the `evaluate/create` method.
@@ -275,6 +318,12 @@ pub struct EvaluateCreateResult {
 pub struct EvaluateScoreParams {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+}
+
+/// Result of the `evaluate/score` method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvaluateScoreResult {
+    pub ok: bool,
 }
 
 /// A single criterion score from evaluation.
@@ -370,10 +419,7 @@ mod tests {
 
     #[test]
     fn json_rpc_response_roundtrip() {
-        let resp = JsonRpcResponse::success(
-            RequestId::Number(1),
-            json!({"sessionId": "abc-123"}),
-        );
+        let resp = JsonRpcResponse::success(RequestId::Number(1), json!({"sessionId": "abc-123"}));
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: JsonRpcResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, RequestId::Number(1));
@@ -471,11 +517,30 @@ mod tests {
     fn session_create_roundtrip() {
         let params = SessionCreateParams {
             working_directory: "/tmp/project".to_string(),
+            model: None,
+            system_prompt: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"workingDirectory\""));
+        assert!(!json.contains("\"model\""));
+        assert!(!json.contains("\"systemPrompt\""));
         let parsed: SessionCreateParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.working_directory, "/tmp/project");
+    }
+
+    #[test]
+    fn session_create_with_optional_fields() {
+        let params = SessionCreateParams {
+            working_directory: "/tmp/project".to_string(),
+            model: Some("claude-opus-4-6".to_string()),
+            system_prompt: Some("You are a planner.".to_string()),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"model\""));
+        assert!(json.contains("\"systemPrompt\""));
+        let parsed: SessionCreateParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model.unwrap(), "claude-opus-4-6");
+        assert_eq!(parsed.system_prompt.unwrap(), "You are a planner.");
     }
 
     #[test]
@@ -507,11 +572,32 @@ mod tests {
             contract: json!({"criteria": []}),
             diff: "+added line".to_string(),
             claude_md: "# Rules".to_string(),
+            model: None,
+            effort: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"claudeMd\""));
+        assert!(!json.contains("\"model\""));
+        assert!(!json.contains("\"effort\""));
         let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.diff, "+added line");
+    }
+
+    #[test]
+    fn evaluate_create_params_with_optional_fields() {
+        let params = EvaluateCreateParams {
+            contract: json!({"criteria": []}),
+            diff: "+line".to_string(),
+            claude_md: "# Rules".to_string(),
+            model: Some("gpt-5.4".to_string()),
+            effort: Some("high".to_string()),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"model\""));
+        assert!(json.contains("\"effort\""));
+        let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.model.unwrap(), "gpt-5.4");
+        assert_eq!(parsed.effort.unwrap(), "high");
     }
 
     #[test]
@@ -550,6 +636,53 @@ mod tests {
     }
 
     #[test]
+    fn session_send_result_roundtrip() {
+        let result = SessionSendResult { ok: true };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: SessionSendResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.ok);
+    }
+
+    #[test]
+    fn evaluate_score_result_roundtrip() {
+        let result = EvaluateScoreResult { ok: true };
+        let json = serde_json::to_string(&result).unwrap();
+        let parsed: EvaluateScoreResult = serde_json::from_str(&json).unwrap();
+        assert!(parsed.ok);
+    }
+
+    #[test]
+    fn response_tool_use_roundtrip() {
+        let params = ResponseToolUseParams {
+            session_id: "s1".to_string(),
+            tool_name: "Read".to_string(),
+            tool_input: json!({"path": "/tmp/file.rs"}),
+            tool_result: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"toolName\""));
+        assert!(json.contains("\"toolInput\""));
+        assert!(!json.contains("\"toolResult\""));
+        let parsed: ResponseToolUseParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tool_name, "Read");
+        assert!(parsed.tool_result.is_none());
+    }
+
+    #[test]
+    fn response_tool_use_with_result() {
+        let params = ResponseToolUseParams {
+            session_id: "s1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: json!({"command": "ls"}),
+            tool_result: Some(json!({"output": "file.txt"})),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("\"toolResult\""));
+        let parsed: ResponseToolUseParams = serde_json::from_str(&json).unwrap();
+        assert!(parsed.tool_result.is_some());
+    }
+
+    #[test]
     fn protocol_error_to_json_rpc_error() {
         let err = ProtocolError::MethodNotFound("foo/bar".to_string());
         let rpc_err = err.to_json_rpc_error();
@@ -564,8 +697,7 @@ mod tests {
         let req: JsonRpcRequest = serde_json::from_str(req_json).unwrap();
         assert_eq!(req.method, methods::SESSION_CREATE);
 
-        let params: SessionCreateParams =
-            serde_json::from_value(req.params.unwrap()).unwrap();
+        let params: SessionCreateParams = serde_json::from_value(req.params.unwrap()).unwrap();
         assert_eq!(params.working_directory, "/path/to/project");
 
         let result = SessionCreateResult {
@@ -582,8 +714,7 @@ mod tests {
         let notif: JsonRpcNotification = serde_json::from_str(notif_json).unwrap();
         assert_eq!(notif.method, methods::RESPONSE_CHUNK);
 
-        let params: ResponseChunkParams =
-            serde_json::from_value(notif.params.unwrap()).unwrap();
+        let params: ResponseChunkParams = serde_json::from_value(notif.params.unwrap()).unwrap();
         assert_eq!(params.text, "## Plan");
     }
 }

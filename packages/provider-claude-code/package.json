@@ -1,0 +1,32 @@
+{
+  "name": "@pice/provider-claude-code",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Claude Code SDK provider for PICE — workflow + evaluation",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "pice-provider-claude-code": "./dist/bin.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@pice/provider-protocol": "workspace:*",
+    "@pice/provider-base": "workspace:*",
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "license": "MIT"
+}
