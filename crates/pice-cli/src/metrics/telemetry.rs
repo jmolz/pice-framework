@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::config::TelemetryConfig;
 
 use super::db::MetricsDb;
 use super::store;
 
+const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Client for opt-in anonymous telemetry.
-/// Queues events locally, logs to JSONL, and (in a future phase) sends via HTTP.
+/// Queues events locally, logs to JSONL, and sends via HTTP when an endpoint is configured.
 pub struct TelemetryClient {
     #[allow(dead_code)]
     endpoint: String,
@@ -52,25 +55,43 @@ impl TelemetryClient {
         Ok(())
     }
 
-    /// Process the queue: in a future phase, send pending events via HTTP.
-    /// For now, just marks them as sent (the JSONL log is the source of truth).
+    /// Send pending telemetry events via HTTP POST, then mark as sent.
+    /// Fully non-fatal: all errors are handled internally at debug level.
+    /// Production evaluate uses a fire-and-forget spawned task instead of
+    /// awaiting this method, to avoid blocking output with HTTP latency.
     #[allow(dead_code)]
-    pub fn flush(&self, db: &MetricsDb) -> Result<()> {
+    pub async fn flush(&self, db: &MetricsDb) {
+        if let Err(e) = self.flush_inner(db).await {
+            tracing::debug!("telemetry flush failed: {e}");
+        }
+    }
+
+    #[allow(dead_code)]
+    async fn flush_inner(&self, db: &MetricsDb) -> Result<()> {
         let pending = store::get_pending_telemetry(db, 50)?;
         if pending.is_empty() {
             return Ok(());
         }
 
-        // MVP: no HTTP sending — just mark as processed.
-        // The JSONL log already has the data for inspection.
+        let payloads: Vec<serde_json::Value> = pending
+            .iter()
+            .filter_map(|e| serde_json::from_str(&e.payload_json).ok())
+            .collect();
+
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        send_batch(&self.endpoint, &payloads).await?;
+
         let ids: Vec<i64> = pending.iter().map(|e| e.id).collect();
         store::mark_telemetry_sent(db, &ids)?;
-
-        tracing::debug!(count = ids.len(), "flushed telemetry queue (local only)");
+        tracing::debug!(count = ids.len(), "flushed telemetry queue via HTTP");
         Ok(())
     }
 
     /// Read recent entries from the JSONL log.
+    /// Used by `pice telemetry show` (not yet implemented as a CLI command).
     #[allow(dead_code)]
     pub fn read_log(&self, limit: usize) -> Result<Vec<String>> {
         if !self.log_path.exists() {
@@ -120,6 +141,32 @@ struct AnonymizedPayload {
     score_avg: Option<f64>,
     provider_type: String,
     timestamp: String,
+}
+
+/// Send a batch of telemetry payloads via HTTP POST.
+/// Returns `Ok(())` on a 2xx response, or an error otherwise.
+///
+/// This is the single implementation of the HTTP send logic — used by both
+/// `flush_inner()` (library/test path) and the fire-and-forget spawn in
+/// `commands::evaluate::flush_telemetry()`.
+pub async fn send_batch(endpoint: &str, payloads: &[serde_json::Value]) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let resp = client
+        .post(endpoint)
+        .json(payloads)
+        .send()
+        .await
+        .context("telemetry HTTP request failed")?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("telemetry endpoint returned status {}", resp.status());
+    }
 }
 
 /// Convert a TelemetryEvent into an AnonymizedPayload by explicitly copying
@@ -269,8 +316,8 @@ mod tests {
         let _: serde_json::Value = serde_json::from_str(log_content.trim()).unwrap();
     }
 
-    #[test]
-    fn flush_marks_entries_sent() {
+    #[tokio::test]
+    async fn flush_handles_unreachable_endpoint() {
         let dir = tempfile::tempdir().unwrap();
         let db = MetricsDb::open_in_memory().unwrap();
         let config = test_config();
@@ -286,10 +333,23 @@ mod tests {
         };
         client.queue_event(&db, &event).unwrap();
 
-        client.flush(&db).unwrap();
+        // flush() is fully non-fatal — it never returns an error
+        client.flush(&db).await;
 
+        // Events stay in queue since HTTP failed (not marked sent)
         let pending = store::get_pending_telemetry(&db, 10).unwrap();
-        assert!(pending.is_empty());
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_empty_queue_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MetricsDb::open_in_memory().unwrap();
+        let config = test_config();
+        let client = TelemetryClient::new(&config, dir.path());
+
+        // flush on empty queue is a no-op
+        client.flush(&db).await;
     }
 
     #[test]

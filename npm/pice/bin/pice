@@ -1,0 +1,18 @@
+#!/usr/bin/env node
+
+const { execFileSync } = require("child_process");
+
+let binaryPath;
+try {
+  const { getBinaryPath } = require("../index.js");
+  binaryPath = getBinaryPath();
+} catch (e) {
+  console.error(`pice: ${e.message}`);
+  process.exit(1);
+}
+
+try {
+  execFileSync(binaryPath, process.argv.slice(2), { stdio: "inherit" });
+} catch (e) {
+  process.exit(e.status || 1);
+}

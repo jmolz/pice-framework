@@ -92,7 +92,7 @@ pub async fn run(args: &EvaluateArgs) -> Result<()> {
         // 5. Enforce contract: recompute pass/fail from scores and thresholds
         enforce_contract(&mut primary, contract);
 
-        // 5b. Record to metrics DB (non-fatal)
+        // 5b. Record to metrics DB and flush telemetry (non-fatal)
         record_metrics(
             &project_root,
             &plan.path,
@@ -103,6 +103,7 @@ pub async fn run(args: &EvaluateArgs) -> Result<()> {
             Some(&config.evaluation.adversarial.provider),
             Some(&config.evaluation.adversarial.model),
         );
+        flush_telemetry(&project_root, &config);
 
         // 6. Display results
         if args.json {
@@ -127,7 +128,7 @@ pub async fn run(args: &EvaluateArgs) -> Result<()> {
         // Enforce contract: recompute pass/fail from scores and thresholds
         enforce_contract(&mut primary, contract);
 
-        // Record to metrics DB (non-fatal)
+        // Record to metrics DB and flush telemetry (non-fatal)
         record_metrics(
             &project_root,
             &plan.path,
@@ -138,6 +139,7 @@ pub async fn run(args: &EvaluateArgs) -> Result<()> {
             None,
             None,
         );
+        flush_telemetry(&project_root, &config);
 
         if args.json {
             let json = output::evaluation_json(&primary, None, tier);
@@ -271,6 +273,11 @@ async fn run_primary_evaluation(
     let mut orchestrator =
         ProviderOrchestrator::start(&config.evaluation.primary.provider, config).await?;
 
+    info!(
+        provider = orchestrator.provider_name(),
+        "running primary evaluation"
+    );
+
     let result = orchestrator
         .evaluate(
             contract_json,
@@ -298,6 +305,11 @@ async fn run_adversarial_evaluation(
     let mut orchestrator =
         ProviderOrchestrator::start(&config.evaluation.adversarial.provider, config).await?;
 
+    info!(
+        provider = orchestrator.provider_name(),
+        "running adversarial evaluation"
+    );
+
     let result = orchestrator
         .evaluate(
             contract_json,
@@ -316,4 +328,53 @@ async fn run_adversarial_evaluation(
 
     // Convert to generic JSON for the adversarial side
     Ok(serde_json::to_value(result?)?)
+}
+
+/// Fire-and-forget flush of queued telemetry events via HTTP.
+/// Reads pending events synchronously, then spawns the HTTP POST so it
+/// does not block evaluate output with network latency.
+///
+/// Because the POST runs in a detached `tokio::spawn`, the process may exit
+/// before the request completes. This is by design — unsent events stay in the
+/// SQLite queue and will be retried on the next `pice evaluate` invocation.
+fn flush_telemetry(project_root: &Path, config: &PiceConfig) {
+    if !config.telemetry.enabled {
+        return;
+    }
+    let Some(db) = metrics::open_metrics_db(project_root).ok().flatten() else {
+        return;
+    };
+    let pending = match metrics::store::get_pending_telemetry(&db, 50) {
+        Ok(p) if !p.is_empty() => p,
+        _ => return,
+    };
+    let payloads: Vec<serde_json::Value> = pending
+        .iter()
+        .filter_map(|e| serde_json::from_str(&e.payload_json).ok())
+        .collect();
+    if payloads.is_empty() {
+        return;
+    }
+    let ids: Vec<i64> = pending.iter().map(|e| e.id).collect();
+    let endpoint = config.telemetry.endpoint.clone();
+    let db_path = project_root.join(&config.metrics.db_path);
+
+    tokio::spawn(async move {
+        match metrics::telemetry::send_batch(&endpoint, &payloads).await {
+            Ok(()) => {
+                // Reopen DB to mark sent — the original handle stayed on the main thread
+                // and rusqlite::Connection isn't Sync so it can't cross the spawn boundary.
+                if let Ok(db) = metrics::db::MetricsDb::open(&db_path) {
+                    if let Err(e) = metrics::store::mark_telemetry_sent(&db, &ids) {
+                        tracing::debug!("telemetry: failed to mark sent: {e}");
+                    } else {
+                        tracing::debug!(count = ids.len(), "flushed telemetry queue via HTTP");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("telemetry send failed: {e}");
+            }
+        }
+    });
 }

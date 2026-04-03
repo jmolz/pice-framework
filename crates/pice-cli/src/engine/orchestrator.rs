@@ -15,8 +15,6 @@ const EVAL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct ProviderOrchestrator {
     host: ProviderHost,
-    /// Used by metrics/logging in Phase 3+.
-    #[allow(dead_code)]
     provider_name: String,
 }
 
@@ -146,8 +144,6 @@ impl ProviderOrchestrator {
         self.host.shutdown(Duration::from_secs(10)).await
     }
 
-    /// Used by metrics/logging in Phase 3+.
-    #[allow(dead_code)]
     pub fn provider_name(&self) -> &str {
         &self.provider_name
     }

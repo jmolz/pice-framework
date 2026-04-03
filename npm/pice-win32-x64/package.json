@@ -1,0 +1,11 @@
+{
+  "name": "@pice/pice-win32-x64",
+  "version": "0.1.0",
+  "description": "PICE CLI binary for Windows x64",
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "files": ["pice.exe"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/jacobmolz/pice" },
+  "preferUnplugged": true
+}

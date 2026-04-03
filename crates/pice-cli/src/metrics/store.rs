@@ -16,7 +16,6 @@ pub struct EvaluationSummary {
 }
 
 /// A pending telemetry entry from the queue.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct TelemetryEntry {
     pub id: i64,
@@ -161,7 +160,6 @@ pub fn queue_telemetry(db: &MetricsDb, payload_json: &str) -> Result<()> {
 }
 
 /// Read pending (unsent) telemetry entries.
-#[allow(dead_code)]
 pub fn get_pending_telemetry(db: &MetricsDb, limit: usize) -> Result<Vec<TelemetryEntry>> {
     let conn = db.conn();
     let mut stmt = conn
@@ -185,7 +183,6 @@ pub fn get_pending_telemetry(db: &MetricsDb, limit: usize) -> Result<Vec<Telemet
 }
 
 /// Mark telemetry entries as sent.
-#[allow(dead_code)]
 pub fn mark_telemetry_sent(db: &MetricsDb, ids: &[i64]) -> Result<()> {
     let conn = db.conn();
     for id in ids {

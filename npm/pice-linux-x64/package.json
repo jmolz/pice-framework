@@ -1,0 +1,11 @@
+{
+  "name": "@pice/pice-linux-x64",
+  "version": "0.1.0",
+  "description": "PICE CLI binary for Linux x64",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["pice"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/jacobmolz/pice" },
+  "preferUnplugged": true
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@pice/pice-darwin-arm64",
+  "version": "0.1.0",
+  "description": "PICE CLI binary for macOS ARM64 (Apple Silicon)",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["pice"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/jacobmolz/pice" },
+  "preferUnplugged": true
+}
