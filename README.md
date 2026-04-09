@@ -23,7 +23,7 @@ PICE CLI is the outer loop. It spawns AI providers over a JSON-RPC protocol, fee
 ### npm (recommended)
 
 ```bash
-npm install -g pice
+npm install -g @jacobmolz/pice
 ```
 
 ### Cargo

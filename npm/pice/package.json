@@ -1,5 +1,5 @@
 {
-  "name": "pice",
+  "name": "@jacobmolz/pice",
   "version": "0.1.0",
   "description": "PICE CLI — structured AI coding workflow orchestrator",
   "bin": { "pice": "bin/pice" },
