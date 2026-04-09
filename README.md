@@ -6,6 +6,10 @@ Structured AI coding workflow orchestrator -- Plan, Implement, Contract-Evaluate
 [![Tests: 217](https://img.shields.io/badge/tests-217_passing-brightgreen)](https://github.com/jmolz/pice-framework/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+<p align="center">
+  <img src="docs/images/pice-evaluate-demo.gif" alt="PICE CLI running a Tier 2 dual-model adversarial evaluation showing contract criteria scores and adversarial review" width="700">
+</p>
+
 ## What is PICE?
 
 PICE is a methodology for structured AI coding that breaks work into three formal phases: **Plan** (research, design, and contract negotiation), **Implement** (code generation from a plan), and **Contract-Evaluate** (adversarial grading of the implementation against the contract). The CLI orchestrates this lifecycle -- it manages the state, the prompts, and the measurement while an AI assistant does the actual coding.
@@ -110,15 +114,10 @@ All commands support `--json` for machine-readable output.
 
 PICE CLI uses a **provider architecture** that separates the Rust core from AI provider implementations:
 
-```
-pice (Rust binary)
-  Core engine --------- state machine, lifecycle, config
-  Metrics engine ------- SQLite storage + telemetry
-  Template engine ------ scaffolding, file generation
-  Provider host -------- spawns and manages provider processes
-       |  JSON-RPC over stdio
-  Providers (TypeScript) -- Claude Code, Codex, community providers
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
+  <img alt="PICE architecture: Rust binary with core engine, metrics engine, template engine, and provider host communicating via JSON-RPC over stdio with TypeScript providers (Claude Code, Codex, community)" src="docs/images/architecture-light.svg" width="800">
+</picture>
 
 The Rust core handles argument parsing, state management, configuration, metrics, and process orchestration. AI providers are separate TypeScript processes that communicate over JSON-RPC on stdio. This design allows community-built providers for any AI coding tool without modifying the core binary.
 
@@ -128,11 +127,10 @@ For provider development, see [`docs/providers/`](docs/providers/).
 
 Evaluation scales with the significance of the change:
 
-| Tier | Scope | Models | Behavior |
-|------|-------|--------|----------|
-| Tier 1 | Minor changes | Claude Opus | Single evaluator, contract grading only |
-| Tier 2 | New features | Claude Opus + GPT-5.4 | Parallel evaluation with adversarial review |
-| Tier 3 | Architectural | Claude Opus team (4) + GPT-5.4 | Agent team evaluation + high-effort adversarial review |
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/evaluation-tiers-dark.svg">
+  <img alt="Evaluation tiers: Tier 1 uses single Claude Opus evaluator for minor changes; Tier 2 adds parallel GPT-5.4 adversarial review for new features; Tier 3 uses a Claude Opus agent team of 4 plus high-effort GPT-5.4 review for architectural changes" src="docs/images/evaluation-tiers-light.svg" width="800">
+</picture>
 
 Evaluators are **context-isolated** -- they see only the contract JSON, the git diff, and the project's `CLAUDE.md`. They never see the implementation conversation or planning rationale.
 
