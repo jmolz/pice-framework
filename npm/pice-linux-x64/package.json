@@ -1,6 +1,6 @@
 {
-  "name": "@jacobmolz/pice-linux-x64",
-  "version": "0.1.0",
+  "name": "@pice/pice-linux-x64",
+  "version": "0.1.1",
   "description": "PICE CLI binary for Linux x64",
   "os": ["linux"],
   "cpu": ["x64"],

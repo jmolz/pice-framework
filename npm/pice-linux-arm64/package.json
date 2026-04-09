@@ -1,6 +1,6 @@
 {
-  "name": "@jacobmolz/pice-linux-arm64",
-  "version": "0.1.0",
+  "name": "@pice/pice-linux-arm64",
+  "version": "0.1.1",
   "description": "PICE CLI binary for Linux ARM64",
   "os": ["linux"],
   "cpu": ["arm64"],
