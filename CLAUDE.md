@@ -221,6 +221,7 @@ When working on specific areas, read the corresponding reference:
 | JSON-RPC protocol | `.claude/rules/protocol.md` | Changing provider contract |
 | Metrics & telemetry | `.claude/rules/metrics.md` | Working on metrics engine |
 | Templates & scaffolding | `.claude/rules/templates.md` | Changing `pice init` output |
+| Visual assets & diagrams | `.claude/rules/docs-visual-assets.md` | Working on docs/images/, docs/diagrams/, or README visuals |
 
 For deep architecture reference: `.claude/docs/`
 For PICE methodology: `docs/methodology/`
