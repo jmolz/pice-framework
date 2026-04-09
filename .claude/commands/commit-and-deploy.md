@@ -1,5 +1,5 @@
 ---
-description: Standard workflow for building, testing, committing and deploying Alpaka changes
+description: Standard workflow for building, testing, committing and pushing PICE framework changes
 ---
 
 # Commit and Deploy Workflow
@@ -8,56 +8,30 @@ description: Standard workflow for building, testing, committing and deploying A
 
 Run these checks in order. Fix failures before proceeding.
 
-### 1. Build
+### 1. Rust checks
 
 ```bash
-pnpm build
+cargo fmt --check
+cargo clippy -- -D warnings
+cargo test
 ```
 
-### 2. Check maxDuration limits
+### 2. TypeScript checks
 
 ```bash
-grep -Ern 'maxDuration[[:space:]]*=[[:space:]]*(80[1-9]|8[1-9][0-9]|9[0-9][0-9]|[0-9]{4,})' --include='*.ts' app/api/ && echo "ERROR: maxDuration exceeds 800s Vercel Pro limit" || echo "OK: all maxDuration values within limit"
-```
-
-### 3. Pipeline pattern validation (required when touching pipeline/job code)
-
-```bash
-./scripts/validate-pipeline-patterns.sh
-```
-
-### 4. Regression tests (REQUIRED for any potentially breaking change)
-
-```bash
-pnpm test -- __tests__/regression/
-```
-
-### 5. RON tests (required when touching ron/**)
-
-```bash
-cd ron && python3 -m pytest __tests__/test_financial_extraction.py __tests__/test_title_generation.py -v
-```
-
-### 6. RON Docker build (required when touching ron/**)
-
-```bash
-docker build -f ron/Dockerfile .
-```
-
-### 7. Full unit tests
-
-```bash
+pnpm lint
+pnpm typecheck
 pnpm test
 ```
 
-## Documentation Updates (REQUIRED)
+### 3. Full builds
 
-Before committing:
+```bash
+cargo build --release
+pnpm build
+```
 
-1. **TASK.md**: Mark completed tasks `[x]`, add discovered issues, update dates
-2. **Help/Knowledge/Security docs**: If product behavior changed, review for accuracy, clarity, structure, terminology, parity, and metadata
-3. **README.md**: Update if commands, env vars, architecture, or setup changed
-4. **ron/README.md**: Update if RON endpoints, models, config, or architecture changed
+**Expected baseline:** 168 Rust tests, 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
 
 ## Commit by Feature (CRITICAL)
 
@@ -67,35 +41,38 @@ Before committing:
 # Review everything
 git status
 
-# Stage and commit by logical group
-git add components/projects/*.tsx
-git commit -m "feat(ui): enhance project engagements tab"
+# Stage and commit by logical group — examples:
+git add crates/pice-cli/src/engine/*.rs
+git commit -m "feat(engine): add session capture support"
 
-git add app/api/projects/[id]/engagements/route.ts
-git commit -m "feat(api): include AI summary in engagements response"
+git add packages/provider-claude-code/src/*.ts
+git commit -m "feat(provider): implement streaming notifications"
 
-git add lib/db/schema*.ts lib/db/migrations/*.sql
-git commit -m "feat(db): add communication schema"
+git add templates/
+git commit -m "chore(templates): update init scaffolding"
 
 # Docs last, separately
-git add TASK.md README.md ron/README.md
-git commit -m "docs: update task tracking and documentation"
+git add docs/ README.md CONTRIBUTING.md
+git commit -m "docs: update architecture diagrams"
+
+# Plans separately
+git add .claude/plans/
+git commit -m "docs(plans): add feature plan"
 ```
 
 **Commit tags:** `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `perf`
 
-**Include scope:** `feat(ui)`, `fix(api)`, `refactor(db)`, `feat(ron)`
+**Include scope:** `feat(engine)`, `fix(provider)`, `refactor(protocol)`, `docs(readme)`
 
 If any AI layer files changed (CLAUDE.md, .claude/rules/, .claude/commands/), add a `Context:` section to the commit body.
 
-## Deploy
+## Push
 
 ```bash
 git push origin main
 ```
 
-**Frontend (Vercel):** Auto-deploys in ~2-5 minutes.
-**RON Backend (RunPod):** Auto-deploys in ~15-20 minutes if `ron/**` or `shared/**` changed.
+CI runs automatically via GitHub Actions (`.github/workflows/ci.yml`).
 
 ## Verify
 
@@ -104,4 +81,8 @@ git status
 # Expected: "nothing to commit, working tree clean"
 ```
 
-If RON deploy fails: check GitHub Actions logs, verify `docker build -f ron/Dockerfile .` locally, check RunPod console.
+Check CI status:
+
+```bash
+gh run list --limit 1
+```
