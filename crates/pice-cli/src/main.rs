@@ -1,5 +1,4 @@
 mod commands;
-mod config;
 mod engine;
 mod metrics;
 mod provider;

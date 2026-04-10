@@ -4,9 +4,10 @@ use pice_protocol::EvaluateResultParams;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use crate::config::PiceConfig;
-use crate::engine::{orchestrator::ProviderOrchestrator, output, plan_parser, prompt};
+use crate::engine::{orchestrator::ProviderOrchestrator, output};
 use crate::metrics;
+use pice_core::config::PiceConfig;
+use pice_core::plan_parser;
 
 #[derive(Args, Debug)]
 pub struct EvaluateArgs {
@@ -34,8 +35,8 @@ pub async fn run(args: &EvaluateArgs) -> Result<()> {
         .unwrap_or_else(|_| PiceConfig::default());
 
     // 3. Gather evaluation context (blocking IO, called before tokio::join!)
-    let diff = prompt::get_git_diff(&project_root)?;
-    let claude_md = prompt::read_claude_md(&project_root)?;
+    let diff = pice_core::prompt::helpers::get_git_diff(&project_root)?;
+    let claude_md = pice_core::prompt::helpers::read_claude_md(&project_root)?;
     let contract_json = serde_json::to_value(contract)?;
 
     if !args.json {

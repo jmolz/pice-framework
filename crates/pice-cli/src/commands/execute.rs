@@ -3,9 +3,10 @@ use clap::Args;
 use std::path::PathBuf;
 use tracing::info;
 
-use crate::config::PiceConfig;
-use crate::engine::{orchestrator::ProviderOrchestrator, plan_parser, prompt, session};
+use crate::engine::{orchestrator::ProviderOrchestrator, prompt, session};
 use crate::metrics;
+use pice_core::config::PiceConfig;
+use pice_core::plan_parser;
 
 #[derive(Args, Debug)]
 pub struct ExecuteArgs {

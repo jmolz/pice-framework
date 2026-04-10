@@ -1,3 +1,9 @@
+//! Provider registry — maps provider names to command/args for spawning.
+//!
+//! Moved from `pice-cli/src/provider/registry.rs` in T5 of the Phase 0 refactor.
+//! Path-walking + config lookup is pure logic; the async `ProviderHost` that
+//! actually spawns providers lives in `pice-daemon::provider::host`.
+
 use crate::config::PiceConfig;
 use std::path::PathBuf;
 
@@ -89,6 +95,6 @@ mod tests {
     fn find_provider_base_returns_a_path() {
         let base = find_provider_base();
         // Should return something (either workspace root or CWD)
-        assert!(base.is_absolute() || base == PathBuf::from("."));
+        assert!(base.is_absolute() || base.to_string_lossy() == ".");
     }
 }

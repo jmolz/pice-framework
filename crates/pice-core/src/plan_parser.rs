@@ -1,3 +1,20 @@
+//! Markdown plan parsing and `## Contract` detection.
+//!
+//! Moved from `pice-cli/src/engine/plan_parser.rs` in T4 of the Phase 0 refactor.
+//! Both `pice-cli` (status reporting) and `pice-daemon` (execute/evaluate
+//! handlers) depend on this module.
+//!
+//! ## Contract-detection invariants (from `.claude/rules/rust-core.md`)
+//!
+//! - `## Contract` headings are detected via line-level matching (`find_h2_heading`),
+//!   not substring search.
+//! - Only level-2 headings (`##`) match. `###` and deeper are rejected.
+//! - Up to 3 leading spaces are allowed per CommonMark.
+//! - If `## Contract` exists but has no ` ```json ` fence, the parser returns an
+//!   error (not `Ok(None)`). Half-written contracts must be surfaced.
+//! - Callers that want malformed plans to surface rather than fail silently use
+//!   the `parse_error` field on the caller's result type (e.g., `status.rs`).
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
