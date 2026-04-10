@@ -3,10 +3,11 @@ use clap::Args;
 use std::path::PathBuf;
 use tracing::info;
 
-use crate::engine::{orchestrator::ProviderOrchestrator, prompt, session};
+use crate::engine::{output, prompt};
 use crate::metrics;
 use pice_core::config::PiceConfig;
 use pice_core::plan_parser;
+use pice_daemon::orchestrator::{session, ProviderOrchestrator};
 
 #[derive(Args, Debug)]
 pub struct ExecuteArgs {
@@ -47,7 +48,7 @@ pub async fn run(args: &ExecuteArgs) -> Result<()> {
     let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, &config).await?;
 
     if !args.json {
-        orchestrator.on_notification(session::streaming_handler());
+        orchestrator.on_notification(session::streaming_handler(output::terminal_sink()));
     }
 
     let session_result = session::run_session(&mut orchestrator, &project_root, exec_prompt).await;

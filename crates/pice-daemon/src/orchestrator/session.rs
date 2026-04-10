@@ -3,18 +3,27 @@ use pice_protocol::{methods, SessionCreateParams, SessionDestroyParams, SessionS
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use super::orchestrator::ProviderOrchestrator;
-use super::output;
+use super::stream::SharedSink;
+use super::ProviderOrchestrator;
 use crate::provider::host::NotificationHandler;
 
-/// Create a notification handler that prints response chunks to stdout.
-/// Use this for commands that stream AI output in text mode.
-pub fn streaming_handler() -> NotificationHandler {
-    Box::new(|method, params| {
+/// Create a notification handler that forwards response chunks to a [`SharedSink`].
+///
+/// The T12-era replacement for the v0.1 `streaming_handler()` that called
+/// `pice_cli::engine::output::print_chunk` directly. The sink is captured by
+/// move into the `'static` closure stored by `ProviderHost`, which is why we
+/// require `SharedSink` (`Arc<dyn StreamSink>`) rather than `&dyn StreamSink`.
+///
+/// Use this for commands that stream AI output in text mode. Callers still
+/// do two-step setup — install the handler, then call [`run_session`] — so
+/// that commands which need a different handler shape (e.g., the capture
+/// handler in [`run_session_and_capture`]) can install their own.
+pub fn streaming_handler(sink: SharedSink) -> NotificationHandler {
+    Box::new(move |method, params| {
         if method == methods::RESPONSE_CHUNK {
             if let Some(params) = params {
                 if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
-                    output::print_chunk(text);
+                    sink.send_chunk(text);
                 }
             }
         }
@@ -64,14 +73,19 @@ pub async fn run_session(
 
 /// Run a full session lifecycle and capture all response text.
 ///
-/// Registers its own notification handler to collect `response/chunk` text.
-/// When `print_chunks` is true, chunks are also printed to stdout in real time.
-/// Returns the concatenated captured text.
+/// Registers its own notification handler to collect `response/chunk` text
+/// and forward each chunk to the supplied sink. The sink controls whether
+/// chunks are user-visible — pass `Arc::new(NullSink)` for silent capture
+/// (e.g., `pice commit` building a message from the model response) and a
+/// `TerminalSink` for the stream-and-capture case (e.g., `pice handoff` in
+/// text mode).
+///
+/// Returns the concatenated captured text regardless of what the sink does.
 pub async fn run_session_and_capture(
     orchestrator: &mut ProviderOrchestrator,
     project_root: &Path,
     prompt: String,
-    print_chunks: bool,
+    sink: SharedSink,
 ) -> Result<String> {
     let chunks: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let chunks_clone = Arc::clone(&chunks);
@@ -80,9 +94,7 @@ pub async fn run_session_and_capture(
         if method == methods::RESPONSE_CHUNK {
             if let Some(params) = params {
                 if let Some(text) = params.get("text").and_then(|t| t.as_str()) {
-                    if print_chunks {
-                        output::print_chunk(text);
-                    }
+                    sink.send_chunk(text);
                     if let Ok(mut guard) = chunks_clone.lock() {
                         guard.push(text.to_string());
                     }
