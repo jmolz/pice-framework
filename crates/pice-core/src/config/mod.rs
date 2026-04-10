@@ -1,3 +1,9 @@
+//! TOML configuration parsing for `.pice/config.toml`.
+//!
+//! Moved from `pice-cli/src/config/mod.rs` in T3 of the Phase 0 refactor.
+//! Both `pice-cli` (config preview + validation) and `pice-daemon` (config
+//! loading at daemon startup) depend on this module.
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;

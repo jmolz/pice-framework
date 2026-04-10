@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 pice-protocol = { path = "../pice-protocol" }
+pice-core = { path = "../pice-core" }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 tokio = { workspace = true }

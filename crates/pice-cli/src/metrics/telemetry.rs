@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::TelemetryConfig;
+use pice_core::config::TelemetryConfig;
 
 use super::db::MetricsDb;
 use super::store;

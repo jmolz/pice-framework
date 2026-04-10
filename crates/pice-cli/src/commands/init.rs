@@ -3,8 +3,8 @@ use clap::Args;
 use std::path::Path;
 use tracing::info;
 
-use crate::config::PiceConfig;
 use crate::templates::extract_templates;
+use pice_core::config::PiceConfig;
 
 #[derive(Args, Debug)]
 pub struct InitArgs {

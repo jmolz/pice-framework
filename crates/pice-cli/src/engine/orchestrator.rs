@@ -1,7 +1,7 @@
-use crate::config::PiceConfig;
 use crate::provider::host::{NotificationHandler, ProviderHost};
-use crate::provider::registry;
 use anyhow::{Context, Result};
+use pice_core::config::PiceConfig;
+use pice_core::provider::registry;
 use pice_protocol::{
     EvaluateCreateParams, EvaluateResultParams, EvaluateScoreParams, InitializeParams,
 };

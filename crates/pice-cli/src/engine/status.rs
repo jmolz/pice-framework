@@ -3,9 +3,9 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 
-use super::plan_parser::ParsedPlan;
 use crate::metrics::db::MetricsDb;
 use crate::metrics::store;
+use pice_core::plan_parser::ParsedPlan;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlanStatus {

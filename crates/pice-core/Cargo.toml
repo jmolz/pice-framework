@@ -1,0 +1,25 @@
+[package]
+name = "pice-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PICE core logic — pure types and shared helpers for CLI and daemon"
+
+[dependencies]
+pice-protocol = { path = "../pice-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+# NOTE: pice-core is PURE logic. Do NOT add tokio, reqwest, rusqlite, or any
+# async/network/database dependency. Graded by contract criterion #1 of the
+# Phase 0 plan (see .claude/plans/phase-0-daemon-foundation.md).
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"
