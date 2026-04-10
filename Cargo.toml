@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/pice-cli", "crates/pice-core", "crates/pice-protocol"]
+members = [
+    "crates/pice-cli",
+    "crates/pice-core",
+    "crates/pice-daemon",
+    "crates/pice-protocol",
+]
 resolver = "2"
 
 [workspace.package]
