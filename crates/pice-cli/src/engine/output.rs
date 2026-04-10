@@ -1,10 +1,56 @@
+use pice_daemon::orchestrator::{NoticeLevel, SharedSink, StreamEvent, StreamSink};
 use pice_protocol::{CriterionScore, EvaluateResultParams};
+use std::sync::Arc;
 
 /// Print a streaming text chunk to the terminal (no newline — the chunk itself contains formatting).
 pub fn print_chunk(text: &str) {
     use std::io::Write;
     print!("{text}");
     std::io::stdout().flush().ok();
+}
+
+/// Stream sink that writes chunks to stdout and advisory events to stderr.
+///
+/// T12-era CLI adapter for `pice_daemon::orchestrator::StreamSink`. Used by
+/// workflow commands (prime, plan, execute, review, handoff) that stream
+/// model output directly to the terminal in v0.1 parity mode.
+///
+/// Events are written to stderr so JSON-mode stdout remains a single valid
+/// JSON object. T22 will relocate this to `pice-cli/src/adapter/sink.rs`
+/// once the adapter module exists.
+pub struct TerminalSink;
+
+impl StreamSink for TerminalSink {
+    fn send_chunk(&self, text: &str) {
+        print_chunk(text);
+    }
+
+    fn send_event(&self, event: StreamEvent) {
+        match event {
+            StreamEvent::Notice { level, message } => {
+                let prefix = match level {
+                    NoticeLevel::Info => "info:",
+                    NoticeLevel::Warn => "warning:",
+                    NoticeLevel::Error => "error:",
+                    // Forward-compat: `NoticeLevel` is `#[non_exhaustive]` so
+                    // T19/T21 can add `Debug`/`Trace` without breaking this match.
+                    _ => "notice:",
+                };
+                eprintln!("{prefix} {message}");
+            }
+            // Forward-compat: `StreamEvent` is `#[non_exhaustive]`. New variants
+            // added in T19+ will land here and log at debug level until a
+            // concrete renderer is wired up.
+            _ => {
+                tracing::debug!("TerminalSink: unhandled StreamEvent variant");
+            }
+        }
+    }
+}
+
+/// Convenience factory returning an `Arc<TerminalSink>` as a `SharedSink`.
+pub fn terminal_sink() -> SharedSink {
+    Arc::new(TerminalSink)
 }
 
 /// Print evaluation results as a formatted table.

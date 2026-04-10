@@ -3,8 +3,10 @@ use clap::Args;
 use std::path::PathBuf;
 use tracing::info;
 
-use crate::engine::{orchestrator::ProviderOrchestrator, prompt, session};
+use crate::engine::{output, prompt};
 use pice_core::config::PiceConfig;
+use pice_daemon::orchestrator::{session, NullSink, ProviderOrchestrator, SharedSink};
+use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct HandoffArgs {
@@ -33,13 +35,16 @@ pub async fn run(args: &HandoffArgs) -> Result<()> {
     info!(provider = %config.provider.name, "starting provider for handoff");
     let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, &config).await?;
 
-    let session_result = session::run_session_and_capture(
-        &mut orchestrator,
-        &project_root,
-        handoff_prompt,
-        !args.json,
-    )
-    .await;
+    // JSON mode: capture silently so stdout stays clean.
+    // Text mode: stream to terminal AND capture for the handoff file.
+    let sink: SharedSink = if args.json {
+        Arc::new(NullSink)
+    } else {
+        output::terminal_sink()
+    };
+    let session_result =
+        session::run_session_and_capture(&mut orchestrator, &project_root, handoff_prompt, sink)
+            .await;
     if let Err(e) = orchestrator.shutdown().await {
         tracing::warn!("provider shutdown failed: {e}");
     }

@@ -4,10 +4,11 @@ use pice_protocol::EvaluateResultParams;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use crate::engine::{orchestrator::ProviderOrchestrator, output};
+use crate::engine::output;
 use crate::metrics;
 use pice_core::config::PiceConfig;
 use pice_core::plan_parser;
+use pice_daemon::orchestrator::ProviderOrchestrator;
 
 #[derive(Args, Debug)]
 pub struct EvaluateArgs {

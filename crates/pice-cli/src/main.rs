@@ -1,7 +1,6 @@
 mod commands;
 mod engine;
 mod metrics;
-mod provider;
 mod templates;
 
 use clap::{Parser, Subcommand};

@@ -2,8 +2,9 @@ use anyhow::Result;
 use clap::Args;
 use tracing::info;
 
-use crate::engine::{orchestrator::ProviderOrchestrator, prompt, session};
+use crate::engine::{output, prompt};
 use pice_core::config::PiceConfig;
+use pice_daemon::orchestrator::{session, ProviderOrchestrator};
 
 #[derive(Args, Debug)]
 pub struct ReviewArgs {
@@ -29,7 +30,7 @@ pub async fn run(args: &ReviewArgs) -> Result<()> {
     let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, &config).await?;
 
     if !args.json {
-        orchestrator.on_notification(session::streaming_handler());
+        orchestrator.on_notification(session::streaming_handler(output::terminal_sink()));
     }
 
     let session_result =

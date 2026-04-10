@@ -4,3 +4,5 @@
 //! The pure path-walking lookup logic (`registry`) stays in
 //! `pice-core::provider::registry` so the CLI can preview provider resolution
 //! without depending on tokio.
+
+pub mod host;

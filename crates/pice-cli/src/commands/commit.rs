@@ -4,9 +4,11 @@ use std::path::Path;
 use std::process::Command;
 use tracing::info;
 
-use crate::engine::{orchestrator::ProviderOrchestrator, prompt, session};
+use crate::engine::prompt;
 use crate::metrics;
 use pice_core::config::PiceConfig;
+use pice_daemon::orchestrator::{session, NullSink, ProviderOrchestrator, SharedSink};
+use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct CommitArgs {
@@ -182,8 +184,11 @@ async fn generate_or_use_message(args: &CommitArgs, project_root: &Path) -> Resu
     info!(provider = %config.provider.name, "starting provider for commit message");
     let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, &config).await?;
 
+    // commit always captures silently — the generated message is printed
+    // by caller logic after cleanup, not streamed during generation.
+    let sink: SharedSink = Arc::new(NullSink);
     let session_result =
-        session::run_session_and_capture(&mut orchestrator, project_root, commit_prompt, false)
+        session::run_session_and_capture(&mut orchestrator, project_root, commit_prompt, sink)
             .await;
     if let Err(e) = orchestrator.shutdown().await {
         tracing::warn!("provider shutdown failed: {e}");
