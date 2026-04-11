@@ -42,6 +42,39 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
+  rust-platform-coverage:
+    name: Rust (${{ matrix.os }})
+    # Validates that platform-specific (#[cfg(unix)] / #[cfg(windows)]) code
+    # compiles, lints, and passes tests on the matching OS. Deliberately
+    # narrower than the `rust` job: no pnpm install, no release build, no
+    # fmt check — those run on Linux and are not OS-sensitive. The point of
+    # this job is purely to surface platform divergence early (e.g. the
+    # macOS fd-inheritance race that motivated the integration-test split
+    # in T15, or T16's Windows named-pipe code which has no other runtime
+    # validation path until release.yml fires).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - run: cargo clippy -- -D warnings
+      - run: cargo test
+
   typescript:
     name: TypeScript
     runs-on: ubuntu-latest
