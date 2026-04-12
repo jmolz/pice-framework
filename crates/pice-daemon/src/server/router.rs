@@ -24,13 +24,19 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use pice_core::cli::CommandRequest;
 use pice_core::protocol::{methods, DaemonRequest, DaemonResponse};
 use serde_json::json;
 
 use super::auth;
+use crate::handlers;
+use crate::orchestrator::NullSink;
 
 /// JSON-RPC error code for "method not found" (standard JSON-RPC 2.0).
 const METHOD_NOT_FOUND_CODE: i32 = -32601;
+
+/// JSON-RPC error code for "invalid params" (standard JSON-RPC 2.0).
+const INVALID_PARAMS_CODE: i32 = -32602;
 
 /// JSON-RPC error code for "internal error" (standard JSON-RPC 2.0).
 const INTERNAL_ERROR_CODE: i32 = -32603;
@@ -87,6 +93,20 @@ impl DaemonContext {
     pub fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::Relaxed)
     }
+
+    /// Test-only constructor with a custom version string.
+    ///
+    /// Uses a fixed version instead of `env!("CARGO_PKG_VERSION")` so tests
+    /// can assert on a known value without depending on Cargo.toml.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(token: &str) -> Self {
+        Self {
+            active_token: token.to_string(),
+            version: "0.1.0-test",
+            start_time: Instant::now(),
+            shutdown_requested: AtomicBool::new(false),
+        }
+    }
 }
 
 /// Authenticate and dispatch a daemon RPC request.
@@ -107,7 +127,7 @@ pub async fn route(req: DaemonRequest, ctx: &DaemonContext) -> DaemonResponse {
     match req.method.as_str() {
         methods::DAEMON_HEALTH => handle_health(req.id, ctx),
         methods::DAEMON_SHUTDOWN => handle_shutdown(req.id, ctx),
-        methods::CLI_DISPATCH => handle_dispatch(req).await,
+        methods::CLI_DISPATCH => handle_dispatch(req, ctx).await,
         _ => DaemonResponse::error(req.id, METHOD_NOT_FOUND_CODE, "method not found"),
     }
 }
@@ -141,38 +161,46 @@ fn handle_shutdown(id: u64, ctx: &DaemonContext) -> DaemonResponse {
 
 /// `cli/dispatch` — execute a `CommandRequest` in the daemon.
 ///
-/// Phase 0 stub: T19 populates this with actual handler dispatch. For now,
-/// returns an internal error so callers know the method exists but isn't
-/// wired up yet.
+/// Deserializes `CommandRequest` from `req.params`, dispatches to the
+/// appropriate handler via [`handlers::dispatch`], and wraps the result
+/// into a `DaemonResponse`.
 ///
-/// The full implementation will:
-/// 1. Deserialize `CommandRequest` from `req.params`
-/// 2. Match on the command variant to select a handler
-/// 3. Stream chunks/events via notifications on the connection
-/// 4. Send `cli/stream-done` with the `CommandResponse`
-/// 5. Return a success response
-#[allow(clippy::unused_async)] // Will be truly async once T19 handlers are wired.
-async fn handle_dispatch(req: DaemonRequest) -> DaemonResponse {
-    DaemonResponse::error(
-        req.id,
-        INTERNAL_ERROR_CODE,
-        "cli/dispatch not yet implemented (T19)",
-    )
+/// Phase 0: handlers are stubs that return placeholder responses. The
+/// streaming path (chunks/events via notifications on the connection) is
+/// wired in T21 when the connection handler is built. For now, a `NullSink`
+/// is used — streaming output is discarded.
+///
+/// T21+ will replace the `NullSink` with a socket-backed sink that relays
+/// `cli/stream-chunk` and `cli/stream-event` notifications to the CLI.
+async fn handle_dispatch(req: DaemonRequest, ctx: &DaemonContext) -> DaemonResponse {
+    // Parse CommandRequest from the request params.
+    let command: CommandRequest = match serde_json::from_value(req.params.clone()) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            return DaemonResponse::error(
+                req.id,
+                INVALID_PARAMS_CODE,
+                format!("failed to parse CommandRequest: {e}"),
+            );
+        }
+    };
+
+    // Dispatch to the handler. NullSink is temporary — T21 wires a real sink.
+    match handlers::dispatch(command, ctx, &NullSink).await {
+        Ok(response) => {
+            DaemonResponse::success(req.id, serde_json::to_value(response).unwrap_or_default())
+        }
+        Err(e) => DaemonResponse::error(req.id, INTERNAL_ERROR_CODE, format!("{e}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pice_core::protocol::methods;
 
     /// Helper: create a DaemonContext with a known token.
     fn test_ctx(token: &str) -> DaemonContext {
-        DaemonContext {
-            active_token: token.to_string(),
-            version: "0.1.0-test",
-            start_time: Instant::now(),
-            shutdown_requested: AtomicBool::new(false),
-        }
+        DaemonContext::new_for_test(token)
     }
 
     /// Helper: create a DaemonRequest with the given method and token.
@@ -221,21 +249,48 @@ mod tests {
         );
     }
 
-    // ── cli/dispatch (T19 stub) ────────────────────────────────────────
+    // ── cli/dispatch ─────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn dispatch_returns_not_implemented_stub() {
+    async fn dispatch_routes_valid_command_request() {
         let ctx = test_ctx("valid-token");
-        let req = test_req(3, methods::CLI_DISPATCH, "valid-token");
+        // Send a valid Init command as params.
+        let req = DaemonRequest::new(
+            3,
+            methods::CLI_DISPATCH,
+            "valid-token",
+            serde_json::json!({"command": "init", "force": false, "json": false}),
+        );
+
+        let resp = route(req, &ctx).await;
+        assert_eq!(resp.id, 3);
+        assert!(resp.error.is_none(), "valid dispatch should succeed");
+
+        let result = resp.result.expect("should have result");
+        // The stub handler returns a Text response.
+        assert_eq!(result["type"], "text");
+        assert!(result["content"].as_str().unwrap().contains("stub"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_malformed_params() {
+        let ctx = test_ctx("valid-token");
+        // Send invalid params — missing required fields.
+        let req = DaemonRequest::new(
+            3,
+            methods::CLI_DISPATCH,
+            "valid-token",
+            serde_json::json!({"not_a_command": true}),
+        );
 
         let resp = route(req, &ctx).await;
         assert_eq!(resp.id, 3);
 
-        let err = resp.error.expect("dispatch stub should return error");
-        assert_eq!(err.code, INTERNAL_ERROR_CODE);
+        let err = resp.error.expect("bad params should return error");
+        assert_eq!(err.code, INVALID_PARAMS_CODE);
         assert!(
-            err.message.contains("not yet implemented"),
-            "should indicate stub, got: {}",
+            err.message.contains("failed to parse"),
+            "should indicate parse failure, got: {}",
             err.message
         );
     }
