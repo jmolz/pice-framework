@@ -5,14 +5,13 @@
 <h1 align="center">m0lz.02</h1>
 
 <p align="center">
-  <strong>PICE</strong> — Structured AI coding workflow orchestrator<br>
+  Structured AI coding workflow orchestrator<br>
   Plan → Implement → Contract-Evaluate with dual-model adversarial evaluation<br>
   <a href="https://m0lz.dev/writing/pice-framework">m0lz.dev/writing/pice-framework</a>
 </p>
 
 ---
 
-# PICE CLI
 
 Structured AI coding workflow orchestrator -- Plan, Implement, Contract-Evaluate.
 
@@ -21,16 +20,16 @@ Structured AI coding workflow orchestrator -- Plan, Implement, Contract-Evaluate
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 <p align="center">
-  <img src="docs/images/pice-evaluate-demo.gif" alt="PICE CLI running a Tier 2 dual-model adversarial evaluation showing contract criteria scores and adversarial review" width="700">
+  <img src="docs/images/pice-evaluate-demo.gif" alt="m0lz.02 running a Tier 2 dual-model adversarial evaluation showing contract criteria scores and adversarial review" width="700">
 </p>
 
-## What is PICE?
+## What is m0lz.02?
 
-PICE is a methodology for structured AI coding that breaks work into three formal phases: **Plan** (research, design, and contract negotiation), **Implement** (code generation from a plan), and **Contract-Evaluate** (adversarial grading of the implementation against the contract). The CLI orchestrates this lifecycle -- it manages the state, the prompts, and the measurement while an AI assistant does the actual coding.
+m0lz.02 implements the PICE methodology — a structured approach to AI coding that breaks work into three formal phases: **Plan** (research, design, and contract negotiation), **Implement** (code generation from a plan), and **Contract-Evaluate** (adversarial grading of the implementation against the contract). The CLI orchestrates this lifecycle -- it manages the state, the prompts, and the measurement while an AI assistant does the actual coding.
 
-The key differentiator is **dual-model adversarial evaluation**. Instead of asking the same AI that wrote the code to judge it, PICE runs parallel evaluations from independent models -- Claude grades contract criteria while GPT-5.4 challenges the approach as an adversary. This eliminates the single-model blind spots that plague self-review workflows.
+The key differentiator is **dual-model adversarial evaluation**. Instead of asking the same AI that wrote the code to judge it, m0lz.02 runs parallel evaluations from independent models -- Claude grades contract criteria while GPT-5.4 challenges the approach as an adversary. This eliminates the single-model blind spots that plague self-review workflows.
 
-PICE CLI is the outer loop. It spawns AI providers over a JSON-RPC protocol, feeds them scoped context, captures structured output, and stores quality metrics locally in SQLite. The AI does the coding; PICE makes sure it is doing it well.
+m0lz.02 is the outer loop. It spawns AI providers over a JSON-RPC protocol, feeds them scoped context, captures structured output, and stores quality metrics locally in SQLite. The AI does the coding; m0lz.02 makes sure it is doing it well.
 
 ## Installation
 
@@ -126,11 +125,11 @@ All commands support `--json` for machine-readable output.
 
 ## Architecture
 
-PICE CLI uses a **provider architecture** that separates the Rust core from AI provider implementations:
+m0lz.02 uses a **provider architecture** that separates the Rust core from AI provider implementations:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/architecture-dark.svg">
-  <img alt="PICE architecture: Rust binary with core engine, metrics engine, template engine, and provider host communicating via JSON-RPC over stdio with TypeScript providers (Claude Code, Codex, community)" src="docs/images/architecture-light.svg" width="800">
+  <img alt="m0lz.02 architecture: Rust binary with core engine, metrics engine, template engine, and provider host communicating via JSON-RPC over stdio with TypeScript providers (Claude Code, Codex, community)" src="docs/images/architecture-light.svg" width="800">
 </picture>
 
 The Rust core handles argument parsing, state management, configuration, metrics, and process orchestration. AI providers are separate TypeScript processes that communicate over JSON-RPC on stdio. This design allows community-built providers for any AI coding tool without modifying the core binary.
@@ -150,7 +149,7 @@ Evaluators are **context-isolated** -- they see only the contract JSON, the git 
 
 ## Configuration
 
-PICE stores project configuration in `.pice/config.toml`, created by `pice init`:
+m0lz.02 stores project configuration in `.pice/config.toml`, created by `pice init`:
 
 ```toml
 [provider]
@@ -208,7 +207,7 @@ pice completions fish > ~/.config/fish/completions/pice.fish
 
 ## Telemetry
 
-Telemetry is **opt-in** and **off by default**. When enabled, PICE collects anonymous usage metrics (command frequency, evaluation pass rates, workflow timing) to improve the tool. No code, prompts, or personally identifiable information is collected.
+Telemetry is **opt-in** and **off by default**. When enabled, m0lz.02 collects anonymous usage metrics (command frequency, evaluation pass rates, workflow timing) to improve the tool. No code, prompts, or personally identifiable information is collected.
 
 Telemetry data is fully inspectable in `.pice/telemetry-log.jsonl` before any data leaves your machine. To enable:
 
@@ -222,7 +221,7 @@ enabled = true
 
 ### Why not just use aider/cursor/copilot?
 
-PICE is the orchestration layer, not a replacement for your AI coding tool. It works *with* tools like Claude Code, Cursor, or Copilot through a provider protocol — managing the lifecycle, enforcing contracts, and measuring quality while your preferred tool does the coding. Think of it as the CI/CD for AI coding sessions.
+m0lz.02 is the orchestration layer, not a replacement for your AI coding tool. It works *with* tools like Claude Code, Cursor, or Copilot through a provider protocol — managing the lifecycle, enforcing contracts, and measuring quality while your preferred tool does the coding. Think of it as the CI/CD for AI coding sessions.
 
 ### Why Rust + TypeScript?
 
@@ -234,11 +233,11 @@ No. Telemetry is opt-in and off by default. When enabled, it collects anonymous 
 
 ### Does this actually improve code quality?
 
-That's what the metrics engine is designed to answer. PICE tracks evaluation scores, pass rates, and workflow timing across your sessions so you can see whether structured workflows produce measurably better results than ad-hoc AI coding. Data over vibes.
+That's what the metrics engine is designed to answer. m0lz.02 tracks evaluation scores, pass rates, and workflow timing across your sessions so you can see whether structured workflows produce measurably better results than ad-hoc AI coding. Data over vibes.
 
 ## Roadmap
 
-PICE v0.1 ships the core loop. The [roadmap](docs/roadmap.md) covers what's next — grounded in empirical research and mathematical foundations:
+m0lz.02 v0.1 ships the core loop. The [roadmap](docs/roadmap.md) covers what's next — grounded in empirical research and mathematical foundations:
 
 - **v0.2 — Stack Loops** — per-layer PICE loops across the technology stack with seam verification at every boundary. [Why: software breaks at integration points, not inside components.](docs/roadmap.md#the-seam-problem)
 - **v0.3 — Arch Experts** — dynamically generated specialist agents inferred from your project's architecture files.
