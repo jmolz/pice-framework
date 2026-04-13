@@ -109,5 +109,15 @@ If the CLI needs to preview what the daemon will execute, put the logic in `pice
 - Write to verification manifests (daemon owns writes; CLI may read via `manifest/get`)
 - Run the adaptive algorithms (pure functions live in `pice-core`, but execution happens in the daemon)
 - Create/remove git worktrees (daemon owns worktree lifecycle)
+- Embed or extract templates (daemon owns `rust-embed` and the init handler; CLI delegates via adapter)
+- Run metrics aggregation queries (daemon owns `metrics::aggregator`; CLI dispatches `pice metrics` to daemon)
 
 All of these go through the daemon. The CLI is an adapter, not a participant.
+
+## Streaming and JSON mode
+
+- Daemon handlers receive a `&dyn StreamSink` for streaming output.
+- In inline mode, `TerminalSink` writes chunks to stdout and events to stderr.
+- In socket mode, `NullSink` is used (temporary — socket-side stream relay is Phase 2 work).
+- **Streaming handlers MUST gate on `!req.json`**: never install `streaming_handler()` or use `to_shared_sink()` when JSON mode is active. Stream chunks on stdout corrupt the JSON response.
+- Capture handlers (commit, handoff) that use `run_session_and_capture()` should use `NullSink` as the shared sink in JSON mode.

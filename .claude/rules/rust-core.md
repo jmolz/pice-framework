@@ -43,7 +43,7 @@ paths:
 
 ## Binary Embedding
 
-- Template files from `templates/` are embedded using `rust-embed` or `include_str!`.
+- Template files from `templates/` are embedded using `rust-embed` in `pice-daemon/src/templates/mod.rs`. The CLI no longer embeds templates — the daemon owns all template extraction (init handler).
 - Test that embedded templates match the actual template files in CI.
 
 ## Provider Resolution
@@ -55,9 +55,10 @@ paths:
 
 ## Session Runner
 
-- `engine/session.rs` provides `run_session()` and `run_session_and_capture()`. All provider-backed commands use these — never duplicate the session lifecycle.
-- `streaming_handler()` creates the standard notification handler for text-mode streaming. Use it instead of inline closures.
+- `pice-daemon/src/orchestrator/session.rs` provides `run_session()` and `run_session_and_capture()`. All provider-backed handlers use these — never duplicate the session lifecycle.
+- `streaming_handler()` creates the standard notification handler for text-mode streaming. Use it instead of inline closures. **Never install the streaming handler when `req.json` is true** — it writes chunks to stdout that corrupt JSON output.
 - The always-shutdown pattern: `let result = session::run_session(...); orchestrator.shutdown(); result?;` — the provider shuts down even on failure.
+- The `to_shared_sink()` bridge in `handlers/mod.rs` converts `&dyn StreamSink` to `SharedSink` (`Arc<dyn StreamSink>`) via unsafe raw pointer transmute. Every call site MUST have a `// SAFETY INVARIANT:` comment documenting that the session is awaited to completion before the handler returns.
 
 ## Contract Parsing
 

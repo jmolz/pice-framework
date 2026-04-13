@@ -51,7 +51,7 @@ pnpm typecheck                 # Type check (tsc --noEmit)
 cargo fmt --check && cargo clippy -- -D warnings && cargo test && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo build --release
 ```
 
-**Expected baseline:** 168 Rust tests, 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
+**Expected baseline:** 271 Rust tests (1 ignored), 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
 
 ---
 
@@ -66,8 +66,7 @@ pice/
 │   │       ├── commands/      # One module per CLI command
 │   │       ├── engine/        # PICE loop state machine, lifecycle
 │   │       ├── config/        # .pice/ and .claude/ management
-│   │       ├── metrics/       # SQLite store (db, store, aggregator, telemetry)
-│   │       ├── templates/     # Scaffolding, file generation
+│   │       ├── metrics/       # Re-exports from pice-daemon (CLI reads only)
 │   │       └── provider/      # Provider host, JSON-RPC, process mgmt
 │   └── pice-protocol/         # Shared JSON-RPC protocol types
 │       └── src/lib.rs
@@ -99,10 +98,16 @@ pice/
 The CLI follows a **Provider Architecture** pattern:
 
 ```
-pice (Rust binary)
-├── Core engine ──── state machine, lifecycle, config
-├── Metrics engine ── SQLite + telemetry
-├── Template engine ── scaffolding, file generation
+pice-cli (CLI adapter)
+├── Arg parsing ──── clap, shell completions
+├── Adapter layer ── inline mode or socket → pice-daemon
+└── TTY rendering ── terminal output, streaming display
+
+pice-daemon (headless daemon)
+├── Handlers ──── 11 command handlers (init, plan, execute, evaluate, etc.)
+├── Orchestrator ── provider session lifecycle, streaming
+├── Metrics ──── SQLite writer + aggregation + telemetry
+├── Templates ── embedded scaffolding (rust-embed)
 ├── Provider host ── spawns and manages provider processes
 │    ↕ JSON-RPC over stdio
 └── Providers (TS) ── Claude Code, Codex, future community providers
@@ -143,12 +148,12 @@ pice (Rust binary)
 
 ### Session Lifecycle
 - All provider-backed commands use `session::run_session()` or `session::run_session_and_capture()` from `engine/session.rs`. Never duplicate the create → send → destroy lifecycle in command files.
-- For streaming output in text mode, use `session::streaming_handler()` — not inline notification handler closures.
+- For streaming output in text mode, use `session::streaming_handler()` — not inline notification handler closures. **In JSON mode (`req.json`), do NOT install the streaming handler** — chunks written to stdout corrupt the JSON response.
 - Commands that need the AI's response text (commit, handoff) use `run_session_and_capture()`. Commands that only stream (prime, review, plan, execute) use `run_session()`.
 - The caller registers the notification handler before calling `run_session()`. The session module owns the handler for `run_session_and_capture()`.
 
 ### Git Index Safety
-- Commands that auto-stage (`git add -u`) must track whether they did so and restore the index (`git reset`) on all non-commit exit paths (dry-run, errors, empty messages).
+- Commands that auto-stage (`git add -u`) must use an RAII drop guard (`AutoStageGuard`) that calls `git reset` in `Drop`. This guarantees index restoration on ALL exit paths — including `?` propagation and panics — not just explicitly handled branches. The guard is `disarm()`ed only after a successful `git commit`.
 - Never generate commit messages from a diff that includes files outside the staged set. Stage first, then build the prompt from `get_staged_diff()`.
 - Check `git status` exit code before inspecting stdout — non-git directories return empty stdout but non-zero exit.
 
