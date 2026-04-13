@@ -43,7 +43,7 @@ pub async fn run_command(req: CommandRequest, sink: &dyn StreamSink) -> Result<C
 mod tests {
     use super::*;
     use crate::orchestrator::NullSink;
-    use pice_core::cli::{InitRequest, StatusRequest};
+    use pice_core::cli::StatusRequest;
 
     #[tokio::test]
     async fn inline_status_returns_stub_response() {
@@ -62,15 +62,16 @@ mod tests {
 
     #[tokio::test]
     async fn inline_json_mode_returns_json_variant() {
-        let req = CommandRequest::Init(InitRequest {
-            force: false,
+        // Use evaluate (still a stub) to test json-mode variant selection
+        // without needing a temp directory or API keys.
+        let req = CommandRequest::Evaluate(pice_core::cli::EvaluateRequest {
+            plan_path: std::path::PathBuf::from("plan.md"),
             json: true,
         });
         let resp = run_command(req, &NullSink).await.expect("run_command");
         match resp {
             CommandResponse::Json { value } => {
                 assert_eq!(value["status"], "stub");
-                assert_eq!(value["command"], "init");
             }
             other => panic!("expected Json response, got: {other:?}"),
         }

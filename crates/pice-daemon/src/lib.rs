@@ -42,3 +42,4 @@ pub mod orchestrator;
 pub mod prompt;
 pub mod provider;
 pub mod server;
+pub mod templates;

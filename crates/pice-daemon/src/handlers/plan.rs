@@ -2,27 +2,35 @@
 
 use anyhow::Result;
 use pice_core::cli::{CommandResponse, PlanRequest};
+use serde_json::json;
 
-use crate::orchestrator::StreamSink;
+use super::to_shared_sink;
+use crate::orchestrator::session::{self, streaming_handler};
+use crate::orchestrator::{ProviderOrchestrator, StreamSink};
+use crate::prompt::builders;
 use crate::server::router::DaemonContext;
 
-#[allow(clippy::unused_async)]
 pub async fn run(
     req: PlanRequest,
-    _ctx: &DaemonContext,
+    ctx: &DaemonContext,
     sink: &dyn StreamSink,
 ) -> Result<CommandResponse> {
-    sink.send_chunk(&format!(
-        "plan handler: not yet ported to daemon (description: {})\n",
-        req.description
-    ));
+    let project_root = ctx.project_root();
+    let config = ctx.config();
+    let prompt = builders::build_plan_prompt(&req.description, project_root)?;
+
+    let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, config).await?;
+    orchestrator.on_notification(streaming_handler(to_shared_sink(sink)));
+
+    let result = session::run_session(&mut orchestrator, project_root, prompt).await;
+    orchestrator.shutdown().await.ok();
+    result?;
+
     if req.json {
         Ok(CommandResponse::Json {
-            value: serde_json::json!({"status": "stub", "command": "plan"}),
+            value: json!({"status": "complete"}),
         })
     } else {
-        Ok(CommandResponse::Text {
-            content: "plan: handler not yet ported from pice-cli (Phase 0 stub)".to_string(),
-        })
+        Ok(CommandResponse::Empty)
     }
 }

@@ -36,11 +36,49 @@ pub mod prime;
 pub mod review;
 pub mod status;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use pice_core::cli::{CommandRequest, CommandResponse};
 
-use crate::orchestrator::StreamSink;
+use crate::orchestrator::{SharedSink, StreamEvent, StreamSink};
 use crate::server::router::DaemonContext;
+
+/// Bridge a borrowed `&dyn StreamSink` to a `SharedSink` for the session runner.
+///
+/// Safety: the returned `SharedSink` must not outlive the borrowed `sink`.
+/// This is guaranteed by the handler pattern: the session is awaited to
+/// completion before the handler returns, so the `Arc` is dropped before
+/// the borrow expires.
+pub(crate) fn to_shared_sink(sink: &dyn StreamSink) -> SharedSink {
+    // SAFETY: We erase the lifetime by going through a raw pointer. The
+    // returned Arc must not outlive the borrowed sink. This is guaranteed by
+    // the handler pattern: the session is awaited to completion before the
+    // handler returns, so the Arc is dropped before the borrow expires.
+    let ptr: *const dyn StreamSink = sink;
+    let static_ptr: *const (dyn StreamSink + 'static) =
+        unsafe { std::mem::transmute(ptr) };
+    Arc::new(SinkBridge(static_ptr))
+}
+
+struct SinkBridge(*const dyn StreamSink);
+
+// SAFETY: The pointer is only dereferenced while the original reference is alive.
+// The handler awaits the session to completion, then drops the Arc, before returning.
+unsafe impl Send for SinkBridge {}
+unsafe impl Sync for SinkBridge {}
+
+impl StreamSink for SinkBridge {
+    fn send_chunk(&self, text: &str) {
+        // SAFETY: guaranteed alive by handler pattern (see to_shared_sink doc)
+        unsafe { &*self.0 }.send_chunk(text);
+    }
+
+    fn send_event(&self, event: StreamEvent) {
+        // SAFETY: guaranteed alive by handler pattern (see to_shared_sink doc)
+        unsafe { &*self.0 }.send_event(event);
+    }
+}
 
 /// Dispatch a `CommandRequest` to the appropriate handler.
 ///
@@ -95,13 +133,25 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_init() {
-        let ctx = test_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx =
+            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Init(pice_core::cli::InitRequest {
             force: false,
             json: false,
         });
         let resp = dispatch(req, &ctx, &NullSink).await.expect("dispatch");
-        assert_stub_response(&resp);
+        match &resp {
+            CommandResponse::Text { content } => {
+                assert!(
+                    content.contains("PICE initialized"),
+                    "init should report success, got: {content}"
+                );
+            }
+            other => panic!("expected Text response from init, got: {other:?}"),
+        }
+        assert!(dir.path().join(".claude/commands/plan-feature.md").exists());
+        assert!(dir.path().join(".pice/config.toml").exists());
     }
 
     #[tokio::test]
@@ -205,7 +255,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_json_mode_returns_json_variant() {
-        let ctx = test_ctx();
+        let dir = tempfile::tempdir().unwrap();
+        let ctx =
+            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Init(pice_core::cli::InitRequest {
             force: false,
             json: true,
@@ -213,7 +265,10 @@ mod tests {
         let resp = dispatch(req, &ctx, &NullSink).await.expect("dispatch");
         match resp {
             CommandResponse::Json { value } => {
-                assert_eq!(value["command"], "init");
+                assert!(
+                    value["totalCreated"].as_u64().unwrap() > 0,
+                    "init json should report created files"
+                );
             }
             other => panic!("json mode should return Json variant, got: {other:?}"),
         }

@@ -27,6 +27,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = "0.2"
 rusqlite = { workspace = true }
+rust-embed = "8"
 chrono = { workspace = true }
 reqwest = { workspace = true }
 getrandom = { workspace = true }

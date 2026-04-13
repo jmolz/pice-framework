@@ -21,10 +21,12 @@
 //! T19 (handlers), T20 (inline mode), and T21 (lifecycle) extend it with
 //! orchestrator, metrics DB, config, and provider host references.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use pice_core::cli::CommandRequest;
+use pice_core::config::PiceConfig;
 use pice_core::protocol::{methods, DaemonRequest, DaemonResponse};
 use serde_json::json;
 
@@ -71,18 +73,30 @@ pub struct DaemonContext {
     /// `Relaxed` ordering is sufficient: the shutdown flag is advisory (the
     /// event loop polls it periodically), not a synchronization fence.
     shutdown_requested: AtomicBool,
+
+    /// The project root directory. Handlers use this to find `.claude/plans/`,
+    /// `.pice/config.toml`, the metrics DB, and other project-relative paths.
+    project_root: PathBuf,
+
+    /// Parsed `.pice/config.toml`. Falls back to `PiceConfig::default()` when
+    /// the config file doesn't exist (uninitialized project).
+    config: PiceConfig,
 }
 
 impl DaemonContext {
     /// Construct a new context. Called once during daemon startup.
     ///
     /// `token` is the hex-encoded bearer token from [`auth::generate_token`].
-    pub fn new(token: String) -> Self {
+    /// `project_root` is the working directory the daemon serves.
+    pub fn new(token: String, project_root: PathBuf) -> Self {
+        let config = load_config(&project_root);
         Self {
             active_token: token,
             version: env!("CARGO_PKG_VERSION"),
             start_time: Instant::now(),
             shutdown_requested: AtomicBool::new(false),
+            project_root,
+            config,
         }
     }
 
@@ -91,13 +105,28 @@ impl DaemonContext {
     /// Used by `PICE_DAEMON_INLINE=1` and integration tests. Skips: socket
     /// setup, auth token generation, stale-cleanup, watchdog. The token is
     /// set to an empty string since inline mode never validates auth.
+    /// Uses the process's current working directory as project root.
     pub fn inline() -> Self {
+        let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = load_config(&project_root);
         Self {
             active_token: String::new(),
             version: env!("CARGO_PKG_VERSION"),
             start_time: Instant::now(),
             shutdown_requested: AtomicBool::new(false),
+            project_root,
+            config,
         }
+    }
+
+    /// The project root directory.
+    pub fn project_root(&self) -> &PathBuf {
+        &self.project_root
+    }
+
+    /// The parsed PICE config.
+    pub fn config(&self) -> &PiceConfig {
+        &self.config
     }
 
     /// Check whether a shutdown has been requested.
@@ -119,8 +148,32 @@ impl DaemonContext {
             version: "0.1.0-test",
             start_time: Instant::now(),
             shutdown_requested: AtomicBool::new(false),
+            project_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            config: PiceConfig::default(),
         }
     }
+
+    /// Test-only constructor with a custom project root.
+    ///
+    /// Used by handler tests that need to point at a temporary directory
+    /// (e.g., `init` handler tests that scaffold files).
+    #[cfg(test)]
+    pub(crate) fn new_for_test_with_root(token: &str, project_root: PathBuf) -> Self {
+        Self {
+            active_token: token.to_string(),
+            version: "0.1.0-test",
+            start_time: Instant::now(),
+            shutdown_requested: AtomicBool::new(false),
+            project_root,
+            config: PiceConfig::default(),
+        }
+    }
+}
+
+/// Load config from `.pice/config.toml`, falling back to defaults.
+fn load_config(project_root: &std::path::Path) -> PiceConfig {
+    let config_path = project_root.join(".pice/config.toml");
+    PiceConfig::load(&config_path).unwrap_or_else(|_| PiceConfig::default())
 }
 
 /// Authenticate and dispatch a daemon RPC request.
@@ -267,7 +320,8 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_routes_valid_command_request() {
-        let ctx = test_ctx("valid-token");
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = DaemonContext::new_for_test_with_root("valid-token", dir.path().to_path_buf());
         // Send a valid Init command as params.
         let req = DaemonRequest::new(
             3,
@@ -281,9 +335,15 @@ mod tests {
         assert!(resp.error.is_none(), "valid dispatch should succeed");
 
         let result = resp.result.expect("should have result");
-        // The stub handler returns a Text response.
+        // The init handler returns a Text response with initialization output.
         assert_eq!(result["type"], "text");
-        assert!(result["content"].as_str().unwrap().contains("stub"));
+        assert!(
+            result["content"]
+                .as_str()
+                .unwrap()
+                .contains("PICE initialized"),
+            "init should report success"
+        );
     }
 
     #[tokio::test]
@@ -368,7 +428,7 @@ mod tests {
 
     #[test]
     fn context_new_uses_cargo_version() {
-        let ctx = DaemonContext::new("token".to_string());
+        let ctx = DaemonContext::new("token".to_string(), PathBuf::from("."));
         // env!("CARGO_PKG_VERSION") is resolved at compile time from Cargo.toml.
         assert!(!ctx.version.is_empty(), "version should not be empty");
         assert!(

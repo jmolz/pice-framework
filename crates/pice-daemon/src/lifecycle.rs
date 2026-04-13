@@ -53,7 +53,8 @@ pub async fn run_with_paths(socket_path: SocketPath, token_path: std::path::Path
     info!(token_path = %token_path.display(), "auth token written");
 
     // Build shared context.
-    let ctx = Arc::new(DaemonContext::new(token));
+    let project_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let ctx = Arc::new(DaemonContext::new(token, project_root));
 
     // Platform-specific bind + accept loop.
     match socket_path {

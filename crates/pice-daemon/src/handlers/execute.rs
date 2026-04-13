@@ -1,35 +1,53 @@
 //! `pice execute` handler — run a plan through the provider.
-//!
-//! This is the streaming exemplar handler. The full implementation will:
-//! 1. Load and parse the plan file
-//! 2. Build the execute prompt via `prompt::build_execute_prompt`
-//! 3. Start a provider session via `ProviderOrchestrator`
-//! 4. Stream chunks to `sink` during execution
-//! 5. Record metrics events (execute_started, execute_completed)
 
 use anyhow::Result;
 use pice_core::cli::{CommandResponse, ExecuteRequest};
+use pice_core::plan_parser::ParsedPlan;
+use serde_json::json;
 
-use crate::orchestrator::StreamSink;
+use super::to_shared_sink;
+use crate::orchestrator::session::{self, streaming_handler};
+use crate::orchestrator::{ProviderOrchestrator, StreamSink};
+use crate::prompt::builders;
 use crate::server::router::DaemonContext;
 
-#[allow(clippy::unused_async)]
 pub async fn run(
     req: ExecuteRequest,
-    _ctx: &DaemonContext,
+    ctx: &DaemonContext,
     sink: &dyn StreamSink,
 ) -> Result<CommandResponse> {
-    sink.send_chunk(&format!(
-        "execute handler: not yet ported to daemon (plan: {})\n",
-        req.plan_path.display()
-    ));
+    let project_root = ctx.project_root();
+    let config = ctx.config();
+
+    // Resolve plan path (relative paths are resolved against project root)
+    let plan_path = if req.plan_path.is_absolute() {
+        req.plan_path.clone()
+    } else {
+        project_root.join(&req.plan_path)
+    };
+
+    if !plan_path.exists() {
+        return Ok(CommandResponse::Exit {
+            code: 1,
+            message: format!("plan file not found: {}", plan_path.display()),
+        });
+    }
+
+    let plan = ParsedPlan::load(&plan_path)?;
+    let prompt = builders::build_execute_prompt(&plan.content, project_root)?;
+
+    let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, config).await?;
+    orchestrator.on_notification(streaming_handler(to_shared_sink(sink)));
+
+    let result = session::run_session(&mut orchestrator, project_root, prompt).await;
+    orchestrator.shutdown().await.ok();
+    result?;
+
     if req.json {
         Ok(CommandResponse::Json {
-            value: serde_json::json!({"status": "stub", "command": "execute"}),
+            value: json!({"status": "complete", "plan": plan.title}),
         })
     } else {
-        Ok(CommandResponse::Text {
-            content: "execute: handler not yet ported from pice-cli (Phase 0 stub)".to_string(),
-        })
+        Ok(CommandResponse::Empty)
     }
 }
