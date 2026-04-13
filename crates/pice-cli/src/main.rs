@@ -2,7 +2,6 @@ mod adapter;
 mod commands;
 mod engine;
 mod metrics;
-mod templates;
 
 use clap::{Parser, Subcommand};
 use clap_complete::{generate, Shell};
