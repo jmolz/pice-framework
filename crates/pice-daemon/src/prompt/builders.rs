@@ -285,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn build_prime_prompt_includes_tree() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -296,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn build_prime_prompt_includes_git_history() {
         let dir = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
@@ -323,6 +325,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn build_prime_prompt_includes_handoff() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
