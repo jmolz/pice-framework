@@ -19,6 +19,7 @@
 //! `pice-cli::metrics::aggregator` (read-only aggregation queries) lives in
 //! pice-cli and imports the `MetricsDb` type from here.
 
+pub mod aggregator;
 pub mod db;
 pub mod store;
 pub mod telemetry;
