@@ -1,5 +1,6 @@
 //! `pice commit` handler — AI-generated commit message.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,6 +12,38 @@ use crate::orchestrator::{NullSink, ProviderOrchestrator, StreamSink};
 use crate::prompt::builders;
 use crate::server::router::DaemonContext;
 
+/// RAII guard that restores the git index when dropped.
+///
+/// Created after auto-staging (`git add -u`). If the commit succeeds,
+/// call `disarm()` to prevent rollback. On any other exit path — `?`,
+/// early return, or panic — the `Drop` impl runs `git reset` to
+/// restore the index, satisfying the git-index-safety contract.
+struct AutoStageGuard<'a> {
+    project_root: &'a Path,
+    active: bool,
+}
+
+impl<'a> AutoStageGuard<'a> {
+    fn new(project_root: &'a Path) -> Self {
+        Self {
+            project_root,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for AutoStageGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            restore_index(self.project_root);
+        }
+    }
+}
+
 pub async fn run(
     req: CommitRequest,
     ctx: &DaemonContext,
@@ -21,7 +54,7 @@ pub async fn run(
 
     // Check if there's anything staged already
     let staged_diff = pice_core::prompt::helpers::get_staged_diff(project_root)?;
-    let mut did_auto_stage = false;
+    let mut guard: Option<AutoStageGuard<'_>> = None;
 
     if staged_diff.trim().is_empty() {
         // Try auto-staging tracked modified files
@@ -32,12 +65,11 @@ pub async fn run(
             .context("failed to run git add -u")?;
 
         if add_result.status.success() {
-            did_auto_stage = true;
+            guard = Some(AutoStageGuard::new(project_root));
             // Check again after staging
             let new_diff = pice_core::prompt::helpers::get_staged_diff(project_root)?;
             if new_diff.trim().is_empty() {
-                // Restore index since we auto-staged but found nothing
-                restore_index(project_root);
+                // Guard drops here → restores index
                 return Ok(CommandResponse::Exit {
                     code: 1,
                     message: "nothing staged to commit".to_string(),
@@ -51,11 +83,11 @@ pub async fn run(
         }
     }
 
-    // Generate or use provided message
+    // Generate or use provided message.
+    // If any `?` propagates here, the guard restores the index automatically.
     let commit_message = if let Some(msg) = &req.message {
         msg.clone()
     } else {
-        // Build prompt and capture AI-generated message
         let prompt = builders::build_commit_prompt(project_root)?;
         let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, config).await?;
         let captured = session::run_session_and_capture(
@@ -71,9 +103,7 @@ pub async fn run(
     };
 
     if commit_message.trim().is_empty() {
-        if did_auto_stage {
-            restore_index(project_root);
-        }
+        // Guard drops here → restores index
         return Ok(CommandResponse::Exit {
             code: 1,
             message: "generated commit message was empty".to_string(),
@@ -82,9 +112,7 @@ pub async fn run(
 
     // Dry run — show message without committing
     if req.dry_run {
-        if did_auto_stage {
-            restore_index(project_root);
-        }
+        // Guard drops here → restores index
         if req.json {
             return Ok(CommandResponse::Json {
                 value: json!({"status": "dry_run", "message": commit_message}),
@@ -103,14 +131,17 @@ pub async fn run(
         .context("failed to run git commit")?;
 
     if !commit_result.status.success() {
-        if did_auto_stage {
-            restore_index(project_root);
-        }
+        // Guard drops here → restores index
         let stderr = String::from_utf8_lossy(&commit_result.stderr);
         return Ok(CommandResponse::Exit {
             code: 1,
             message: format!("git commit failed: {stderr}"),
         });
+    }
+
+    // Commit succeeded — disarm the guard so we don't undo the stage.
+    if let Some(g) = &mut guard {
+        g.disarm();
     }
 
     if req.json {

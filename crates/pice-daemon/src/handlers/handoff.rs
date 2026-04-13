@@ -21,8 +21,13 @@ pub async fn run(
 
     let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, config).await?;
 
-    // Stream and capture: handoff streams to the terminal while collecting text
-    let shared = to_shared_sink(sink);
+    // Stream and capture: in text mode, handoff streams to the terminal while
+    // collecting text. In JSON mode, use NullSink to keep stdout clean.
+    let shared: crate::orchestrator::SharedSink = if req.json {
+        std::sync::Arc::new(crate::orchestrator::NullSink)
+    } else {
+        to_shared_sink(sink)
+    };
     let captured =
         session::run_session_and_capture(&mut orchestrator, project_root, prompt, shared).await;
     orchestrator.shutdown().await.ok();

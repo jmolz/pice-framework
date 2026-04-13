@@ -33,6 +33,15 @@ pnpm build
 
 **Expected baseline:** 168 Rust tests, 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
 
+## Determine Context (Worktree or Main)
+
+```bash
+git branch --show-current
+git worktree list
+```
+
+Determine if you're in a **worktree** (feature branch) or on **main**. The remaining phases adapt based on this.
+
 ## Commit by Feature (CRITICAL)
 
 **Do NOT create one giant commit.** Group changes by feature/purpose.
@@ -66,9 +75,32 @@ git commit -m "docs(plans): add feature plan"
 
 If any AI layer files changed (CLAUDE.md, .claude/rules/, .claude/commands/), add a `Context:` section to the commit body.
 
+## Merge to Main (Worktree Only)
+
+**Skip this phase if already on main.**
+
+If you committed on a feature branch in a worktree, merge it into main:
+
+```bash
+FEATURE_BRANCH=$(git branch --show-current)
+WORKTREE_PATH=$(pwd)
+MAIN_REPO=$(git worktree list | head -1 | awk '{print $1}')
+cd "$MAIN_REPO"
+git checkout main
+git pull origin main
+git merge "$FEATURE_BRANCH"
+```
+
+If the merge has conflicts:
+
+1. Resolve conflicts — favor the feature branch for new code, preserve main for unrelated changes
+2. Run the full validation suite again after resolving
+3. Commit the merge resolution
+
 ## Push
 
 ```bash
+# Push from the main repo directory (not the worktree)
 git push origin main
 ```
 
@@ -143,11 +175,33 @@ EOF
 )"
 ```
 
+## Clean Up Worktree (Worktree Only)
+
+**Skip this phase if you were already on main.**
+
+After a successful merge and push, remove the worktree and feature branch:
+
+```bash
+git worktree remove "$WORKTREE_PATH"
+git branch -d "$FEATURE_BRANCH"
+```
+
+Verify cleanup:
+
+```bash
+git worktree list
+git branch
+git status
+```
+
+If `git branch -d` refuses (branch not fully merged), investigate — do NOT force-delete with `-D` without understanding why.
+
 ## Verify
 
 ```bash
+git log --oneline -5
 git status
-# Expected: "nothing to commit, working tree clean"
+# Expected: on main, clean tree, feature commits visible in log
 
 gh release list --limit 3
 # Expected: new release shows as "Latest"

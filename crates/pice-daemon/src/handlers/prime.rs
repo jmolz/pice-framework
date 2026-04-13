@@ -20,7 +20,9 @@ pub async fn run(
     let prompt = builders::build_prime_prompt(project_root)?;
 
     let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, config).await?;
-    orchestrator.on_notification(streaming_handler(to_shared_sink(sink)));
+    if !req.json {
+        orchestrator.on_notification(streaming_handler(to_shared_sink(sink)));
+    }
 
     let result = session::run_session(&mut orchestrator, project_root, prompt).await;
     orchestrator.shutdown().await.ok();
