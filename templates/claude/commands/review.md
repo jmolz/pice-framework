@@ -179,8 +179,21 @@ Expected baseline: {describe your known-good state — lint error count, test co
 ## Phase 3: Code Review of Current Changes
 
 ```bash
-git diff HEAD
+git branch --show-current
 git status
+```
+
+**If on a feature branch (worktree)**, diff against main to see the full feature scope:
+
+```bash
+git diff main...HEAD
+git diff main...HEAD --stat
+```
+
+**If on main**, diff against the last commit:
+
+```bash
+git diff HEAD
 ```
 
 If reviewing a specific commit, check it out or diff against it.
