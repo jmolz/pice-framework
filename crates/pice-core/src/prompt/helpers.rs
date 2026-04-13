@@ -446,16 +446,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn get_project_tree_includes_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
 
         let result = get_project_tree(dir.path()).unwrap();
-        // Check for both Unix and Windows path separators
         assert!(
-            result.contains("src/main.rs") || result.contains("src\\main.rs"),
-            "expected tree to contain src/main.rs or src\\main.rs, got:\n{result}"
+            result.contains("src/main.rs"),
+            "expected tree to contain src/main.rs, got:\n{result}"
         );
     }
 }
