@@ -16,8 +16,8 @@
 
 Structured AI coding workflow orchestrator -- Plan, Implement, Contract-Evaluate.
 
-[![CI](https://github.com/jmolz/pice-framework/actions/workflows/ci.yml/badge.svg)](https://github.com/jmolz/pice-framework/actions/workflows/ci.yml)
-[![Tests: 217](https://img.shields.io/badge/tests-217_passing-brightgreen)](https://github.com/jmolz/pice-framework/actions/workflows/ci.yml)
+[![CI](https://github.com/jmolz/m0lz.02/actions/workflows/ci.yml/badge.svg)](https://github.com/jmolz/m0lz.02/actions/workflows/ci.yml)
+[![Tests: 217](https://img.shields.io/badge/tests-217_passing-brightgreen)](https://github.com/jmolz/m0lz.02/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 <p align="center">
