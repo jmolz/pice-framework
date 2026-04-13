@@ -87,6 +87,23 @@ Use this template as the output structure — fill in every section with real da
 
 @.claude/templates/plan-template.md
 
+### Worktree Execution (REQUIRED)
+
+All new features MUST be executed in a git worktree to isolate work from main. The plan must include a `## Worktree` section specifying:
+
+```markdown
+## Worktree
+
+- **Branch**: `feature/{kebab-case-name}`
+- **Path**: `.worktrees/{kebab-case-name}`
+```
+
+This ensures:
+- Main stays clean and deployable at all times
+- No risk of regressing or overwriting previously completed work
+- Clean merge history when the feature is complete
+- Parallel features can be developed in separate worktrees without conflict
+
 ---
 
 ## Phase 6: Contract Negotiation

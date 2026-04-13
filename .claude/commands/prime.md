@@ -37,6 +37,7 @@ Read key config files:
 git log -15 --oneline 2>/dev/null
 git status 2>/dev/null
 git branch --show-current 2>/dev/null
+git worktree list 2>/dev/null
 ```
 
 ### 4. Identify Key Entry Points
@@ -77,6 +78,7 @@ Summarize in under 300 words with bullet points:
 
 - Active branch and recent work
 - Any uncommitted changes
+- Active worktrees and their feature branches (if any)
 - Pending plans or handoffs
 - Handoff status: which items are resolved vs. still open, whether HANDOFF.md should be cleaned up or deleted
 

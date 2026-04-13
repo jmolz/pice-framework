@@ -39,6 +39,7 @@ git status
 git diff --stat HEAD
 git log --oneline -20
 git branch --show-current
+git worktree list
 ```
 
 **If a previous HANDOFF.md existed**, cross-reference its "In Progress / Next Steps" items against the git log:
@@ -63,9 +64,20 @@ Review everything that happened in the current session:
 - What errors were encountered and resolved?
 - What dead ends were explored?
 
+### Worktree State
+
+If working in a git worktree, capture:
+
+- **Worktree path**: output of `pwd`
+- **Feature branch**: output of `git branch --show-current`
+- **Main repo path**: first line of `git worktree list`
+- **Merge status**: is the feature ready to merge, or still in progress?
+
+This is critical — the next session needs to know where to `cd` to resume work.
+
 ### 4. Write HANDOFF.md
 
-Save to `HANDOFF.md` in the project root. Use this template as the structure — fill in every section with real data from reconciliation + current session:
+Save to `HANDOFF.md` in the project root (the main repo, not the worktree). Use this template as the structure — fill in every section with real data from reconciliation + current session:
 
 @.claude/templates/HANDOFF-template.md
 
