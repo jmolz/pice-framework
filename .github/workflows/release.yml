@@ -51,19 +51,24 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: pice
+            daemon_binary: pice-daemon
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             binary: pice
+            daemon_binary: pice-daemon
             cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
             binary: pice
+            daemon_binary: pice-daemon
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: pice
+            daemon_binary: pice-daemon
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             binary: pice.exe
+            daemon_binary: pice-daemon.exe
     steps:
       - uses: actions/checkout@v4
 
@@ -83,11 +88,13 @@ jobs:
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }}
 
-      - name: Upload binary artifact
+      - name: Upload binary artifacts
         uses: actions/upload-artifact@v4
         with:
           name: pice-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          path: |
+            target/${{ matrix.target }}/release/${{ matrix.binary }}
+            target/${{ matrix.target }}/release/${{ matrix.daemon_binary }}
 
   smoke-test:
     name: Smoke test
@@ -102,11 +109,12 @@ jobs:
           name: pice-x86_64-unknown-linux-gnu
           path: ./bin
 
-      - name: Verify binary runs
+      - name: Verify binaries run
         run: |
-          chmod +x ./bin/pice
+          chmod +x ./bin/pice ./bin/pice-daemon
           ./bin/pice --version
           ./bin/pice --help
+          test -x ./bin/pice-daemon
 
   completions:
     name: Generate shell completions
@@ -152,12 +160,12 @@ jobs:
           mkdir -p release
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin; do
             cd artifacts/pice-${target}
-            chmod +x pice
-            tar czf ../../release/pice-${target}.tar.gz pice
+            chmod +x pice pice-daemon
+            tar czf ../../release/pice-${target}.tar.gz pice pice-daemon
             cd ../..
           done
           cd artifacts/pice-x86_64-pc-windows-msvc
-          zip ../../release/pice-x86_64-pc-windows-msvc.zip pice.exe
+          zip ../../release/pice-x86_64-pc-windows-msvc.zip pice.exe pice-daemon.exe
           cd ../..
           cp -r artifacts/completions release/
 
@@ -193,12 +201,15 @@ jobs:
 
       - name: Copy binaries to NPM packages
         run: |
-          cp artifacts/pice-aarch64-apple-darwin/pice npm/pice-darwin-arm64/pice
-          cp artifacts/pice-x86_64-apple-darwin/pice npm/pice-darwin-x64/pice
-          cp artifacts/pice-aarch64-unknown-linux-gnu/pice npm/pice-linux-arm64/pice
-          cp artifacts/pice-x86_64-unknown-linux-gnu/pice npm/pice-linux-x64/pice
+          for pkg_target in "aarch64-apple-darwin:pice-darwin-arm64" "x86_64-apple-darwin:pice-darwin-x64" "aarch64-unknown-linux-gnu:pice-linux-arm64" "x86_64-unknown-linux-gnu:pice-linux-x64"; do
+            target="${pkg_target%%:*}"
+            pkg="${pkg_target##*:}"
+            cp "artifacts/pice-${target}/pice" "npm/${pkg}/pice"
+            cp "artifacts/pice-${target}/pice-daemon" "npm/${pkg}/pice-daemon"
+            chmod +x "npm/${pkg}/pice" "npm/${pkg}/pice-daemon"
+          done
           cp artifacts/pice-x86_64-pc-windows-msvc/pice.exe npm/pice-win32-x64/pice.exe
-          chmod +x npm/pice-darwin-arm64/pice npm/pice-darwin-x64/pice npm/pice-linux-arm64/pice npm/pice-linux-x64/pice
+          cp artifacts/pice-x86_64-pc-windows-msvc/pice-daemon.exe npm/pice-win32-x64/pice-daemon.exe
 
       - name: Publish platform packages
         env:

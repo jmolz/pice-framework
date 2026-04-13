@@ -10,11 +10,11 @@ const fs = require("fs");
  * (Alpine, Void, etc.) are detected and rejected with a clear message.
  */
 const PLATFORM_MAP = {
-  "darwin-arm64": { pkg: "@pice/pice-darwin-arm64", bin: "pice" },
-  "darwin-x64": { pkg: "@pice/pice-darwin-x64", bin: "pice" },
-  "linux-arm64": { pkg: "@pice/pice-linux-arm64", bin: "pice" },
-  "linux-x64": { pkg: "@pice/pice-linux-x64", bin: "pice" },
-  "win32-x64": { pkg: "@pice/pice-win32-x64", bin: "pice.exe" },
+  "darwin-arm64": { pkg: "@pice/pice-darwin-arm64", bin: "pice", daemonBin: "pice-daemon" },
+  "darwin-x64": { pkg: "@pice/pice-darwin-x64", bin: "pice", daemonBin: "pice-daemon" },
+  "linux-arm64": { pkg: "@pice/pice-linux-arm64", bin: "pice", daemonBin: "pice-daemon" },
+  "linux-x64": { pkg: "@pice/pice-linux-x64", bin: "pice", daemonBin: "pice-daemon" },
+  "win32-x64": { pkg: "@pice/pice-win32-x64", bin: "pice.exe", daemonBin: "pice-daemon.exe" },
 };
 
 /**
@@ -91,4 +91,45 @@ function getBinaryPath() {
   return path.join(pkgDir, entry.bin);
 }
 
-module.exports = { getBinaryPath };
+/**
+ * Returns the absolute path to the pice-daemon binary for the current platform.
+ *
+ * The daemon binary ships alongside the CLI in the same platform package.
+ * The CLI's auto-start logic uses this to locate `pice-daemon` without
+ * requiring it to be on the user's `$PATH`.
+ *
+ * @returns {string} Absolute path to the pice-daemon binary
+ * @throws {Error} If the current platform/arch combination is unsupported
+ *   or if the platform-specific package is not installed
+ */
+function getDaemonBinaryPath() {
+  if (isMusl()) {
+    throw new Error(
+      `PICE daemon does not currently provide musl/Alpine Linux binaries. ` +
+        `Install from source instead: cargo install pice-daemon`
+    );
+  }
+
+  const key = `${process.platform}-${process.arch}`;
+  const entry = PLATFORM_MAP[key];
+
+  if (!entry) {
+    throw new Error(
+      `Unsupported platform: ${process.platform}/${process.arch}.`
+    );
+  }
+
+  let pkgDir;
+  try {
+    const pkgJsonPath = require.resolve(`${entry.pkg}/package.json`);
+    pkgDir = path.dirname(pkgJsonPath);
+  } catch {
+    throw new Error(
+      `The platform-specific package ${entry.pkg} is not installed.`
+    );
+  }
+
+  return path.join(pkgDir, entry.daemonBin);
+}
+
+module.exports = { getBinaryPath, getDaemonBinaryPath };

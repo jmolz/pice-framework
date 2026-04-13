@@ -125,6 +125,20 @@ fn evaluate_command_shows_json_flag_in_help() {
         .stdout(predicate::str::contains("--json"));
 }
 
+#[test]
+fn daemon_subcommand_shows_actions_in_help() {
+    pice_cmd()
+        .arg("daemon")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("start"))
+        .stdout(predicate::str::contains("stop"))
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("restart"))
+        .stdout(predicate::str::contains("logs"));
+}
+
 // ─── Error Path Tests ──────────────────────────────────────────────────────
 // v0.2 Phase 0: commands dispatch through adapter → daemon stubs.
 // These tests verify v0.1 behavior; re-enable when daemon handlers are ported.

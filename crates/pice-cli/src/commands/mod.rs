@@ -1,5 +1,6 @@
 pub mod benchmark;
 pub mod commit;
+pub mod daemon;
 pub mod evaluate;
 pub mod execute;
 pub mod handoff;
