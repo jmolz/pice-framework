@@ -95,7 +95,9 @@ async fn try_connect_and_health(
 /// The child inherits nothing from the CLI (stdin/stdout/stderr are all null).
 /// The CLI does not wait on the child — it becomes a daemon that outlives
 /// the CLI process.
-fn spawn_daemon() -> Result<()> {
+///
+/// `pub(crate)` because `commands::daemon::cmd_start` also uses this.
+pub(crate) fn spawn_daemon() -> Result<()> {
     std::process::Command::new("pice-daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())

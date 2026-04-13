@@ -137,10 +137,36 @@ impl DaemonClient {
             .context("failed to deserialize CommandResponse from daemon result")
     }
 
+    /// Send a `daemon/health` RPC and return the raw result JSON.
+    ///
+    /// Unlike [`health_check`], which only asserts liveness, this returns the
+    /// response body so callers can extract `version`, `uptime_seconds`, etc.
+    /// Used by `pice daemon status` (T24).
+    pub async fn health_query(&mut self) -> Result<serde_json::Value> {
+        let req = DaemonRequest::new(
+            0,
+            methods::DAEMON_HEALTH,
+            &self.token,
+            serde_json::json!({}),
+        );
+        self.write_msg(&req).await?;
+
+        let resp: DaemonResponse = self
+            .read_msg()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("daemon closed connection during health query"))?;
+
+        if let Some(err) = resp.error {
+            bail!("daemon health query failed ({}): {}", err.code, err.message);
+        }
+
+        resp.result
+            .ok_or_else(|| anyhow::anyhow!("daemon returned success with no result"))
+    }
+
     /// Send a `daemon/shutdown` RPC to request orderly daemon shutdown.
     ///
     /// Used by `pice daemon stop` (T24) and test cleanup.
-    #[allow(dead_code)] // T24 wires this into `pice daemon stop`.
     pub async fn shutdown(&mut self) -> Result<()> {
         let req = DaemonRequest::new(
             99,
