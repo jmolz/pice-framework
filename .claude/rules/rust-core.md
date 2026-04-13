@@ -9,12 +9,12 @@ paths:
 
 ## Crate Organization
 
-### v0.1 (current, shipped)
+### v0.1 (historical — shipped, now superseded by v0.2)
 
-- `pice-cli` — binary crate, depends on `pice-protocol`. Owns everything: state machine, provider host, metrics, templates.
+- `pice-cli` — monolithic binary crate. Owned everything: state machine, provider host, metrics, templates.
 - `pice-protocol` — library crate, zero external dependencies beyond serde. Shared contract types for core↔provider JSON-RPC.
 
-### v0.2+ (post-refactor — see `PRDv2.md` and `.claude/rules/daemon.md`)
+### v0.2 (current)
 
 - `pice-cli` — thin CLI adapter binary. Owns: arg parsing (clap), config discovery + validation, terminal rendering, desktop notifications, keyboard input for gate prompts, shell completions. Dispatches everything else to the daemon over a Unix socket / named pipe.
 - `pice-daemon` — long-running daemon binary. Owns: orchestrator (Stack Loops engine, adaptive algorithms, gate state manager, worktree lifecycle), provider process host (moved from cli), manifest CRUD, SQLite writes, daemon RPC server.

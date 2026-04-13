@@ -17,7 +17,7 @@ PICE CLI is an open-source workflow orchestrator for structured AI coding. It im
 
 | Technology | Purpose |
 |------------|---------|
-| Rust (stable) | Core CLI binary — arg parsing, state machine, config, metrics, templates, provider host |
+| Rust (stable) | Three crates: `pice-cli` (thin adapter), `pice-daemon` (orchestrator, providers, metrics), `pice-core` (shared logic) |
 | TypeScript 5.x | Provider implementations — Claude Code SDK bridge, Codex evaluator |
 | Node.js 22+ LTS | Runtime for TypeScript providers |
 | clap 4.x | CLI framework (args, help, shell completions) |
