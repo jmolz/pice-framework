@@ -56,8 +56,7 @@ pub(crate) fn to_shared_sink(sink: &dyn StreamSink) -> SharedSink {
     // the handler pattern: the session is awaited to completion before the
     // handler returns, so the Arc is dropped before the borrow expires.
     let ptr: *const dyn StreamSink = sink;
-    let static_ptr: *const (dyn StreamSink + 'static) =
-        unsafe { std::mem::transmute(ptr) };
+    let static_ptr: *const (dyn StreamSink + 'static) = unsafe { std::mem::transmute(ptr) };
     Arc::new(SinkBridge(static_ptr))
 }
 
@@ -118,8 +117,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_init() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Init(pice_core::cli::InitRequest {
             force: false,
             json: false,
@@ -166,8 +164,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_execute_missing_plan_returns_exit() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Execute(pice_core::cli::ExecuteRequest {
             plan_path: std::path::PathBuf::from("nonexistent-plan.md"),
             json: false,
@@ -188,8 +185,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_evaluate_missing_plan() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Evaluate(pice_core::cli::EvaluateRequest {
             plan_path: std::path::PathBuf::from("plan.md"),
             json: false,
@@ -239,8 +235,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Commit(pice_core::cli::CommitRequest {
             message: None,
             dry_run: false,
@@ -275,8 +270,7 @@ mod tests {
             .output()
             .unwrap();
 
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Commit(pice_core::cli::CommitRequest {
             message: Some("test: dry run commit".to_string()),
             dry_run: true,
@@ -331,8 +325,7 @@ db_path = ".pice/metrics.db"
         .unwrap();
 
         // Construct context — it loads config from the temp dir
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
 
         let req = CommandRequest::Handoff(pice_core::cli::HandoffRequest {
             output: None,
@@ -346,8 +339,7 @@ db_path = ".pice/metrics.db"
     #[tokio::test]
     async fn dispatch_status() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Status(pice_core::cli::StatusRequest { json: false });
         let resp = dispatch(req, &ctx, &NullSink).await.expect("dispatch");
         match &resp {
@@ -364,8 +356,7 @@ db_path = ".pice/metrics.db"
     #[tokio::test]
     async fn dispatch_metrics() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Metrics(pice_core::cli::MetricsRequest {
             json: false,
             csv: false,
@@ -374,7 +365,9 @@ db_path = ".pice/metrics.db"
         match &resp {
             CommandResponse::Text { content } => {
                 assert!(
-                    content.contains("metrics") || content.contains("Metrics") || content.contains("pice init"),
+                    content.contains("metrics")
+                        || content.contains("Metrics")
+                        || content.contains("pice init"),
                     "metrics should return text output, got: {content}"
                 );
             }
@@ -385,8 +378,7 @@ db_path = ".pice/metrics.db"
     #[tokio::test]
     async fn dispatch_benchmark() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Benchmark(pice_core::cli::BenchmarkRequest { json: false });
         let resp = dispatch(req, &ctx, &NullSink).await.expect("dispatch");
         match &resp {
@@ -403,8 +395,7 @@ db_path = ".pice/metrics.db"
     #[tokio::test]
     async fn dispatch_json_mode_returns_json_variant() {
         let dir = tempfile::tempdir().unwrap();
-        let ctx =
-            DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
         let req = CommandRequest::Init(pice_core::cli::InitRequest {
             force: false,
             json: true,

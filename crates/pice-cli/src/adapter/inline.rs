@@ -54,14 +54,14 @@ mod tests {
     use pice_daemon::orchestrator::NoticeLevel;
 
     #[tokio::test]
-    async fn inline_dispatch_returns_stub_response() {
+    async fn inline_dispatch_returns_text_response() {
         let req = CommandRequest::Status(StatusRequest { json: false });
         let resp = dispatch_inline(req).await.expect("dispatch_inline");
         match resp {
             CommandResponse::Text { content } => {
                 assert!(
-                    content.contains("stub"),
-                    "inline status should return stub, got: {content}"
+                    content.contains("PICE Status"),
+                    "inline status should contain header, got: {content}"
                 );
             }
             other => panic!("expected Text response, got: {other:?}"),
@@ -70,15 +70,14 @@ mod tests {
 
     #[tokio::test]
     async fn inline_dispatch_json_mode() {
-        let req = CommandRequest::Init(InitRequest {
-            force: false,
-            json: true,
-        });
+        let req = CommandRequest::Status(StatusRequest { json: true });
         let resp = dispatch_inline(req).await.expect("dispatch_inline");
         match resp {
             CommandResponse::Json { value } => {
-                assert_eq!(value["status"], "stub");
-                assert_eq!(value["command"], "init");
+                assert!(
+                    value["plans"].is_array(),
+                    "status json should have plans array, got: {value}"
+                );
             }
             other => panic!("expected Json response, got: {other:?}"),
         }

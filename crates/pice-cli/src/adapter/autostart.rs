@@ -146,7 +146,7 @@ mod tests {
         let resp = client.dispatch(req).await.expect("dispatch");
         match resp {
             pice_core::cli::CommandResponse::Text { content } => {
-                assert!(content.contains("stub"));
+                assert!(content.contains("PICE Status"));
             }
             other => panic!("expected Text, got: {other:?}"),
         }

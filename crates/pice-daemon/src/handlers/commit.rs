@@ -57,8 +57,7 @@ pub async fn run(
     } else {
         // Build prompt and capture AI-generated message
         let prompt = builders::build_commit_prompt(project_root)?;
-        let mut orchestrator =
-            ProviderOrchestrator::start(&config.provider.name, config).await?;
+        let mut orchestrator = ProviderOrchestrator::start(&config.provider.name, config).await?;
         let captured = session::run_session_and_capture(
             &mut orchestrator,
             project_root,

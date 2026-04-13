@@ -239,11 +239,11 @@ fn format_table(report: &MetricsReport) -> String {
         "Total evaluations:   {:>5}\n",
         report.total_evaluations
     ));
+    out.push_str(&format!("Total PICE loops:    {:>5}\n", report.total_loops));
     out.push_str(&format!(
-        "Total PICE loops:    {:>5}\n",
-        report.total_loops
+        "Pass rate:           {:>4.1}%\n",
+        report.pass_rate
     ));
-    out.push_str(&format!("Pass rate:           {:>4.1}%\n", report.pass_rate));
     out.push_str(&format!(
         "Average score:       {:>4.1}/10\n",
         report.avg_score

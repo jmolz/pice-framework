@@ -257,8 +257,8 @@ mod tests {
         match resp {
             CommandResponse::Text { content } => {
                 assert!(
-                    content.contains("stub"),
-                    "status should return stub, got: {content}"
+                    content.contains("PICE Status"),
+                    "status should contain header, got: {content}"
                 );
             }
             other => panic!("expected Text response, got: {other:?}"),

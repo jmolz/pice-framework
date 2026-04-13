@@ -23,13 +23,8 @@ pub async fn run(
 
     // Stream and capture: handoff streams to the terminal while collecting text
     let shared = to_shared_sink(sink);
-    let captured = session::run_session_and_capture(
-        &mut orchestrator,
-        project_root,
-        prompt,
-        shared,
-    )
-    .await;
+    let captured =
+        session::run_session_and_capture(&mut orchestrator, project_root, prompt, shared).await;
     orchestrator.shutdown().await.ok();
     let handoff_content = captured?;
 

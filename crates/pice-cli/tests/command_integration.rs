@@ -144,7 +144,7 @@ fn daemon_subcommand_shows_actions_in_help() {
 // These tests verify v0.1 behavior; re-enable when daemon handlers are ported.
 
 #[test]
-#[ignore = "v0.2: daemon stubs don't validate plan file paths"]
+
 fn execute_with_missing_plan_file_fails() {
     pice_cmd()
         .arg("execute")
@@ -154,7 +154,7 @@ fn execute_with_missing_plan_file_fails() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs don't validate plan file paths"]
+
 fn evaluate_with_missing_plan_file_fails() {
     pice_cmd()
         .arg("evaluate")
@@ -164,7 +164,7 @@ fn evaluate_with_missing_plan_file_fails() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs don't validate contracts"]
+
 fn evaluate_plan_without_contract_fails() {
     let dir = tempfile::tempdir().unwrap();
     let plan_path = dir.path().join("no-contract.md");
@@ -223,7 +223,7 @@ db_path = ".pice/metrics.db"
 // the binary location looking for packages/.
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn plan_command_with_stub_provider() {
     let dir = setup_stub_project();
 
@@ -240,7 +240,7 @@ fn plan_command_with_stub_provider() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn execute_command_with_stub_provider() {
     let dir = setup_stub_project();
     let plan_path = create_plan_with_contract(dir.path());
@@ -259,7 +259,7 @@ fn execute_command_with_stub_provider() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn evaluate_command_with_stub_provider() {
     let dir = setup_stub_project();
     let plan_path = create_plan_with_contract(dir.path());
@@ -303,7 +303,7 @@ fn evaluate_command_with_stub_provider() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn evaluate_graceful_degradation() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -412,7 +412,7 @@ fn phase4_benchmark_help() {
 // ─── Phase 4: Metrics with Empty DB ──────────────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace metrics pipeline"]
+
 fn phase4_metrics_empty_db() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -437,7 +437,7 @@ fn phase4_metrics_empty_db() {
 // ─── Phase 4: Benchmark ─────────────────────────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace benchmark pipeline"]
+
 fn phase4_benchmark_empty() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -475,7 +475,7 @@ fn phase4_benchmark_empty() {
 // ─── Phase 4: Init creates real DB ──────────────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace init pipeline"]
+
 fn phase4_init_creates_real_db() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -496,7 +496,7 @@ fn phase4_init_creates_real_db() {
 // ─── Phase 4: Status shows Last Eval column ─────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace status pipeline"]
+
 fn phase4_status_shows_evaluation_column() {
     let dir = tempfile::tempdir().unwrap();
     create_plan_with_contract(dir.path());
@@ -512,7 +512,7 @@ fn phase4_status_shows_evaluation_column() {
 // ─── Phase 4: Corrupt DB resilience ──────────────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace metrics pipeline"]
+
 fn phase4_metrics_with_corrupt_db() {
     let dir = tempfile::tempdir().unwrap();
     let pice_dir = dir.path().join(".pice");
@@ -571,7 +571,7 @@ db_path = ".pice/metrics.db"
 // ─── Phase 4: init --force preserves metrics data ───────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace init pipeline"]
+
 fn phase4_init_force_preserves_metrics_history() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -671,7 +671,7 @@ fn status_command_shows_json_flag_in_help() {
 // ─── Phase 3: Status (no provider needed) ────────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace status pipeline"]
+
 fn status_command_no_plans_directory() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -685,7 +685,7 @@ fn status_command_no_plans_directory() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace status pipeline"]
+
 fn status_command_shows_plans() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -726,7 +726,7 @@ fn status_command_shows_plans() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace status pipeline"]
+
 fn status_command_shows_malformed_plans() {
     let dir = tempfile::tempdir().unwrap();
     let plans_dir = dir.path().join(".claude/plans");
@@ -780,7 +780,7 @@ fn setup_stub_project_with_git() -> tempfile::TempDir {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn phase3_prime_command_with_stub_provider() {
     let dir = setup_stub_project_with_git();
 
@@ -794,7 +794,7 @@ fn phase3_prime_command_with_stub_provider() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn phase3_review_command_with_stub_provider() {
     let dir = setup_stub_project_with_git();
 
@@ -808,7 +808,7 @@ fn phase3_review_command_with_stub_provider() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn phase3_commit_command_dry_run_with_stub_provider() {
     let dir = setup_stub_project_with_git();
 
@@ -830,7 +830,7 @@ fn phase3_commit_command_dry_run_with_stub_provider() {
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace provider pipeline"]
+
 fn phase3_handoff_command_with_stub_provider() {
     let dir = setup_stub_project_with_git();
 
@@ -850,22 +850,23 @@ fn phase3_handoff_command_with_stub_provider() {
 // ─── Phase 3: Error Path Tests ───────────────────────────────────────────────
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace commit pipeline"]
+
 fn phase3_commit_nothing_to_commit() {
     let dir = setup_stub_project_with_git();
 
     // Clean repo — nothing to commit
+    // Exit response prints message to stderr via render_response
     pice_cmd()
         .current_dir(dir.path())
         .arg("commit")
         .arg("--json")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("nothing to commit"));
+        .stderr(predicate::str::contains("nothing staged to commit"));
 }
 
 #[test]
-#[ignore = "v0.2: daemon stubs replace commit pipeline"]
+
 fn phase3_commit_untracked_only_fails() {
     let dir = setup_stub_project_with_git();
 
@@ -880,5 +881,5 @@ fn phase3_commit_untracked_only_fails() {
         .arg("--json")
         .assert()
         .failure()
-        .stdout(predicate::str::contains("nothing staged to commit"));
+        .stderr(predicate::str::contains("nothing staged to commit"));
 }

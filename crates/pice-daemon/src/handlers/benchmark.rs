@@ -66,10 +66,7 @@ pub async fn run(
         output.push_str("═══════════════════════════════════════\n\n");
         output.push_str(&format!("Total commits:       {:>5}\n", total_commits));
         output.push_str(&format!("Test coverage:       {:>4.1}%\n", coverage_pct));
-        output.push_str(&format!(
-            "Total evaluations:   {:>5}\n",
-            total_evaluations
-        ));
+        output.push_str(&format!("Total evaluations:   {:>5}\n", total_evaluations));
         output.push_str(&format!("Pass rate:           {:>4.1}%\n", pass_rate));
         output.push_str(&format!("Average score:       {:>4.1}/10\n", avg_score));
         Ok(CommandResponse::Text { content: output })

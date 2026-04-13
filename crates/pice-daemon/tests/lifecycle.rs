@@ -123,7 +123,10 @@ async fn full_lifecycle_multiple_rpcs_on_one_connection() {
     let dispatch_req = DaemonRequest::new(3, methods::CLI_DISPATCH, &token, params);
     conn.write_message(&dispatch_req).await.expect("write");
     let eval_resp: DaemonResponse = conn.read_message().await.expect("read").expect("not EOF");
-    assert!(eval_resp.error.is_none(), "eval dispatch should succeed (Exit response, not error)");
+    assert!(
+        eval_resp.error.is_none(),
+        "eval dispatch should succeed (Exit response, not error)"
+    );
 
     // 4. Shutdown.
     let shutdown_resp = rpc(&mut conn, 99, methods::DAEMON_SHUTDOWN, &token).await;

@@ -165,18 +165,12 @@ fn get_git_info(project_root: &std::path::Path) -> serde_json::Value {
             let lines: Vec<&str> = text.lines().collect();
             let staged = lines
                 .iter()
-                .filter(|l| {
-                    l.starts_with('M') || l.starts_with('A') || l.starts_with('D')
-                })
+                .filter(|l| l.starts_with('M') || l.starts_with('A') || l.starts_with('D'))
                 .count();
             let unstaged = lines
                 .iter()
                 .filter(|l| {
-                    l.chars()
-                        .nth(1)
-                        .map(|c| c != ' ')
-                        .unwrap_or(false)
-                        && !l.starts_with('?')
+                    l.chars().nth(1).map(|c| c != ' ').unwrap_or(false) && !l.starts_with('?')
                 })
                 .count();
             let untracked = lines.iter().filter(|l| l.starts_with("??")).count();
