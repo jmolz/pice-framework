@@ -284,12 +284,15 @@ fn merge_layer_override_fields(
 
     if let Some(o_rr) = overlay.require_review {
         // Effective project floor for require_review on this layer:
-        //   - project_layer.require_review if set
-        //   - otherwise project_review.enabled (global gate)
-        // A user must not downgrade either path to false.
-        let layer_rr_floor = project_layer.require_review.unwrap_or(false);
+        //   - if project_layer.require_review is explicitly set, that IS the
+        //     floor (including `Some(false)` — a project-committed exemption
+        //     is a legitimate value a user may match).
+        //   - otherwise fall back to `project_review.enabled` (global gate).
+        //
+        // `or`ing both sources would incorrectly reject a user keeping a
+        // project-committed per-layer exemption when the global gate is on.
         let global_rr_floor = project_review.map(|r| r.enabled).unwrap_or(false);
-        let floor = layer_rr_floor || global_rr_floor;
+        let floor = project_layer.require_review.unwrap_or(global_rr_floor);
         if floor && !o_rr {
             violations.push(FloorViolation {
                 field: format!("layer_overrides.{layer}.require_review"),
@@ -625,6 +628,45 @@ mod tests {
             .violations
             .iter()
             .any(|v| v.field == "layer_overrides.backend.budget_usd"));
+    }
+
+    #[test]
+    fn project_committed_layer_exemption_preserved_under_global_gate() {
+        // Project globally enables review AND explicitly exempts one layer
+        // via `layer_overrides.experimental.require_review: false`. A user
+        // workflow that keeps the exemption (require_review: false) while
+        // tightening some other field must NOT be rejected — the project
+        // committed to the exemption, so the user is matching, not relaxing.
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        b.layer_overrides.insert(
+            "experimental".into(),
+            LayerOverride {
+                require_review: Some(false),
+                ..Default::default()
+            },
+        );
+
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "experimental".into(),
+            LayerOverride {
+                require_review: Some(false), // match the project exemption
+                min_confidence: Some(0.95),  // tighten something else
+                ..Default::default()
+            },
+        );
+
+        // Must succeed — user is matching the project's effective per-layer
+        // value, not undercutting it.
+        let merged = merge_with_floor(b, u).expect("legitimate exemption should merge");
+        assert_eq!(
+            merged.layer_overrides["experimental"].require_review,
+            Some(false)
+        );
     }
 
     #[test]

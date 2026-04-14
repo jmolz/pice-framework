@@ -8,7 +8,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Top-level `.pice/workflow.yaml` configuration.
+///
+/// `deny_unknown_fields` on every workflow struct catches (a) misspelled
+/// field names and (b) stale fields removed from the schema (e.g., the old
+/// `phases.review` which was deprecated in favor of top-level `review`).
+/// Silent acceptance of unknown keys let stale configs pass validation
+/// while the actual setting went unenforced — a real CI foot-gun.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowConfig {
     pub schema_version: String,
     pub defaults: Defaults,
@@ -24,6 +31,7 @@ pub struct WorkflowConfig {
 
 /// Pipeline-wide defaults applied when no layer override specifies otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct Defaults {
     pub tier: u8,
     pub min_confidence: f64,
@@ -54,6 +62,7 @@ pub enum CostCapBehavior {
 /// floor-bypass surface (floor merge only covered the top-level field).
 /// Removed to keep one canonical location.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Phases {
     #[serde(default)]
     pub plan: PhaseConfig,
@@ -65,6 +74,7 @@ pub struct Phases {
 
 /// Generic phase descriptor — only used for `plan` today.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PhaseConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -74,6 +84,7 @@ pub struct PhaseConfig {
 
 /// `phases.execute` — implementation phase.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutePhase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -98,6 +109,7 @@ impl Default for ExecutePhase {
 
 /// Retry policy for the execute phase.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct RetryConfig {
     pub max_attempts: u32,
     #[serde(default)]
@@ -115,6 +127,7 @@ impl Default for RetryConfig {
 
 /// `phases.evaluate` — dual-model scoring phase.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluatePhase {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -153,6 +166,7 @@ pub enum AdaptiveAlgo {
 
 /// Per-layer override. All fields are optional — absent fields inherit from defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LayerOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<u8>,
@@ -170,6 +184,7 @@ pub struct LayerOverride {
 
 /// Review gate configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewConfig {
     #[serde(default)]
     pub enabled: bool,

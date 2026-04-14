@@ -187,15 +187,22 @@ pub fn validate_triggers(cfg: &WorkflowConfig) -> ValidationReport {
 pub fn validate_cross_references(cfg: &WorkflowConfig, layers: &LayersConfig) -> ValidationReport {
     let mut report = ValidationReport::default();
 
-    // Authoritative set is the intersection of `order` and `defs` — a name
-    // that appears in `order` but has no `[layers.X]` definition would never
-    // activate at runtime, so references to it are ghost layers. Prefer
-    // `defs.keys()` over `order.iter()` here: the orchestrator consults
-    // `defs` to resolve a layer, so any cross-ref that doesn't match a def
-    // is silently dead at runtime. Listing only `defs` keeps validation and
-    // execution aligned.
-    let known_layers: Vec<&str> = layers.layers.defs.keys().map(|s| s.as_str()).collect();
-    let known_layers_set: std::collections::HashSet<&str> = known_layers.iter().copied().collect();
+    // Authoritative set is the runtime-live intersection of `order` and
+    // `defs`. The orchestrator's `build_dag` / `active_layers` iterates
+    // `order` and skips any name missing from `defs`; conversely a `defs`
+    // entry without an `order` position is never visited. Both kinds of
+    // ghost are runtime-dead, so validation must reject cross-references
+    // to either. Using only `order` would admit defs-only ghosts; using
+    // only `defs` would admit order-only ghosts. Intersection matches the
+    // live set runtime actually sees.
+    let order_set: std::collections::HashSet<&str> =
+        layers.layers.order.iter().map(|s| s.as_str()).collect();
+    let defs_set: std::collections::HashSet<&str> =
+        layers.layers.defs.keys().map(|s| s.as_str()).collect();
+    let known_layers_set: std::collections::HashSet<&str> =
+        order_set.intersection(&defs_set).copied().collect();
+    let mut known_layers: Vec<&str> = known_layers_set.iter().copied().collect();
+    known_layers.sort();
 
     for layer in cfg.layer_overrides.keys() {
         if !known_layers_set.contains(layer.as_str()) {

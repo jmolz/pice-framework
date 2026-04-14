@@ -32,7 +32,16 @@ pub fn render_response(resp: CommandResponse) -> Result<()> {
         CommandResponse::Empty => {}
         CommandResponse::Exit { code, message } => {
             if !message.is_empty() {
-                eprintln!("{message}");
+                // When the handler uses Exit to convey a JSON payload (the
+                // pattern for `--json` failure paths — `pice validate` and
+                // `pice evaluate` both do this), emit to stdout so machine
+                // callers still get valid JSON on the expected channel.
+                // Non-JSON messages go to stderr as before.
+                if serde_json::from_str::<serde_json::Value>(&message).is_ok() {
+                    println!("{message}");
+                } else {
+                    eprintln!("{message}");
+                }
             }
             std::process::exit(code);
         }

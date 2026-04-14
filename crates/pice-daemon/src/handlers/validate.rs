@@ -32,17 +32,19 @@ pub async fn run(
         Ok(r) => r,
         Err(e) => {
             let message = format!("workflow.yaml load/merge failed: {e:#}");
-            return Ok(if req.json {
-                CommandResponse::Json {
-                    value: json!({
-                        "ok": false,
-                        "errors": [{"field": "workflow", "message": message}],
-                        "warnings": [],
-                    }),
-                }
-            } else {
-                CommandResponse::Exit { code: 1, message }
-            });
+            if req.json {
+                let value = json!({
+                    "ok": false,
+                    "errors": [{"field": "workflow", "message": message}],
+                    "warnings": [],
+                });
+                return Ok(CommandResponse::Exit {
+                    code: 1,
+                    message: serde_json::to_string_pretty(&value)
+                        .unwrap_or_else(|_| value.to_string()),
+                });
+            }
+            return Ok(CommandResponse::Exit { code: 1, message });
         }
     };
 
@@ -71,14 +73,24 @@ pub async fn run(
     let report = validate::validate_all(&resolved, layers.as_ref(), known_models.as_deref());
 
     if req.json {
-        Ok(CommandResponse::Json {
-            value: json!({
-                "ok": report.is_ok(),
-                "errors": report.errors,
-                "warnings": report.warnings,
-                "using_framework_defaults": using_defaults,
-            }),
-        })
+        let value = json!({
+            "ok": report.is_ok(),
+            "errors": report.errors,
+            "warnings": report.warnings,
+            "using_framework_defaults": using_defaults,
+        });
+        if report.is_ok() {
+            Ok(CommandResponse::Json { value })
+        } else {
+            // JSON-mode failure: emit the full structured report on stdout
+            // (via the render layer that routes JSON-shaped Exit messages
+            // to stdout) AND signal nonzero exit so CI pipelines like
+            // `pice validate --json && deploy` fail closed.
+            Ok(CommandResponse::Exit {
+                code: 1,
+                message: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+            })
+        }
     } else if !report.is_ok() {
         let mut message = format!("Validation failed with {} error(s):\n", report.errors.len());
         for e in &report.errors {
