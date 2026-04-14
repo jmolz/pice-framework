@@ -170,6 +170,39 @@ defaults:
     }
 
     #[test]
+    fn load_project_rejects_unknown_top_level_fields() {
+        // Stale or misspelled field names must be rejected at parse time,
+        // not silently dropped. `phases.review` was removed from the
+        // schema; a workflow still carrying it is a stale config that must
+        // not validate cleanly (runtime would silently ignore the setting).
+        let tmp = tempdir().unwrap();
+        let yaml = r#"
+schema_version: "0.2"
+defaults:
+  tier: 2
+  min_confidence: 0.9
+  max_passes: 5
+  model: sonnet
+  budget_usd: 2.0
+  cost_cap_behavior: halt
+phases:
+  review:
+    enabled: true
+    trigger: "always"
+"#;
+        write(&tmp.path().join(".pice/workflow.yaml"), yaml);
+        let err = load_project(tmp.path())
+            .expect_err("expected deny_unknown_fields to reject stale phases.review");
+        // Use `{:#}` to include the full error chain — the serde detail is
+        // wrapped by anyhow's top-level context.
+        let chain = format!("{err:#}");
+        assert!(
+            chain.contains("review") || chain.contains("unknown"),
+            "error chain should flag the unknown field: {chain}"
+        );
+    }
+
+    #[test]
     fn load_project_malformed_yaml() {
         let tmp = tempdir().unwrap();
         write(

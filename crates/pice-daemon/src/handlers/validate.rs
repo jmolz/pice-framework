@@ -275,12 +275,19 @@ layer_overrides:
         };
         let resp = run(req, &ctx, &NullSink).await.unwrap();
         match resp {
-            CommandResponse::Json { value } => {
+            // JSON-mode validation failures now return Exit{code:1, message:<json>}
+            // so `pice validate --json` in CI scripts fails the process. The
+            // renderer routes JSON-shaped messages to stdout; tests parse the
+            // message directly.
+            CommandResponse::Exit { code, message } => {
+                assert_eq!(code, 1);
+                let value: serde_json::Value = serde_json::from_str(&message)
+                    .expect("Exit message should contain valid JSON");
                 assert_eq!(value["ok"], false);
                 let errs = value["errors"].as_array().unwrap();
                 assert!(!errs.is_empty());
             }
-            other => panic!("expected Json, got {other:?}"),
+            other => panic!("expected Exit with JSON, got {other:?}"),
         }
     }
 

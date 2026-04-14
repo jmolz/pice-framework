@@ -456,6 +456,39 @@ mod tests {
     }
 
     #[test]
+    fn defs_only_ghost_layer_rejected() {
+        // A layer defined in `[layers.X]` but missing from `layers.order`
+        // is never visited by `build_dag()` / `active_layers()`. Workflow
+        // references to it are just as dead as order-only ghosts, so
+        // validation must reject them too.
+        let mut layers = sample_layers();
+        layers.layers.defs.insert(
+            "defs_only_ghost".into(),
+            crate::layers::LayerDef {
+                paths: vec!["whatever/**".into()],
+                always_run: false,
+                contract: None,
+                depends_on: vec![],
+                layer_type: None,
+                environment_variants: None,
+            },
+        );
+        // NOTE: not added to `layers.order`.
+
+        let mut cfg = embedded_defaults();
+        cfg.layer_overrides.insert(
+            "defs_only_ghost".into(),
+            LayerOverride {
+                tier: Some(3),
+                ..Default::default()
+            },
+        );
+        let report = validate_cross_references(&cfg, &layers);
+        assert!(!report.is_ok(), "defs-only ghost should be rejected");
+        assert!(report.errors[0].message.contains("defs_only_ghost"));
+    }
+
+    #[test]
     fn order_only_ghost_layer_rejected() {
         // A name listed in `layers.order` but missing from `layers.defs`
         // never activates at runtime. Workflow cross-references to it must
