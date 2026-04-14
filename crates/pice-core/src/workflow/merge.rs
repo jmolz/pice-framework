@@ -32,6 +32,27 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::workflow::schema::{Defaults, LayerOverride, ReviewConfig, WorkflowConfig};
+use crate::workflow::trigger;
+
+/// Returns true iff two trigger expressions parse to AST-equivalent
+/// expressions. Tolerates surface-level differences (whitespace, the
+/// `always` ↔ `true` keyword aliasing, formatting). If either expression
+/// fails to parse, returns false — `validate_triggers` surfaces the parse
+/// error separately, and we conservatively treat unparseable triggers as
+/// non-equivalent so floor enforcement does not silently accept garbage.
+///
+/// This is **structural** equivalence, not logical implication. A user
+/// trigger that is *semantically stricter* than the project trigger
+/// (e.g., user `always` vs project `tier >= 3`, where `always` is a
+/// superset of conditions) will still be rejected. Full AST-implication
+/// checking is deferred — see the trigger floor comments at the call
+/// sites.
+fn triggers_equivalent(project: &str, user: &str) -> bool {
+    match (trigger::parse(project), trigger::parse(user)) {
+        (Ok(p), Ok(u)) => p == u,
+        _ => false,
+    }
+}
 
 /// A single floor-rule violation. Named fields so downstream tooling (the
 /// daemon RPC and `pice validate --json`) can serialize the diff cleanly.
@@ -319,12 +340,17 @@ fn merge_layer_override_fields(
         // implication checking can relax this in a future phase.
         let project_trigger = project_layer.trigger.as_deref();
         if let (Some(pt), Some(o)) = (project_trigger, overlay.trigger.as_deref()) {
-            if o != pt {
+            // Equivalent ASTs (e.g., `always` vs `true`, whitespace diffs)
+            // are accepted as a no-op restatement of the project trigger.
+            // Any other rewrite — including weakening to `false` and
+            // semantically stricter rewrites — is rejected. AST implication
+            // is deferred; see triggers_equivalent docs.
+            if !triggers_equivalent(pt, o) {
                 let reason = if o.is_empty() {
                     "required gate trigger cannot be removed"
                 } else {
-                    "required gate trigger cannot be weakened or rewritten; \
-                     omit the override to keep the project trigger or match it exactly"
+                    "required gate trigger cannot be rewritten; \
+                     omit the override to keep the project trigger or restate it equivalently"
                 };
                 violations.push(FloorViolation {
                     field: format!("layer_overrides.{layer}.trigger"),
@@ -383,13 +409,13 @@ fn merge_review(
                         reason: "required gate trigger cannot be removed",
                     });
                 }
-                (Some(pt), Some(o)) if o != pt => {
+                (Some(pt), Some(o)) if !triggers_equivalent(pt, o) => {
                     violations.push(FloorViolation {
                         field: "review.trigger".into(),
                         project: pt.to_string(),
                         user: o.to_string(),
-                        reason: "required gate trigger cannot be weakened or rewritten; \
-                                 omit the override to keep the project trigger or match it exactly",
+                        reason: "required gate trigger cannot be rewritten; \
+                                 omit the override to keep the project trigger or restate it equivalently",
                     });
                 }
                 (_, Some(_)) => {
@@ -592,6 +618,50 @@ mod tests {
         let err = merge_with_floor(b, u).unwrap_err();
         let fv = err.downcast_ref::<FloorViolations>().unwrap();
         assert!(fv.violations.iter().any(|v| v.field == "review.trigger"));
+    }
+
+    #[test]
+    fn review_trigger_ast_equivalent_restatement_allowed() {
+        // Project trigger `always`. User restates as `true` — semantically
+        // identical (both lex to a literal-true), so AST comparison treats
+        // them as the same expression. Floor-merge should accept.
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("always".into()),
+            ..Default::default()
+        });
+        let mut u = overlay_from(&b);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("true".into()),
+            ..b.review.clone().unwrap()
+        });
+        let merged =
+            merge_with_floor(b, u).expect("AST-equivalent trigger restatement should pass");
+        assert_eq!(
+            merged.review.unwrap().trigger.as_deref(),
+            // The user's spelling wins when ASTs match (both are valid).
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn review_trigger_whitespace_differences_allowed() {
+        // Project: "tier >= 3"; user: "tier>=3" with no spaces. Same AST.
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier >= 3".into()),
+            ..Default::default()
+        });
+        let mut u = overlay_from(&b);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier>=3".into()),
+            ..b.review.clone().unwrap()
+        });
+        merge_with_floor(b, u).expect("whitespace-only difference should pass");
     }
 
     #[test]
