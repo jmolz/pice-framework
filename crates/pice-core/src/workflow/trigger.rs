@@ -947,11 +947,7 @@ mod tests {
         // the process. With the MAX_PARSE_DEPTH guard, parse returns a
         // ParseError cleanly.
         let depth = 200;
-        let expr = format!(
-            "{}tier >= 1{}",
-            "(".repeat(depth),
-            ")".repeat(depth)
-        );
+        let expr = format!("{}tier >= 1{}", "(".repeat(depth), ")".repeat(depth));
         let err = parse(&expr).expect_err("expected depth-limit parse error");
         assert!(
             err.message.contains("too deeply nested"),
@@ -977,11 +973,7 @@ mod tests {
     fn moderate_nesting_under_limit_parses() {
         // Sanity: 64 levels of parens is well within MAX_PARSE_DEPTH (128).
         let depth = 64;
-        let expr = format!(
-            "{}tier >= 1{}",
-            "(".repeat(depth),
-            ")".repeat(depth)
-        );
+        let expr = format!("{}tier >= 1{}", "(".repeat(depth), ")".repeat(depth));
         parse(&expr).expect("64-level nesting should parse cleanly");
     }
 }

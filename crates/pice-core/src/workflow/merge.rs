@@ -527,10 +527,8 @@ mod tests {
         let err = merge_with_floor(b, u).unwrap_err();
         let fv = err.downcast_ref::<FloorViolations>().unwrap();
         assert!(
-            fv.violations
-                .iter()
-                .any(|v| v.field == "review.trigger"
-                    && v.reason == "required gate trigger cannot be removed"),
+            fv.violations.iter().any(|v| v.field == "review.trigger"
+                && v.reason == "required gate trigger cannot be removed"),
             "expected review.trigger removal violation, got: {fv:?}"
         );
     }
@@ -744,8 +742,8 @@ mod tests {
         u.defaults.min_confidence = 0.80; // lower (violation #2)
         u.defaults.budget_usd = 10.0; // raise (violation #3)
         u.review = Some(ReviewConfig {
-            enabled: false,  // disable required review (violation #4)
-            trigger: None,   // remove required trigger (violation #5)
+            enabled: false, // disable required review (violation #4)
+            trigger: None,  // remove required trigger (violation #5)
             ..Default::default()
         });
         // Downgrade existing layer's require_review (violation #6):

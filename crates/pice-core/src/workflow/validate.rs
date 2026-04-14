@@ -466,10 +466,7 @@ mod tests {
             },
         );
         let report = validate_cross_references(&cfg, &layers);
-        assert!(
-            !report.is_ok(),
-            "expected order-only ghost to be rejected"
-        );
+        assert!(!report.is_ok(), "expected order-only ghost to be rejected");
         assert!(report.errors[0].message.contains("ghost_in_order"));
     }
 
