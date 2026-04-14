@@ -39,6 +39,12 @@ Run in order; later levels override earlier:
 - `environment_variants = ["staging", "production"]` on the deployment layer triggers environment-specific contract property evaluation
 - Polyrepo external contracts go in `[external_contracts]`, deferred to v0.4 for real inference
 
+## Dependency cascade (transitive closure)
+
+Layer activation uses **transitive** dependency cascade: if database changes activate `api` (depends_on database), then `frontend` (depends_on api) also activates. This catches downstream breakage — exactly the class of failures Stack Loops was built to detect.
+
+Layers activated by cascade but with no file changes of their own get `Skipped` status (they have no diff to evaluate), EXCEPT `always_run` layers which get `Pending` status (they must never be marked Skipped — seam checks / static analysis will evaluate them in Phase 3).
+
 ## DAG construction and parallel cohorts
 
 The orchestrator builds a topological DAG from `layers.toml` + plan-declared dependencies, then groups layers into **cohorts** where every layer in a cohort has no pending dependencies. Cohorts execute sequentially; layers within a cohort execute in parallel via git worktree isolation.
@@ -46,6 +52,16 @@ The orchestrator builds a topological DAG from `layers.toml` + plan-declared dep
 - Max parallelism is configurable via `workflow.defaults.max_parallelism` (default = CPU count)
 - Dependency edges always win — a layer with upstream in the current cohort never starts early
 - `always_run` layers are evaluated even if their upstreams fail, unless the user configured `halt_on_upstream_failure = true`
+
+## Fail-closed evaluation
+
+Layers are **never** marked as PASSED without real provider-backed evaluation. Phase 1 records `LayerStatus::Pending` with `model: "phase-1-pending"` and `score: None`. The manifest overall status is `InProgress`, not `Passed`, until Phase 2 wires real provider scoring. This prevents false confidence.
+
+## Manifest persistence
+
+- Manifest paths are **namespaced by project hash**: `~/.pice/state/{project_hash_12chars}/{feature_id}.manifest.json`. This prevents cross-repo collisions when different projects use the same plan filename.
+- Manifests are persisted **incrementally**: initial checkpoint before the evaluation loop, per-layer checkpoint after each result, and final checkpoint after overall status computation.
+- `save()` uses **crash-safe atomic writes**: fsync temp file → atomic rename → fsync parent directory. After `save()` returns, the checkpoint survives power loss.
 
 ## Context isolation (HARD RULE)
 

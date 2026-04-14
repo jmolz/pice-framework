@@ -51,7 +51,7 @@ pnpm typecheck                 # Type check (tsc --noEmit)
 cargo fmt --check && cargo clippy -- -D warnings && cargo test && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo build --release
 ```
 
-**Expected baseline:** 271 Rust tests (1 ignored), 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
+**Expected baseline:** 367 Rust tests (1 ignored), 51 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
 
 ---
 
@@ -251,7 +251,9 @@ For post-v0.1 design: `PRDv2.md` + `docs/research/`
 - **Never commit API keys or secrets** — auth is handled via environment variables or subscription OAuth flows, never hardcoded.
 - **All CLI commands go through the provider protocol** — no direct SDK calls from Rust. The protocol IS the abstraction boundary.
 - **(v0.2+) CLI and daemon share parsing/validation via `pice-core`** — never duplicate config, layer, workflow, or manifest parsing logic in `pice-cli` and `pice-daemon`. Both depend on `pice-core`; the CLI previews what the daemon will execute, so divergence is a bug.
-- **(v0.2+) The verification manifest is the source of truth** — daemon reads and writes `~/.pice/state/{feature-id}.manifest.json`; every adapter (CLI, dashboard, CI) observes the same manifest. Never build parallel state stores.
+- **(v0.2+) The verification manifest is the source of truth** — daemon reads and writes `~/.pice/state/{project-hash}/{feature-id}.manifest.json` (namespaced by project hash to prevent cross-repo collisions); every adapter (CLI, dashboard, CI) observes the same manifest. Never build parallel state stores. Writes use crash-safe atomic persistence (fsync + rename + dir fsync).
 - **(v0.2+) Daemon RPC is a separate protocol from provider RPC** — the provider protocol is `pice-daemon`↔`provider` (spawn+stdio). The daemon RPC is `pice-cli`↔`pice-daemon` (socket+newline-JSON). They use JSON-RPC 2.0 but are DIFFERENT method namespaces, different consumers, different transports. Do not conflate.
 - **(v0.2+) Honor the ~96.6% confidence ceiling** — for dual-model correlated evaluators, confidence reports must never claim higher than the correlated-Condorcet ceiling (`docs/research/convergence-analysis.md`). Adaptive algorithms halt at the target; they do not pretend more passes breach the ceiling.
-- **(v0.2+) Always-run layers cannot be skipped** — `infrastructure`, `deployment`, `observability` layers execute regardless of change scope, unless explicitly overridden in `workflow.yaml` and logged to audit trail.
+- **(v0.2+) Always-run layers cannot be skipped** — `infrastructure`, `deployment`, `observability` layers execute regardless of change scope, unless explicitly overridden in `workflow.yaml` and logged to audit trail. When always-run layers have empty diffs, they are `Pending` (not `Skipped`) — seam checks / static analysis will evaluate them.
+- **(v0.2+) Dependency cascade is transitive** — if database changes activate `api` (depends_on database), `frontend` (depends_on api) also activates. Layers activated by cascade with no own file changes are `Skipped`; always-run layers with no changes are `Pending`.
+- **(v0.2+) Fail closed on evaluation** — layers are NEVER marked `Passed` without real provider-backed evaluation. Phase 1 records `Pending` status. The manifest overall status is `InProgress`, not `Passed`, until provider scoring runs.

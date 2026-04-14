@@ -60,17 +60,16 @@ pub async fn run(
         let layers_config = pice_core::layers::LayersConfig::load(&layers_path)
             .context("failed to load layers config")?;
 
-        let manifest = crate::orchestrator::stack_loops::run_stack_loops(
-            &layers_config,
-            &plan_path,
+        let stack_cfg = crate::orchestrator::stack_loops::StackLoopsConfig {
+            layers: &layers_config,
+            plan_path: &plan_path,
             project_root,
-            &config.evaluation.primary.provider,
-            &config.evaluation.primary.model,
-            config,
-            sink,
-            req.json,
-        )
-        .await?;
+            primary_provider: &config.evaluation.primary.provider,
+            primary_model: &config.evaluation.primary.model,
+            pice_config: config,
+        };
+        let manifest =
+            crate::orchestrator::stack_loops::run_stack_loops(&stack_cfg, sink, req.json).await?;
 
         // Format and return results from manifest
         if req.json {

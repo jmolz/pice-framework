@@ -1,0 +1,23 @@
+[contract]
+layer = "deployment"
+tier = 2
+
+[[contract.criteria]]
+name = "CI pipeline passes all stages"
+threshold = 9
+validation = "Verify build, test, lint, and security scan stages complete without failures"
+
+[[contract.criteria]]
+name = "Environment configuration matches target"
+threshold = 8
+validation = "Check that staging/production configs are correct and environment-specific values are parameterized"
+
+[[contract.criteria]]
+name = "Rollback strategy exists and is tested"
+threshold = 7
+validation = "Verify deployment can be reverted to the previous version without manual intervention"
+
+[[contract.criteria]]
+name = "Health checks are configured and functional"
+threshold = 8
+validation = "Check that readiness and liveness probes are defined and hit meaningful endpoints"

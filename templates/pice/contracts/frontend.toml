@@ -1,0 +1,28 @@
+[contract]
+layer = "frontend"
+tier = 2
+
+[[contract.criteria]]
+name = "Routes and navigation work correctly"
+threshold = 8
+validation = "Verify new routes render the correct components and handle unknown paths gracefully"
+
+[[contract.criteria]]
+name = "Components render without errors across states"
+threshold = 8
+validation = "Check loading, empty, error, and populated states for new and modified components"
+
+[[contract.criteria]]
+name = "Basic accessibility requirements are met"
+threshold = 7
+validation = "Verify semantic HTML, alt text, keyboard navigation, and ARIA labels on interactive elements"
+
+[[contract.criteria]]
+name = "Client-side errors are caught and reported"
+threshold = 7
+validation = "Check for error boundaries, try-catch around async calls, and user-facing error messages"
+
+[[contract.criteria]]
+name = "Layout is responsive across breakpoints"
+threshold = 7
+validation = "Verify components adapt to mobile, tablet, and desktop viewport widths"

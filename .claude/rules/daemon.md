@@ -76,9 +76,10 @@ If the CLI needs to preview what the daemon will execute, put the logic in `pice
 
 ## Verification manifest — source of truth
 
-- Location: `~/.pice/state/{feature-id}.manifest.json` (namespaced by `project_root_hash`)
+- Location: `~/.pice/state/{project_hash_12chars}/{feature-id}.manifest.json` (namespaced by project root SHA-256 hash to prevent cross-repo collisions)
 - Schema versioned (`schema_version: "0.2"`); daemon refuses to read incompatible versions
-- Writes are atomic: write to `.tmp` + rename
+- Writes are crash-safe: write to `.tmp` + fsync + rename + fsync parent directory
+- Persisted incrementally: initial checkpoint, per-layer checkpoint, final checkpoint
 - Single-writer-per-manifest enforced by daemon's internal lock map
 - All adapters (CLI, dashboard, CI) observe the same manifest
 - Never build parallel state stores. Never write manifest data to SQLite and treat SQLite as authoritative — SQLite is for metrics aggregation and audit trail. The manifest is for current evaluation state.

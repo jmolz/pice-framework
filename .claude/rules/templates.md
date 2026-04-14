@@ -36,6 +36,20 @@ Files that must stay in sync:
 Files that exist only in root (project-specific, not scaffolded):
 - `.claude/PRD.md`, `.claude/rules/*.md`, `.claude/docs/*.md`, `.claude/plans/*.md`, `.claude/settings.local.json`, `.claude/skills/`
 
+## Contract Templates (v0.2+)
+
+`templates/pice/contracts/` contains 7 default layer-specific contract templates. These are extracted by `pice init --upgrade` and `pice layers detect --write` into `.pice/contracts/`. They are NOT synced with the root project — they are defaults for new projects.
+
+| Template | Layer | Purpose |
+|----------|-------|---------|
+| `templates/pice/contracts/backend.toml` | backend | Code quality, error handling, tests, performance |
+| `templates/pice/contracts/database.toml` | database | Migration safety, schema consistency, query correctness |
+| `templates/pice/contracts/api.toml` | api | Input validation, auth, response format, error responses |
+| `templates/pice/contracts/frontend.toml` | frontend | Routes, components, accessibility, error handling |
+| `templates/pice/contracts/infrastructure.toml` | infrastructure | Env vars, secrets, IaC builds, security |
+| `templates/pice/contracts/deployment.toml` | deployment | CI pipeline, env config, rollback, health checks |
+| `templates/pice/contracts/observability.toml` | observability | Logging, alerts, tracing, metrics |
+
 ## Build-Time Embedding
 
 - Templates are embedded via `rust-embed` at compile time. Changes to `templates/` require `cargo build` to take effect.

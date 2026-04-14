@@ -1,0 +1,23 @@
+[contract]
+layer = "observability"
+tier = 2
+
+[[contract.criteria]]
+name = "Logging covers critical code paths"
+threshold = 8
+validation = "Verify structured logs exist for errors, state transitions, and key business events"
+
+[[contract.criteria]]
+name = "Alerts are defined for SLA-critical metrics"
+threshold = 7
+validation = "Check that alert rules exist for latency, error rate, and availability thresholds"
+
+[[contract.criteria]]
+name = "Tracing spans cover service boundaries"
+threshold = 7
+validation = "Verify trace context propagation across HTTP calls, queue consumers, and database queries"
+
+[[contract.criteria]]
+name = "Error rates and latency are tracked"
+threshold = 8
+validation = "Check that metrics are emitted for request duration, error counts, and saturation indicators"

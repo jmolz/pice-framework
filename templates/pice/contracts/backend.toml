@@ -1,0 +1,23 @@
+[contract]
+layer = "backend"
+tier = 2
+
+[[contract.criteria]]
+name = "Business logic is correct and handles edge cases"
+threshold = 8
+validation = "Review core logic paths for correctness and boundary conditions"
+
+[[contract.criteria]]
+name = "Error handling covers all failure modes"
+threshold = 8
+validation = "Check that errors are caught, logged, and surfaced appropriately"
+
+[[contract.criteria]]
+name = "Unit tests cover critical paths"
+threshold = 7
+validation = "Verify test coverage for new and modified functions"
+
+[[contract.criteria]]
+name = "No performance regressions in hot paths"
+threshold = 7
+validation = "Check for O(n^2) loops, unnecessary allocations, blocking calls"

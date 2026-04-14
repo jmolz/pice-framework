@@ -1,0 +1,23 @@
+[contract]
+layer = "database"
+tier = 2
+
+[[contract.criteria]]
+name = "Migrations are safe and reversible"
+threshold = 9
+validation = "Verify migrations can be rolled back without data loss and avoid locking tables in production"
+
+[[contract.criteria]]
+name = "Schema changes are consistent with existing conventions"
+threshold = 8
+validation = "Check naming conventions, column types, constraints, and foreign key relationships"
+
+[[contract.criteria]]
+name = "Queries are correct and use appropriate indexes"
+threshold = 8
+validation = "Review query plans for new queries and verify indexes exist for filtered/joined columns"
+
+[[contract.criteria]]
+name = "Data integrity constraints are enforced"
+threshold = 8
+validation = "Check for NOT NULL, UNIQUE, CHECK constraints, and foreign keys where required"

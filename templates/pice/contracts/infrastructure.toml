@@ -1,0 +1,23 @@
+[contract]
+layer = "infrastructure"
+tier = 2
+
+[[contract.criteria]]
+name = "Environment variables are declared and defaulted"
+threshold = 8
+validation = "Check that all required env vars are documented, validated at startup, and have sensible defaults"
+
+[[contract.criteria]]
+name = "No hardcoded secrets or credentials"
+threshold = 9
+validation = "Scan for API keys, passwords, tokens, or connection strings committed in plaintext"
+
+[[contract.criteria]]
+name = "Container and IaC definitions build cleanly"
+threshold = 8
+validation = "Verify Dockerfiles, Terraform, or other IaC files parse and build without errors"
+
+[[contract.criteria]]
+name = "Security configuration is present and correct"
+threshold = 8
+validation = "Check TLS settings, network policies, least-privilege IAM roles, and secret management"
