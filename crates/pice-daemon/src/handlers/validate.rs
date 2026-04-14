@@ -38,11 +38,7 @@ pub async fn run(
                     "errors": [{"field": "workflow", "message": message}],
                     "warnings": [],
                 });
-                return Ok(CommandResponse::Exit {
-                    code: 1,
-                    message: serde_json::to_string_pretty(&value)
-                        .unwrap_or_else(|_| value.to_string()),
-                });
+                return Ok(CommandResponse::ExitJson { code: 1, value });
             }
             return Ok(CommandResponse::Exit { code: 1, message });
         }
@@ -83,13 +79,9 @@ pub async fn run(
             Ok(CommandResponse::Json { value })
         } else {
             // JSON-mode failure: emit the full structured report on stdout
-            // (via the render layer that routes JSON-shaped Exit messages
-            // to stdout) AND signal nonzero exit so CI pipelines like
-            // `pice validate --json && deploy` fail closed.
-            Ok(CommandResponse::Exit {
-                code: 1,
-                message: serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
-            })
+            // (via `ExitJson` in the renderer) AND signal nonzero exit so CI
+            // pipelines like `pice validate --json && deploy` fail closed.
+            Ok(CommandResponse::ExitJson { code: 1, value })
         }
     } else if !report.is_ok() {
         let mut message = format!("Validation failed with {} error(s):\n", report.errors.len());
@@ -275,19 +267,16 @@ layer_overrides:
         };
         let resp = run(req, &ctx, &NullSink).await.unwrap();
         match resp {
-            // JSON-mode validation failures now return Exit{code:1, message:<json>}
-            // so `pice validate --json` in CI scripts fails the process. The
-            // renderer routes JSON-shaped messages to stdout; tests parse the
-            // message directly.
-            CommandResponse::Exit { code, message } => {
+            // JSON-mode validation failures return ExitJson{code:1, value}
+            // so `pice validate --json` in CI scripts fails the process while
+            // still emitting a parseable report on stdout via the renderer.
+            CommandResponse::ExitJson { code, value } => {
                 assert_eq!(code, 1);
-                let value: serde_json::Value =
-                    serde_json::from_str(&message).expect("Exit message should contain valid JSON");
                 assert_eq!(value["ok"], false);
                 let errs = value["errors"].as_array().unwrap();
                 assert!(!errs.is_empty());
             }
-            other => panic!("expected Exit with JSON, got {other:?}"),
+            other => panic!("expected ExitJson, got {other:?}"),
         }
     }
 

@@ -63,7 +63,19 @@ pub enum CommandResponse {
     /// The command succeeded with no user-visible payload.
     Empty,
     /// The command failed and the CLI should exit with the given code.
+    ///
+    /// `message` is human-readable text routed to stderr. For structured
+    /// JSON-on-failure (the `--json` error path) use [`CommandResponse::ExitJson`]
+    /// instead — mixing the two via string sniffing is ambiguous and fragile.
     Exit { code: i32, message: String },
+    /// The command failed in `--json` mode and the CLI should emit the
+    /// structured payload on stdout before exiting with the given code.
+    ///
+    /// Distinct from `Exit` so the renderer does not need to guess whether a
+    /// message is JSON or plain text. Used by `pice validate --json` on
+    /// validation failure so CI pipelines (`pice validate --json && deploy`)
+    /// fail closed while still receiving a parseable error report on stdout.
+    ExitJson { code: i32, value: serde_json::Value },
 }
 
 // ─── Request structs ────────────────────────────────────────────────────────
@@ -464,6 +476,29 @@ mod tests {
         assert!(wire.contains("\"type\":\"empty\""));
         let parsed: CommandResponse = serde_json::from_str(&wire).unwrap();
         matches!(parsed, CommandResponse::Empty);
+    }
+
+    #[test]
+    fn command_response_exit_json_roundtrip() {
+        // JSON-mode failure path: exit nonzero AND carry a structured payload
+        // that the renderer writes to stdout. Catches the old string-sniffing
+        // ambiguity where a plain-text `Exit` message that happened to parse
+        // as JSON would be misrouted.
+        let resp = CommandResponse::ExitJson {
+            code: 1,
+            value: serde_json::json!({"ok": false, "errors": ["bad"]}),
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        assert!(wire.contains("\"type\":\"exit-json\""));
+        let parsed: CommandResponse = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandResponse::ExitJson { code, value } => {
+                assert_eq!(code, 1);
+                assert_eq!(value["ok"], false);
+                assert_eq!(value["errors"][0], "bad");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]
