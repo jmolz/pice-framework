@@ -207,6 +207,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_evaluate_v01_fallback_emits_warning() {
+        // A valid plan with contract, but NO .pice/layers.toml → v0.1 fallback
+        // with warning message via sink.send_chunk().
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create a plan with a contract section
+        let plans_dir = dir.path().join(".claude/plans");
+        std::fs::create_dir_all(&plans_dir).unwrap();
+        std::fs::write(
+            plans_dir.join("test-plan.md"),
+            r#"# Plan
+
+## Contract
+
+```json
+{
+  "feature": "test",
+  "tier": 1,
+  "pass_threshold": 8,
+  "criteria": [
+    {"name": "works", "threshold": 8, "validation": "manual"}
+  ]
+}
+```
+"#,
+        )
+        .unwrap();
+
+        // Create .pice/config.toml so the project is initialized
+        let pice_dir = dir.path().join(".pice");
+        std::fs::create_dir_all(&pice_dir).unwrap();
+        std::fs::write(
+            pice_dir.join("config.toml"),
+            r#"
+[provider]
+name = "claude-code"
+[evaluation]
+[evaluation.primary]
+provider = "claude-code"
+model = "claude-sonnet-4-20250514"
+[evaluation.adversarial]
+provider = "codex"
+model = "o3-mini"
+effort = "high"
+enabled = false
+[evaluation.tiers]
+tier1_models = ["claude-sonnet-4-20250514"]
+tier2_models = ["claude-sonnet-4-20250514"]
+tier3_models = ["claude-sonnet-4-20250514"]
+tier3_agent_team = false
+[telemetry]
+enabled = false
+endpoint = "https://telemetry.pice.dev/v1/events"
+[metrics]
+db_path = ".pice/metrics.db"
+"#,
+        )
+        .unwrap();
+
+        // NO .pice/layers.toml — this is the v0.1 case
+
+        // Use a CaptureSink to verify the warning
+        use std::sync::Mutex;
+        struct CaptureSink {
+            chunks: Mutex<Vec<String>>,
+        }
+        impl StreamSink for CaptureSink {
+            fn send_chunk(&self, text: &str) {
+                self.chunks.lock().unwrap().push(text.to_string());
+            }
+            fn send_event(&self, _event: StreamEvent) {}
+        }
+
+        let sink = CaptureSink {
+            chunks: Mutex::new(Vec::new()),
+        };
+        let ctx = DaemonContext::new_for_test_with_root("test-token", dir.path().to_path_buf());
+        let req = CommandRequest::Evaluate(pice_core::cli::EvaluateRequest {
+            plan_path: std::path::PathBuf::from(".claude/plans/test-plan.md"),
+            json: false,
+        });
+
+        // The handler will emit the v0.1 warning, then try to start a provider
+        // (which will fail). We care about the warning being emitted.
+        let _result = dispatch(req, &ctx, &sink).await;
+
+        let chunks = sink.chunks.lock().unwrap();
+        let all_output = chunks.join("");
+        assert!(
+            all_output.contains("No .pice/layers.toml found"),
+            "should emit v0.1 fallback warning, got chunks: {:?}",
+            *chunks
+        );
+        assert!(
+            all_output.contains("single-loop evaluation"),
+            "should mention single-loop evaluation, got chunks: {:?}",
+            *chunks
+        );
+    }
+
+    #[tokio::test]
     async fn dispatch_review_errors_without_provider() {
         let ctx = test_ctx();
         let req = CommandRequest::Review(pice_core::cli::ReviewRequest { json: false });
