@@ -381,6 +381,7 @@ pub fn parse(input: &str) -> Result<TriggerAst, ParseError> {
     let mut p = Parser {
         tokens: &tokens,
         pos: 0,
+        depth: 0,
     };
     let ast = p.parse_or()?;
     if p.pos < tokens.len() {
@@ -394,9 +395,20 @@ pub fn parse(input: &str) -> Result<TriggerAst, ParseError> {
     Ok(ast)
 }
 
+/// Maximum nesting depth for `(` groups and chained `NOT`. Beyond this, parsing
+/// returns a `ParseError` rather than overflowing the Rust stack. Real-world
+/// triggers are shallow (< 10 levels); 128 leaves massive headroom while
+/// bounding the recursion budget under malformed input.
+const MAX_PARSE_DEPTH: usize = 128;
+
 struct Parser<'a> {
     tokens: &'a [TokenWithPos],
     pos: usize,
+    /// Current recursion depth across the two descent points — `(` groups in
+    /// `parse_primary` and chained `NOT` in `parse_not`. Incremented before
+    /// recursing, decremented after. The rest of the grammar is iterative
+    /// (while-loops in `parse_or`/`parse_and`) and does not grow the stack.
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -454,8 +466,16 @@ impl<'a> Parser<'a> {
     fn parse_not(&mut self) -> Result<TriggerAst, ParseError> {
         if matches!(self.peek().map(|t| &t.token), Some(Token::Not)) {
             self.bump();
-            let inner = self.parse_not()?;
-            Ok(TriggerAst::Not(Box::new(inner)))
+            self.depth += 1;
+            if self.depth > MAX_PARSE_DEPTH {
+                self.depth -= 1;
+                return Err(self.err(format!(
+                    "trigger expression too deeply nested (max depth {MAX_PARSE_DEPTH})"
+                )));
+            }
+            let inner_result = self.parse_not();
+            self.depth -= 1;
+            Ok(TriggerAst::Not(Box::new(inner_result?)))
         } else {
             self.parse_primary()
         }
@@ -470,7 +490,16 @@ impl<'a> Parser<'a> {
         match &token.token {
             Token::LParen => {
                 self.bump();
-                let inner = self.parse_or()?;
+                self.depth += 1;
+                if self.depth > MAX_PARSE_DEPTH {
+                    self.depth -= 1;
+                    return Err(self.err(format!(
+                        "trigger expression too deeply nested (max depth {MAX_PARSE_DEPTH})"
+                    )));
+                }
+                let inner_result = self.parse_or();
+                self.depth -= 1;
+                let inner = inner_result?;
                 match self.peek().map(|t| &t.token) {
                     Some(Token::RParen) => {
                         self.bump();
@@ -909,5 +938,50 @@ mod tests {
             &parse("NOT (layer == frontend)").unwrap(),
             &ctx()
         ));
+    }
+
+    #[test]
+    fn deeply_nested_parens_return_parse_error_not_overflow() {
+        // Construct a pathological expression of 200 nested `(` groups. Prior
+        // to the depth limit this would recurse past the Rust stack and abort
+        // the process. With the MAX_PARSE_DEPTH guard, parse returns a
+        // ParseError cleanly.
+        let depth = 200;
+        let expr = format!(
+            "{}tier >= 1{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let err = parse(&expr).expect_err("expected depth-limit parse error");
+        assert!(
+            err.message.contains("too deeply nested"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn deeply_nested_not_returns_parse_error_not_overflow() {
+        // 200 chained NOT keywords is well beyond MAX_PARSE_DEPTH. Must return
+        // a ParseError, not crash the process.
+        let expr = format!("{}tier >= 1", "NOT ".repeat(200));
+        let err = parse(&expr).expect_err("expected depth-limit parse error");
+        assert!(
+            err.message.contains("too deeply nested"),
+            "unexpected error message: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn moderate_nesting_under_limit_parses() {
+        // Sanity: 64 levels of parens is well within MAX_PARSE_DEPTH (128).
+        let depth = 64;
+        let expr = format!(
+            "{}tier >= 1{}",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        parse(&expr).expect("64-level nesting should parse cleanly");
     }
 }

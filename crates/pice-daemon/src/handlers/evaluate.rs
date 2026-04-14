@@ -63,6 +63,23 @@ pub async fn run(
         let workflow = pice_core::workflow::loader::resolve(project_root)
             .context("failed to resolve workflow.yaml")?;
 
+        // Fail closed on semantic workflow errors (bad triggers, unknown
+        // layer overrides, out-of-range tiers, unknown seam boundaries).
+        // Without this check, a broken workflow.yaml would silently drive
+        // orchestration — e.g. a layer_override referencing a ghost layer
+        // would be ignored at runtime. `pice validate` runs the same
+        // checks; this mirrors them at execution time.
+        let report =
+            pice_core::workflow::validate::validate_all(&workflow, Some(&layers_config), None);
+        if !report.is_ok() {
+            let mut message = String::from("workflow.yaml has validation errors:\n");
+            for e in &report.errors {
+                message.push_str(&format!("  - {}: {}\n", e.field, e.message));
+            }
+            message.push_str("\nRun `pice validate` for full details.\n");
+            return Ok(CommandResponse::Exit { code: 1, message });
+        }
+
         let stack_cfg = crate::orchestrator::stack_loops::StackLoopsConfig {
             layers: &layers_config,
             plan_path: &plan_path,

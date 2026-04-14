@@ -213,6 +213,91 @@ defaults:
     }
 
     #[test]
+    fn workflow_config_roundtrips_through_yaml() {
+        // Contract criterion #1: serialize a fully-populated WorkflowConfig,
+        // deserialize, assert equality. Catches `skip_serializing_if` data
+        // loss and serde field-name drift across the full schema surface.
+        use crate::workflow::schema::{
+            AdaptiveAlgo, CostCapBehavior, Defaults, EvaluatePhase, ExecutePhase, LayerOverride,
+            OnTimeout, PhaseConfig, Phases, RetryConfig, ReviewConfig, WorkflowConfig,
+        };
+        use std::collections::BTreeMap;
+
+        let mut layer_overrides: BTreeMap<String, LayerOverride> = BTreeMap::new();
+        layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                tier: Some(3),
+                min_confidence: Some(0.97),
+                max_passes: Some(8),
+                budget_usd: Some(0.9),
+                require_review: Some(true),
+                trigger: Some("confidence < 0.95".into()),
+            },
+        );
+
+        let mut model_override: BTreeMap<String, String> = BTreeMap::new();
+        model_override.insert("backend".into(), "opus".into());
+
+        let mut seams: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        seams.insert(
+            "backend-frontend".into(),
+            vec!["contract_type_sync".into(), "error_shape".into()],
+        );
+
+        let original = WorkflowConfig {
+            schema_version: "0.2".into(),
+            defaults: Defaults {
+                tier: 3,
+                min_confidence: 0.95,
+                max_passes: 7,
+                model: "opus".into(),
+                budget_usd: 3.0,
+                cost_cap_behavior: CostCapBehavior::Warn,
+                max_parallelism: Some(4),
+            },
+            phases: Phases {
+                plan: PhaseConfig {
+                    description: Some("Planning".into()),
+                    output: Some(".claude/plans/{feature}.md".into()),
+                },
+                execute: ExecutePhase {
+                    description: Some("Executing".into()),
+                    parallel: true,
+                    worktree_isolation: true,
+                    retry: RetryConfig {
+                        max_attempts: 4,
+                        fresh_context: true,
+                    },
+                },
+                evaluate: EvaluatePhase {
+                    description: Some("Evaluating".into()),
+                    parallel: true,
+                    seam_checks: true,
+                    adaptive_algorithm: AdaptiveAlgo::Adts,
+                    model_override,
+                },
+            },
+            layer_overrides,
+            review: Some(ReviewConfig {
+                enabled: true,
+                trigger: Some("tier >= 3 OR layer == infrastructure".into()),
+                timeout_hours: 48,
+                on_timeout: OnTimeout::Reject,
+                notification: "stdout".into(),
+            }),
+            seams: Some(seams),
+        };
+
+        let yaml = serde_yaml::to_string(&original).expect("serialize");
+        let roundtripped: WorkflowConfig = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert_eq!(
+            original, roundtripped,
+            "WorkflowConfig roundtrip lost data; yaml was:\n{yaml}"
+        );
+    }
+
+    #[test]
     fn resolve_project_overrides_framework() {
         let tmp = tempdir().unwrap();
         // Project strictens every floor-guarded field (tier, min_confidence,

@@ -164,19 +164,6 @@ pub fn validate_triggers(cfg: &WorkflowConfig) -> ValidationReport {
         }
     }
 
-    if let Some(review) = cfg.phases.review.as_ref() {
-        if let Some(expr) = review.trigger.as_deref() {
-            if let Err(e) = trigger::parse(expr) {
-                report.errors.push(ValidationError {
-                    field: "phases.review.trigger".into(),
-                    message: e.message.clone(),
-                    line: Some(e.line),
-                    column: Some(e.column),
-                });
-            }
-        }
-    }
-
     for (layer, o) in &cfg.layer_overrides {
         if let Some(expr) = o.trigger.as_deref() {
             if let Err(e) = trigger::parse(expr) {
@@ -200,7 +187,14 @@ pub fn validate_triggers(cfg: &WorkflowConfig) -> ValidationReport {
 pub fn validate_cross_references(cfg: &WorkflowConfig, layers: &LayersConfig) -> ValidationReport {
     let mut report = ValidationReport::default();
 
-    let known_layers: Vec<&str> = layers.layers.order.iter().map(|s| s.as_str()).collect();
+    // Authoritative set is the intersection of `order` and `defs` — a name
+    // that appears in `order` but has no `[layers.X]` definition would never
+    // activate at runtime, so references to it are ghost layers. Prefer
+    // `defs.keys()` over `order.iter()` here: the orchestrator consults
+    // `defs` to resolve a layer, so any cross-ref that doesn't match a def
+    // is silently dead at runtime. Listing only `defs` keeps validation and
+    // execution aligned.
+    let known_layers: Vec<&str> = layers.layers.defs.keys().map(|s| s.as_str()).collect();
     let known_layers_set: std::collections::HashSet<&str> = known_layers.iter().copied().collect();
 
     for layer in cfg.layer_overrides.keys() {
@@ -452,6 +446,31 @@ mod tests {
         let err = &report.errors[0];
         assert!(err.message.contains("ghost_layer"));
         assert!(err.message.contains("backend"));
+    }
+
+    #[test]
+    fn order_only_ghost_layer_rejected() {
+        // A name listed in `layers.order` but missing from `layers.defs`
+        // never activates at runtime. Workflow cross-references to it must
+        // be rejected — otherwise the override silently no-ops.
+        let mut layers = sample_layers();
+        layers.layers.order.push("ghost_in_order".into());
+        // NOTE: no corresponding `defs` entry.
+
+        let mut cfg = embedded_defaults();
+        cfg.layer_overrides.insert(
+            "ghost_in_order".into(),
+            LayerOverride {
+                tier: Some(3),
+                ..Default::default()
+            },
+        );
+        let report = validate_cross_references(&cfg, &layers);
+        assert!(
+            !report.is_ok(),
+            "expected order-only ghost to be rejected"
+        );
+        assert!(report.errors[0].message.contains("ghost_in_order"));
     }
 
     #[test]

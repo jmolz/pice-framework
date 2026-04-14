@@ -16,6 +16,15 @@
 //! | `max_passes`      | higher count (more rigor)  |
 //! | `budget_usd`      | lower dollars              |
 //! | `require_review`  | true                       |
+//!
+//! ## Per-layer floor derivation
+//!
+//! A user override on layer `X` is checked against the **effective project
+//! value** for that layer — `project.defaults` overlaid with
+//! `project.layer_overrides[X]` (if any). This closes the escape path where a
+//! user adds a fresh per-layer override on a layer the project never listed:
+//! without this rule, the floor would collapse to `LayerOverride::default()`
+//! and any value would pass.
 
 use anyhow::Result;
 use serde::Serialize;
@@ -87,6 +96,16 @@ pub fn overlay(base: WorkflowConfig, overlay: WorkflowConfig) -> WorkflowConfig 
 /// project step uses [`overlay`] instead — see PRDv2 lines 903–918.
 pub fn merge_with_floor(base: WorkflowConfig, overlay: WorkflowConfig) -> Result<WorkflowConfig> {
     let mut violations: Vec<FloorViolation> = Vec::new();
+
+    // Snapshot project values BEFORE mutation — these are the true floors used
+    // by per-layer floor derivation. If we only consulted `out.defaults` after
+    // `merge_defaults`, a user raising defaults could then be checked against
+    // their own raised value in the per-layer step; that's still safe, but the
+    // snapshot makes intent unambiguous: the floor is what the PROJECT said.
+    let project_defaults = base.defaults.clone();
+    let project_review = base.review.clone();
+    let project_layer_overrides = base.layer_overrides.clone();
+
     let mut out = base.clone();
 
     // schema_version: overlay must match base exactly (handled pre-merge in loader).
@@ -102,6 +121,9 @@ pub fn merge_with_floor(base: WorkflowConfig, overlay: WorkflowConfig) -> Result
     merge_layer_overrides(
         &mut out.layer_overrides,
         &overlay.layer_overrides,
+        &project_defaults,
+        project_review.as_ref(),
+        &project_layer_overrides,
         &mut violations,
     );
 
@@ -148,7 +170,8 @@ fn merge_defaults(base: &mut Defaults, overlay: &Defaults, violations: &mut Vec<
 
     // max_passes — not floor-guarded per PRDv2 lines 908–916. Overlay wins.
     // (Rationale: more passes increases rigor and cost; fewer passes decreases
-    // both. Direction is not monotonic, so the PRD leaves this unconstrained.)
+    // both. Direction is not monotonic, so the PRD leaves this unconstrained.
+    // See `.claude/rules/workflow-yaml.md` for the policy alignment note.)
     base.max_passes = overlay.max_passes;
 
     // budget_usd — overlay can only LOWER (lower budget = more restrictive)
@@ -178,11 +201,24 @@ fn merge_defaults(base: &mut Defaults, overlay: &Defaults, violations: &mut Vec<
 fn merge_layer_overrides(
     base: &mut BTreeMap<String, LayerOverride>,
     overlay: &BTreeMap<String, LayerOverride>,
+    project_defaults: &Defaults,
+    project_review: Option<&ReviewConfig>,
+    project_layer_overrides: &BTreeMap<String, LayerOverride>,
     violations: &mut Vec<FloorViolation>,
 ) {
+    let empty = LayerOverride::default();
     for (layer, o) in overlay {
+        let project_layer = project_layer_overrides.get(layer).unwrap_or(&empty);
         let entry = base.entry(layer.clone()).or_default();
-        merge_layer_override_fields(layer, entry, o, violations);
+        merge_layer_override_fields(
+            layer,
+            entry,
+            o,
+            project_defaults,
+            project_review,
+            project_layer,
+            violations,
+        );
     }
 }
 
@@ -190,29 +226,38 @@ fn merge_layer_override_fields(
     layer: &str,
     base: &mut LayerOverride,
     overlay: &LayerOverride,
+    project_defaults: &Defaults,
+    project_review: Option<&ReviewConfig>,
+    project_layer: &LayerOverride,
     violations: &mut Vec<FloorViolation>,
 ) {
     if let Some(o_tier) = overlay.tier {
-        match base.tier {
-            Some(b_tier) if o_tier < b_tier => violations.push(FloorViolation {
+        let floor = project_layer.tier.unwrap_or(project_defaults.tier);
+        if o_tier < floor {
+            violations.push(FloorViolation {
                 field: format!("layer_overrides.{layer}.tier"),
-                project: b_tier.to_string(),
+                project: floor.to_string(),
                 user: o_tier.to_string(),
                 reason: "tier may only be raised",
-            }),
-            _ => base.tier = Some(o_tier),
+            });
+        } else {
+            base.tier = Some(o_tier);
         }
     }
 
     if let Some(o_mc) = overlay.min_confidence {
-        match base.min_confidence {
-            Some(b_mc) if o_mc < b_mc => violations.push(FloorViolation {
+        let floor = project_layer
+            .min_confidence
+            .unwrap_or(project_defaults.min_confidence);
+        if o_mc < floor {
+            violations.push(FloorViolation {
                 field: format!("layer_overrides.{layer}.min_confidence"),
-                project: b_mc.to_string(),
+                project: floor.to_string(),
                 user: o_mc.to_string(),
                 reason: "min_confidence may only be raised",
-            }),
-            _ => base.min_confidence = Some(o_mc),
+            });
+        } else {
+            base.min_confidence = Some(o_mc);
         }
     }
 
@@ -222,39 +267,50 @@ fn merge_layer_override_fields(
     }
 
     if let Some(o_b) = overlay.budget_usd {
-        match base.budget_usd {
-            Some(b_b) if o_b > b_b => violations.push(FloorViolation {
+        let ceiling = project_layer
+            .budget_usd
+            .unwrap_or(project_defaults.budget_usd);
+        if o_b > ceiling {
+            violations.push(FloorViolation {
                 field: format!("layer_overrides.{layer}.budget_usd"),
-                project: b_b.to_string(),
+                project: ceiling.to_string(),
                 user: o_b.to_string(),
                 reason: "budget_usd may only be lowered",
-            }),
-            _ => base.budget_usd = Some(o_b),
+            });
+        } else {
+            base.budget_usd = Some(o_b);
         }
     }
 
     if let Some(o_rr) = overlay.require_review {
-        match base.require_review {
-            Some(true) if !o_rr => violations.push(FloorViolation {
+        // Effective project floor for require_review on this layer:
+        //   - project_layer.require_review if set
+        //   - otherwise project_review.enabled (global gate)
+        // A user must not downgrade either path to false.
+        let layer_rr_floor = project_layer.require_review.unwrap_or(false);
+        let global_rr_floor = project_review.map(|r| r.enabled).unwrap_or(false);
+        let floor = layer_rr_floor || global_rr_floor;
+        if floor && !o_rr {
+            violations.push(FloorViolation {
                 field: format!("layer_overrides.{layer}.require_review"),
                 project: "true".into(),
                 user: "false".into(),
                 reason: "required review cannot be disabled",
-            }),
-            _ => base.require_review = Some(o_rr),
+            });
+        } else {
+            base.require_review = Some(o_rr);
         }
     }
 
     if overlay.trigger.is_some() {
-        // Adding a stricter trigger is allowed; removing one is not
-        // expressible here (absent overlay.trigger = no change). If the
-        // overlay sets an empty string AND base has a trigger, treat as
-        // removal attempt.
-        if let (Some(b), Some(o)) = (base.trigger.as_deref(), overlay.trigger.as_deref()) {
-            if o.is_empty() && !b.is_empty() {
+        // Adding a stricter trigger is allowed; removing one (empty string
+        // sentinel) is not. The floor is the project's per-layer trigger.
+        let project_trigger = project_layer.trigger.as_deref();
+        if let (Some(pt), Some(o)) = (project_trigger, overlay.trigger.as_deref()) {
+            if o.is_empty() && !pt.is_empty() {
                 violations.push(FloorViolation {
                     field: format!("layer_overrides.{layer}.trigger"),
-                    project: b.to_string(),
+                    project: pt.to_string(),
                     user: String::new(),
                     reason: "required gate trigger cannot be removed",
                 });
@@ -453,6 +509,152 @@ mod tests {
     }
 
     #[test]
+    fn required_review_trigger_removal_rejected() {
+        // Project review has a required trigger; user attempts to remove it
+        // (sets trigger = None in overlay). This is the Row 5 floor-table rule.
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier >= 3".into()),
+            ..Default::default()
+        });
+        let mut u = overlay_from(&b);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: None, // removal attempt
+            ..b.review.clone().unwrap()
+        });
+        let err = merge_with_floor(b, u).unwrap_err();
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert!(
+            fv.violations
+                .iter()
+                .any(|v| v.field == "review.trigger"
+                    && v.reason == "required gate trigger cannot be removed"),
+            "expected review.trigger removal violation, got: {fv:?}"
+        );
+    }
+
+    #[test]
+    fn layer_override_require_review_downgrade_rejected() {
+        // Project layer override sets require_review: true; user attempts
+        // to disable it. Row 4 of the floor table, per-layer variant.
+        let mut b = base();
+        b.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                require_review: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                require_review: Some(false),
+                ..Default::default()
+            },
+        );
+        let err = merge_with_floor(b, u).unwrap_err();
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert!(fv
+            .violations
+            .iter()
+            .any(|v| v.field == "layer_overrides.infrastructure.require_review"));
+    }
+
+    #[test]
+    fn fresh_layer_tier_override_checked_against_defaults() {
+        // Project has defaults.tier = 3 and NO layer_overrides entry for
+        // "backend". A user adding layer_overrides.backend.tier = 1 must be
+        // rejected against the project's defaults floor (Codex critical
+        // finding regression).
+        let mut b = base();
+        b.defaults.tier = 3;
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                tier: Some(1),
+                ..Default::default()
+            },
+        );
+        let err = merge_with_floor(b, u).unwrap_err();
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert!(
+            fv.violations
+                .iter()
+                .any(|v| v.field == "layer_overrides.backend.tier"),
+            "expected floor violation on fresh layer, got: {fv:?}"
+        );
+    }
+
+    #[test]
+    fn fresh_layer_min_confidence_override_checked_against_defaults() {
+        let mut b = base();
+        b.defaults.min_confidence = 0.95;
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                min_confidence: Some(0.80),
+                ..Default::default()
+            },
+        );
+        let err = merge_with_floor(b, u).unwrap_err();
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert!(fv
+            .violations
+            .iter()
+            .any(|v| v.field == "layer_overrides.backend.min_confidence"));
+    }
+
+    #[test]
+    fn fresh_layer_budget_override_checked_against_defaults() {
+        let mut b = base();
+        b.defaults.budget_usd = 1.0;
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                budget_usd: Some(10.0), // higher = relaxation
+                ..Default::default()
+            },
+        );
+        let err = merge_with_floor(b, u).unwrap_err();
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert!(fv
+            .violations
+            .iter()
+            .any(|v| v.field == "layer_overrides.backend.budget_usd"));
+    }
+
+    #[test]
+    fn fresh_layer_require_review_override_checked_against_global() {
+        // Project has global review.enabled = true and NO per-layer entry.
+        // User tries to exempt one layer: require_review = false.
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            ..Default::default()
+        });
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                require_review: Some(false),
+                ..Default::default()
+            },
+        );
+        let err = merge_with_floor(b, u).unwrap_err();
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert!(fv
+            .violations
+            .iter()
+            .any(|v| v.field == "layer_overrides.backend.require_review"));
+    }
+
+    #[test]
     fn layer_override_restrict_confidence_allowed() {
         let mut b = base();
         b.layer_overrides.insert(
@@ -508,38 +710,97 @@ mod tests {
 
     #[test]
     fn adversarial_relax_all_floors_collects_all_violations() {
+        // Exercises EVERY floor-protected vector in one pass:
+        //   1. defaults.tier (lower)
+        //   2. defaults.min_confidence (lower)
+        //   3. defaults.budget_usd (raise)
+        //   4. review.enabled (disable)
+        //   5. review.trigger (remove)
+        //   6. layer_overrides.{existing}.require_review (downgrade)
+        //   7. layer_overrides.{fresh}.tier (undercut defaults via new layer)
+        //
+        // max_passes is intentionally excluded (not floor-guarded per PRDv2).
+        // Asserts ALL seven violations are collected in a single merge call —
+        // a single-miss bypass defeats the team-wide policy guarantee.
         let mut b = base();
         b.defaults.tier = 3;
         b.defaults.min_confidence = 0.95;
         b.defaults.budget_usd = 2.0;
-        b.defaults.max_passes = 5;
         b.review = Some(ReviewConfig {
             enabled: true,
             trigger: Some("tier >= 3".into()),
             ..Default::default()
         });
+        b.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                require_review: Some(true),
+                ..Default::default()
+            },
+        );
 
         let mut u = overlay_from(&b);
-        u.defaults.tier = 2; // lower
-        u.defaults.min_confidence = 0.80; // lower
-        u.defaults.budget_usd = 10.0; // raise
-                                      // max_passes is NOT floor-guarded (see merge logic above); skipped.
+        u.defaults.tier = 2; // lower (violation #1)
+        u.defaults.min_confidence = 0.80; // lower (violation #2)
+        u.defaults.budget_usd = 10.0; // raise (violation #3)
         u.review = Some(ReviewConfig {
-            enabled: false,
-            trigger: b.review.clone().unwrap().trigger,
-            ..b.review.clone().unwrap()
+            enabled: false,  // disable required review (violation #4)
+            trigger: None,   // remove required trigger (violation #5)
+            ..Default::default()
         });
+        // Downgrade existing layer's require_review (violation #6):
+        u.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                require_review: Some(false),
+                ..Default::default()
+            },
+        );
+        // Fresh layer override that undercuts defaults.tier (violation #7):
+        u.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                tier: Some(1),
+                ..Default::default()
+            },
+        );
 
         let err = merge_with_floor(b, u).unwrap_err();
-        let err_msg = err.to_string();
-        assert!(err_msg.contains("4"), "expected 4 violations: {err_msg}");
-
         let fv = err.downcast_ref::<FloorViolations>().unwrap();
-        assert_eq!(fv.violations.len(), 4);
         let fields: Vec<&str> = fv.violations.iter().map(|v| v.field.as_str()).collect();
-        assert!(fields.contains(&"defaults.tier"));
-        assert!(fields.contains(&"defaults.min_confidence"));
-        assert!(fields.contains(&"defaults.budget_usd"));
-        assert!(fields.contains(&"review.enabled"));
+
+        assert!(
+            fields.contains(&"defaults.tier"),
+            "missing defaults.tier: {fields:?}"
+        );
+        assert!(
+            fields.contains(&"defaults.min_confidence"),
+            "missing defaults.min_confidence: {fields:?}"
+        );
+        assert!(
+            fields.contains(&"defaults.budget_usd"),
+            "missing defaults.budget_usd: {fields:?}"
+        );
+        assert!(
+            fields.contains(&"review.enabled"),
+            "missing review.enabled: {fields:?}"
+        );
+        assert!(
+            fields.contains(&"review.trigger"),
+            "missing review.trigger: {fields:?}"
+        );
+        assert!(
+            fields.contains(&"layer_overrides.infrastructure.require_review"),
+            "missing layer require_review: {fields:?}"
+        );
+        assert!(
+            fields.contains(&"layer_overrides.backend.tier"),
+            "missing fresh-layer tier escape: {fields:?}"
+        );
+        assert!(
+            fv.violations.len() >= 7,
+            "expected at least 7 violations, got {}: {fields:?}",
+            fv.violations.len()
+        );
     }
 }

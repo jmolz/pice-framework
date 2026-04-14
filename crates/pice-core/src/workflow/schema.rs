@@ -46,7 +46,13 @@ pub enum CostCapBehavior {
     Continue,
 }
 
-/// Phase configuration — plan / execute / evaluate / review.
+/// Phase configuration — plan / execute / evaluate.
+///
+/// Review gates live at the top level (`WorkflowConfig.review`), NOT inside
+/// `phases`. Prior to Phase 2 GA this struct carried a duplicate
+/// `phases.review` field; it was dead at runtime and created a latent
+/// floor-bypass surface (floor merge only covered the top-level field).
+/// Removed to keep one canonical location.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Phases {
     #[serde(default)]
@@ -55,8 +61,6 @@ pub struct Phases {
     pub execute: ExecutePhase,
     #[serde(default)]
     pub evaluate: EvaluatePhase,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub review: Option<ReviewConfig>,
 }
 
 /// Generic phase descriptor — only used for `plan` today.
