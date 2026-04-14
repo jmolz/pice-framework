@@ -1,0 +1,34 @@
+# Preset: ci
+# Intended for unattended CI runs — no human review, strict budget cap,
+# serial execution (max_parallelism: 1) for deterministic test ordering.
+
+schema_version: "0.2"
+
+defaults:
+  tier: 2
+  min_confidence: 0.90
+  max_passes: 5
+  model: sonnet
+  budget_usd: 1.00
+  cost_cap_behavior: halt
+  max_parallelism: 1
+
+phases:
+  execute:
+    parallel: false
+    worktree_isolation: true
+    retry:
+      max_attempts: 2
+      fresh_context: true
+  evaluate:
+    parallel: false
+    seam_checks: true
+    adaptive_algorithm: bayesian_sprt
+
+layer_overrides: {}
+
+review:
+  enabled: false
+  timeout_hours: 24
+  on_timeout: reject
+  notification: stdout

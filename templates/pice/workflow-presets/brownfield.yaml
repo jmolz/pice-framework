@@ -1,0 +1,33 @@
+# Preset: brownfield
+# Intended for legacy codebases where regression risk is the dominant concern.
+# Higher confidence, more passes, larger budget to accommodate retries.
+
+schema_version: "0.2"
+
+defaults:
+  tier: 2
+  min_confidence: 0.92
+  max_passes: 5
+  model: sonnet
+  budget_usd: 1.50
+  cost_cap_behavior: halt
+
+phases:
+  execute:
+    parallel: true
+    worktree_isolation: true
+    retry:
+      max_attempts: 3
+      fresh_context: true
+  evaluate:
+    parallel: true
+    seam_checks: true
+    adaptive_algorithm: adts
+
+layer_overrides: {}
+
+review:
+  enabled: false
+  timeout_hours: 24
+  on_timeout: reject
+  notification: stdout

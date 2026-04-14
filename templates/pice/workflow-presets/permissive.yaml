@@ -1,0 +1,33 @@
+# Preset: permissive
+# Intended for rapid prototyping — low confidence target, few passes,
+# warn-on-overage instead of halt. Do NOT use for production code.
+
+schema_version: "0.2"
+
+defaults:
+  tier: 1
+  min_confidence: 0.85
+  max_passes: 2
+  model: sonnet
+  budget_usd: 1.50
+  cost_cap_behavior: warn
+
+phases:
+  execute:
+    parallel: true
+    worktree_isolation: false
+    retry:
+      max_attempts: 1
+      fresh_context: false
+  evaluate:
+    parallel: true
+    seam_checks: false
+    adaptive_algorithm: none
+
+layer_overrides: {}
+
+review:
+  enabled: false
+  timeout_hours: 24
+  on_timeout: skip
+  notification: stdout

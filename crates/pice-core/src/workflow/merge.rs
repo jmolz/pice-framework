@@ -1,0 +1,545 @@
+//! Floor-based merge semantics — user overrides can restrict, never relax.
+//!
+//! The floor table is the HARD RULE from `.claude/rules/workflow-yaml.md` and
+//! PRDv2 lines 908–918. A single merge function enforces it for both the
+//! framework→project merge (project raising the floor) and the project→user
+//! merge (user restricting further). Every would-be relaxation becomes a
+//! [`FloorViolation`] and all violations are collected before returning so the
+//! CLI can print them in one pass.
+//!
+//! Direction summary (see `.claude/rules/workflow-yaml.md` lines 38–45):
+//!
+//! | Field             | Stricter means             |
+//! |-------------------|----------------------------|
+//! | `tier`            | higher number              |
+//! | `min_confidence`  | higher fraction            |
+//! | `max_passes`      | higher count (more rigor)  |
+//! | `budget_usd`      | lower dollars              |
+//! | `require_review`  | true                       |
+
+use anyhow::Result;
+use serde::Serialize;
+use std::collections::BTreeMap;
+use thiserror::Error;
+
+use crate::workflow::schema::{Defaults, LayerOverride, ReviewConfig, WorkflowConfig};
+
+/// A single floor-rule violation. Named fields so downstream tooling (the
+/// daemon RPC and `pice validate --json`) can serialize the diff cleanly.
+#[derive(Debug, Clone, Error, Serialize, PartialEq)]
+#[error("{field}: override violates project floor ({reason}); project={project}, override={user}")]
+pub struct FloorViolation {
+    pub field: String,
+    pub project: String,
+    pub user: String,
+    pub reason: &'static str,
+}
+
+/// Aggregate of floor violations detected during one merge call.
+#[derive(Debug, Clone, Error, Serialize, PartialEq)]
+pub struct FloorViolations {
+    pub violations: Vec<FloorViolation>,
+}
+
+impl std::fmt::Display for FloorViolations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "workflow override violates {} project floor(s):",
+            self.violations.len()
+        )?;
+        for v in &self.violations {
+            writeln!(f, "  - {v}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Simple overlay merge — `overlay` wins on every field. Used for the
+/// framework→project step, which PRDv2 lines 903–918 do NOT floor-guard (only
+/// project→user is floor-bound). Scalar fields from overlay replace base; map
+/// fields are merged key-by-key with overlay keys taking precedence; review
+/// and seams are replaced wholesale when overlay sets them.
+pub fn overlay(base: WorkflowConfig, overlay: WorkflowConfig) -> WorkflowConfig {
+    let mut out = base;
+    out.defaults = overlay.defaults;
+    out.phases = overlay.phases;
+    for (k, v) in overlay.layer_overrides {
+        out.layer_overrides.insert(k, v);
+    }
+    if overlay.review.is_some() {
+        out.review = overlay.review;
+    }
+    if let Some(overlay_seams) = overlay.seams {
+        let base_seams = out.seams.get_or_insert_with(BTreeMap::new);
+        for (k, v) in overlay_seams {
+            base_seams.insert(k, v);
+        }
+    }
+    out
+}
+
+/// Merge `overlay` on top of `base` using floor-based semantics. Any field
+/// `overlay` sets that would relax `base` becomes a [`FloorViolation`]. All
+/// violations are collected before returning.
+///
+/// Called for the project→user step during `loader::resolve`. The framework→
+/// project step uses [`overlay`] instead — see PRDv2 lines 903–918.
+pub fn merge_with_floor(base: WorkflowConfig, overlay: WorkflowConfig) -> Result<WorkflowConfig> {
+    let mut violations: Vec<FloorViolation> = Vec::new();
+    let mut out = base.clone();
+
+    // schema_version: overlay must match base exactly (handled pre-merge in loader).
+    // We still keep base's value to avoid drift.
+
+    merge_defaults(&mut out.defaults, &overlay.defaults, &mut violations);
+
+    // phases: overlay fully replaces base for scalar sub-structs. The PRD
+    // doesn't floor-guard phase-level fields (they're orchestration knobs, not
+    // security guardrails), so overlay wins without further checks.
+    out.phases = overlay.phases.clone();
+
+    merge_layer_overrides(
+        &mut out.layer_overrides,
+        &overlay.layer_overrides,
+        &mut violations,
+    );
+
+    merge_review(&mut out.review, overlay.review.as_ref(), &mut violations);
+
+    // seams: purely additive overlay (no floor). Overlay keys replace base.
+    if let Some(overlay_seams) = overlay.seams {
+        let base_seams = out.seams.get_or_insert_with(BTreeMap::new);
+        for (k, v) in overlay_seams {
+            base_seams.insert(k, v);
+        }
+    }
+
+    if !violations.is_empty() {
+        return Err(FloorViolations { violations }.into());
+    }
+    Ok(out)
+}
+
+fn merge_defaults(base: &mut Defaults, overlay: &Defaults, violations: &mut Vec<FloorViolation>) {
+    // tier — overlay can only raise
+    if overlay.tier < base.tier {
+        violations.push(FloorViolation {
+            field: "defaults.tier".into(),
+            project: base.tier.to_string(),
+            user: overlay.tier.to_string(),
+            reason: "tier may only be raised",
+        });
+    } else {
+        base.tier = overlay.tier;
+    }
+
+    // min_confidence — overlay can only raise
+    if overlay.min_confidence < base.min_confidence {
+        violations.push(FloorViolation {
+            field: "defaults.min_confidence".into(),
+            project: base.min_confidence.to_string(),
+            user: overlay.min_confidence.to_string(),
+            reason: "min_confidence may only be raised",
+        });
+    } else {
+        base.min_confidence = overlay.min_confidence;
+    }
+
+    // max_passes — not floor-guarded per PRDv2 lines 908–916. Overlay wins.
+    // (Rationale: more passes increases rigor and cost; fewer passes decreases
+    // both. Direction is not monotonic, so the PRD leaves this unconstrained.)
+    base.max_passes = overlay.max_passes;
+
+    // budget_usd — overlay can only LOWER (lower budget = more restrictive)
+    if overlay.budget_usd > base.budget_usd {
+        violations.push(FloorViolation {
+            field: "defaults.budget_usd".into(),
+            project: base.budget_usd.to_string(),
+            user: overlay.budget_usd.to_string(),
+            reason: "budget_usd may only be lowered",
+        });
+    } else {
+        base.budget_usd = overlay.budget_usd;
+    }
+
+    // model — not floor-guarded (team pref; restrictiveness is domain-specific)
+    base.model = overlay.model.clone();
+
+    // cost_cap_behavior — not floor-guarded (halt is strictest and the default)
+    base.cost_cap_behavior = overlay.cost_cap_behavior;
+
+    // max_parallelism — overlay wins if set
+    if overlay.max_parallelism.is_some() {
+        base.max_parallelism = overlay.max_parallelism;
+    }
+}
+
+fn merge_layer_overrides(
+    base: &mut BTreeMap<String, LayerOverride>,
+    overlay: &BTreeMap<String, LayerOverride>,
+    violations: &mut Vec<FloorViolation>,
+) {
+    for (layer, o) in overlay {
+        let entry = base.entry(layer.clone()).or_default();
+        merge_layer_override_fields(layer, entry, o, violations);
+    }
+}
+
+fn merge_layer_override_fields(
+    layer: &str,
+    base: &mut LayerOverride,
+    overlay: &LayerOverride,
+    violations: &mut Vec<FloorViolation>,
+) {
+    if let Some(o_tier) = overlay.tier {
+        match base.tier {
+            Some(b_tier) if o_tier < b_tier => violations.push(FloorViolation {
+                field: format!("layer_overrides.{layer}.tier"),
+                project: b_tier.to_string(),
+                user: o_tier.to_string(),
+                reason: "tier may only be raised",
+            }),
+            _ => base.tier = Some(o_tier),
+        }
+    }
+
+    if let Some(o_mc) = overlay.min_confidence {
+        match base.min_confidence {
+            Some(b_mc) if o_mc < b_mc => violations.push(FloorViolation {
+                field: format!("layer_overrides.{layer}.min_confidence"),
+                project: b_mc.to_string(),
+                user: o_mc.to_string(),
+                reason: "min_confidence may only be raised",
+            }),
+            _ => base.min_confidence = Some(o_mc),
+        }
+    }
+
+    if let Some(o_mp) = overlay.max_passes {
+        // max_passes is not floor-guarded (see defaults merge comment).
+        base.max_passes = Some(o_mp);
+    }
+
+    if let Some(o_b) = overlay.budget_usd {
+        match base.budget_usd {
+            Some(b_b) if o_b > b_b => violations.push(FloorViolation {
+                field: format!("layer_overrides.{layer}.budget_usd"),
+                project: b_b.to_string(),
+                user: o_b.to_string(),
+                reason: "budget_usd may only be lowered",
+            }),
+            _ => base.budget_usd = Some(o_b),
+        }
+    }
+
+    if let Some(o_rr) = overlay.require_review {
+        match base.require_review {
+            Some(true) if !o_rr => violations.push(FloorViolation {
+                field: format!("layer_overrides.{layer}.require_review"),
+                project: "true".into(),
+                user: "false".into(),
+                reason: "required review cannot be disabled",
+            }),
+            _ => base.require_review = Some(o_rr),
+        }
+    }
+
+    if overlay.trigger.is_some() {
+        // Adding a stricter trigger is allowed; removing one is not
+        // expressible here (absent overlay.trigger = no change). If the
+        // overlay sets an empty string AND base has a trigger, treat as
+        // removal attempt.
+        if let (Some(b), Some(o)) = (base.trigger.as_deref(), overlay.trigger.as_deref()) {
+            if o.is_empty() && !b.is_empty() {
+                violations.push(FloorViolation {
+                    field: format!("layer_overrides.{layer}.trigger"),
+                    project: b.to_string(),
+                    user: String::new(),
+                    reason: "required gate trigger cannot be removed",
+                });
+                return;
+            }
+        }
+        base.trigger = overlay.trigger.clone();
+    }
+}
+
+fn merge_review(
+    base: &mut Option<ReviewConfig>,
+    overlay: Option<&ReviewConfig>,
+    violations: &mut Vec<FloorViolation>,
+) {
+    let Some(overlay) = overlay else {
+        return;
+    };
+
+    match base {
+        None => {
+            *base = Some(overlay.clone());
+        }
+        Some(b) => {
+            // require_review as a project-level flag is `enabled`. Overlay
+            // may not disable a project-required review.
+            if b.enabled && !overlay.enabled {
+                violations.push(FloorViolation {
+                    field: "review.enabled".into(),
+                    project: "true".into(),
+                    user: "false".into(),
+                    reason: "required review cannot be disabled",
+                });
+            } else {
+                b.enabled = overlay.enabled;
+            }
+
+            // Trigger: overlay may add or tighten. Removing a project trigger
+            // is a violation (treated as setting to empty string or None when
+            // project had one).
+            if b.trigger.is_some() && overlay.trigger.is_none() {
+                violations.push(FloorViolation {
+                    field: "review.trigger".into(),
+                    project: b.trigger.clone().unwrap_or_default(),
+                    user: "(removed)".into(),
+                    reason: "required gate trigger cannot be removed",
+                });
+            } else if overlay.trigger.is_some() {
+                b.trigger = overlay.trigger.clone();
+            }
+
+            // Other fields are tuning knobs — overlay wins.
+            b.timeout_hours = overlay.timeout_hours;
+            b.on_timeout = overlay.on_timeout;
+            b.notification = overlay.notification.clone();
+        }
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::schema::{
+        CostCapBehavior, Defaults, LayerOverride, OnTimeout, ReviewConfig, WorkflowConfig,
+    };
+
+    fn base() -> WorkflowConfig {
+        WorkflowConfig {
+            schema_version: "0.2".into(),
+            defaults: Defaults {
+                tier: 2,
+                min_confidence: 0.90,
+                max_passes: 5,
+                model: "sonnet".into(),
+                budget_usd: 2.0,
+                cost_cap_behavior: CostCapBehavior::Halt,
+                max_parallelism: None,
+            },
+            phases: Default::default(),
+            layer_overrides: BTreeMap::new(),
+            review: None,
+            seams: None,
+        }
+    }
+
+    fn overlay_from(base: &WorkflowConfig) -> WorkflowConfig {
+        base.clone()
+    }
+
+    #[test]
+    fn user_raises_min_confidence_allowed() {
+        let mut u = overlay_from(&base());
+        u.defaults.min_confidence = 0.95;
+        let merged = merge_with_floor(base(), u).unwrap();
+        assert!((merged.defaults.min_confidence - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn user_lowers_min_confidence_rejected() {
+        let mut u = overlay_from(&base());
+        u.defaults.min_confidence = 0.80;
+        let err = merge_with_floor(base(), u).unwrap_err().to_string();
+        assert!(err.contains("min_confidence"), "err: {err}");
+        assert!(err.contains("0.9") || err.contains("0.90"), "err: {err}");
+    }
+
+    #[test]
+    fn user_lowers_budget_allowed() {
+        let mut u = overlay_from(&base());
+        u.defaults.budget_usd = 1.0;
+        let merged = merge_with_floor(base(), u).unwrap();
+        assert!((merged.defaults.budget_usd - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn user_raises_budget_rejected() {
+        let mut u = overlay_from(&base());
+        u.defaults.budget_usd = 10.0;
+        let err = merge_with_floor(base(), u).unwrap_err().to_string();
+        assert!(err.contains("budget_usd"), "err: {err}");
+    }
+
+    #[test]
+    fn user_raises_tier_allowed() {
+        let mut u = overlay_from(&base());
+        u.defaults.tier = 3;
+        let merged = merge_with_floor(base(), u).unwrap();
+        assert_eq!(merged.defaults.tier, 3);
+    }
+
+    #[test]
+    fn user_lowers_tier_rejected() {
+        let mut b = base();
+        b.defaults.tier = 3;
+        let mut u = overlay_from(&b);
+        u.defaults.tier = 2;
+        let err = merge_with_floor(b, u).unwrap_err().to_string();
+        assert!(err.contains("tier"), "err: {err}");
+    }
+
+    #[test]
+    fn user_changes_max_passes_always_allowed() {
+        // max_passes isn't floor-guarded per PRDv2 lines 908–916 — both
+        // directions are fine. Test both.
+        let mut up = overlay_from(&base());
+        up.defaults.max_passes = 10;
+        assert_eq!(
+            merge_with_floor(base(), up).unwrap().defaults.max_passes,
+            10
+        );
+
+        let mut down = overlay_from(&base());
+        down.defaults.max_passes = 2;
+        assert_eq!(
+            merge_with_floor(base(), down).unwrap().defaults.max_passes,
+            2
+        );
+    }
+
+    #[test]
+    fn user_enables_review_when_project_false_allowed() {
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let mut u = overlay_from(&b);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier >= 3".into()),
+            ..Default::default()
+        });
+        let merged = merge_with_floor(b, u).unwrap();
+        assert!(merged.review.unwrap().enabled);
+    }
+
+    #[test]
+    fn user_disables_required_review_rejected() {
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("always".into()),
+            timeout_hours: 24,
+            on_timeout: OnTimeout::Reject,
+            notification: "stdout".into(),
+        });
+        let mut u = overlay_from(&b);
+        u.review = Some(ReviewConfig {
+            enabled: false,
+            ..b.review.clone().unwrap()
+        });
+        let err = merge_with_floor(b, u).unwrap_err().to_string();
+        assert!(err.contains("review"), "err: {err}");
+    }
+
+    #[test]
+    fn layer_override_restrict_confidence_allowed() {
+        let mut b = base();
+        b.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                min_confidence: Some(0.92),
+                ..Default::default()
+            },
+        );
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                min_confidence: Some(0.97),
+                ..Default::default()
+            },
+        );
+        let merged = merge_with_floor(b, u).unwrap();
+        assert_eq!(
+            merged.layer_overrides["infrastructure"].min_confidence,
+            Some(0.97)
+        );
+    }
+
+    #[test]
+    fn layer_override_relax_confidence_rejected() {
+        let mut b = base();
+        b.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                min_confidence: Some(0.95),
+                ..Default::default()
+            },
+        );
+        let mut u = overlay_from(&b);
+        u.layer_overrides.insert(
+            "infrastructure".into(),
+            LayerOverride {
+                min_confidence: Some(0.85),
+                ..Default::default()
+            },
+        );
+        let err = merge_with_floor(b, u).unwrap_err().to_string();
+        assert!(err.contains("infrastructure"), "err: {err}");
+        assert!(err.contains("min_confidence"), "err: {err}");
+    }
+
+    #[test]
+    fn empty_user_returns_base_unchanged() {
+        let merged = merge_with_floor(base(), base()).unwrap();
+        assert_eq!(merged, base());
+    }
+
+    #[test]
+    fn adversarial_relax_all_floors_collects_all_violations() {
+        let mut b = base();
+        b.defaults.tier = 3;
+        b.defaults.min_confidence = 0.95;
+        b.defaults.budget_usd = 2.0;
+        b.defaults.max_passes = 5;
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier >= 3".into()),
+            ..Default::default()
+        });
+
+        let mut u = overlay_from(&b);
+        u.defaults.tier = 2; // lower
+        u.defaults.min_confidence = 0.80; // lower
+        u.defaults.budget_usd = 10.0; // raise
+                                      // max_passes is NOT floor-guarded (see merge logic above); skipped.
+        u.review = Some(ReviewConfig {
+            enabled: false,
+            trigger: b.review.clone().unwrap().trigger,
+            ..b.review.clone().unwrap()
+        });
+
+        let err = merge_with_floor(b, u).unwrap_err();
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("4"), "expected 4 violations: {err_msg}");
+
+        let fv = err.downcast_ref::<FloorViolations>().unwrap();
+        assert_eq!(fv.violations.len(), 4);
+        let fields: Vec<&str> = fv.violations.iter().map(|v| v.field.as_str()).collect();
+        assert!(fields.contains(&"defaults.tier"));
+        assert!(fields.contains(&"defaults.min_confidence"));
+        assert!(fields.contains(&"defaults.budget_usd"));
+        assert!(fields.contains(&"review.enabled"));
+    }
+}

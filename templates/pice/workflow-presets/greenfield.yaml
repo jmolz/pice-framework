@@ -1,0 +1,33 @@
+# Preset: greenfield
+# Intended for brand-new codebases where speed matters more than rigor.
+# Relative to framework defaults: lower min_confidence, fewer passes, smaller budget.
+
+schema_version: "0.2"
+
+defaults:
+  tier: 2
+  min_confidence: 0.88
+  max_passes: 3
+  model: sonnet
+  budget_usd: 1.50
+  cost_cap_behavior: halt
+
+phases:
+  execute:
+    parallel: true
+    worktree_isolation: true
+    retry:
+      max_attempts: 2
+      fresh_context: true
+  evaluate:
+    parallel: true
+    seam_checks: true
+    adaptive_algorithm: bayesian_sprt
+
+layer_overrides: {}
+
+review:
+  enabled: false
+  timeout_hours: 24
+  on_timeout: reject
+  notification: stdout
