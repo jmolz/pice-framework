@@ -48,6 +48,15 @@ use crate::workflow::trigger;
 /// checking is deferred — see the trigger floor comments at the call
 /// sites.
 fn triggers_equivalent(project: &str, user: &str) -> bool {
+    // Byte-identical strings are always equivalent — no need to parse, and
+    // crucially we MUST NOT collapse a parse failure to a "rewrite"
+    // violation when the user has merely restated the same (possibly
+    // invalid) text. That would mask the real parse error with a
+    // misleading floor violation. `validate_triggers` reports the syntax
+    // error separately on the resolved config.
+    if project == user {
+        return true;
+    }
     match (trigger::parse(project), trigger::parse(user)) {
         (Ok(p), Ok(u)) => p == u,
         _ => false,
@@ -618,6 +627,34 @@ mod tests {
         let err = merge_with_floor(b, u).unwrap_err();
         let fv = err.downcast_ref::<FloorViolations>().unwrap();
         assert!(fv.violations.iter().any(|v| v.field == "review.trigger"));
+    }
+
+    #[test]
+    fn identical_invalid_trigger_does_not_mask_parse_error() {
+        // Both project and user have an identical (but syntactically
+        // invalid) trigger. Floor-merge must NOT report this as a rewrite
+        // violation — that would mask the real parse error which
+        // `validate_triggers` will surface separately on the resolved
+        // config. Identical text is always equivalent.
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier ==".into()), // invalid
+            ..Default::default()
+        });
+        let mut u = overlay_from(&b);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("tier ==".into()), // identical to project
+            ..b.review.clone().unwrap()
+        });
+        // Merge succeeds; no floor violation is fabricated. The resolved
+        // config still has the invalid trigger, which `validate_triggers`
+        // (called in the validate handler and the evaluate handler) will
+        // catch with a real parse error including line/column.
+        let merged =
+            merge_with_floor(b, u).expect("identical triggers must not be flagged as rewrites");
+        assert_eq!(merged.review.unwrap().trigger.as_deref(), Some("tier =="));
     }
 
     #[test]
