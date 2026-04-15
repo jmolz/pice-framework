@@ -1,8 +1,13 @@
 //! Git diff filtering by layer glob patterns and layer-specific prompt builder.
 //!
-//! Pure text processing — no filesystem access, no async, no network.
-//! Used by the daemon to extract per-layer diffs from a full `git diff` output
-//! and to construct context-isolated evaluation prompts for each layer.
+//! Diff filtering is pure text processing — no filesystem access. The
+//! [`scan_files_by_globs`] helper DOES touch the filesystem: it walks the
+//! repo and returns files matching a layer's globs. It is used by seam
+//! verification to construct `boundary_files` from the full per-layer file
+//! set (not just the changed diff) so seam checks can compare a changed
+//! side against an unchanged counterpart artifact.
+
+use std::path::{Path, PathBuf};
 
 /// Filter a unified diff to include only files matching the given glob patterns.
 ///
@@ -76,6 +81,83 @@ pub fn build_layer_prompt(
 IMPORTANT: You are evaluating ONLY the {layer_name} layer. Do not consider
 changes to other layers. Grade strictly against the contract criteria above."#
     )
+}
+
+/// Walk `root` recursively and return all files matching any of `globs`,
+/// returned as paths relative to `root`. Symlinks are not followed; common
+/// noise directories (`.git`, `target`, `node_modules`, `dist`, `build`)
+/// are skipped so seam scanning stays under the 100ms budget on typical
+/// repos.
+///
+/// Returns an empty vec if `globs` is empty, all globs fail to parse, or
+/// `root` is unreadable.
+///
+/// # Why this exists
+///
+/// Seam checks need to compare both sides of a layer boundary. If only one
+/// side changes (handler updated, OpenAPI spec untouched), the diff-only
+/// file set would miss the unchanged side and the check would silently
+/// return `Passed`. This helper gives the seam runner the full per-layer
+/// file set regardless of what changed — the drift-detection concern.
+pub fn scan_files_by_globs(root: &Path, globs: &[String]) -> Vec<PathBuf> {
+    if globs.is_empty() {
+        return Vec::new();
+    }
+    let patterns: Vec<glob::Pattern> = globs
+        .iter()
+        .filter_map(|g| glob::Pattern::new(g).ok())
+        .collect();
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    walk_for_globs(root, root, &patterns, &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Recursive helper for [`scan_files_by_globs`]. Skips common noise
+/// directories and symlinks.
+fn walk_for_globs(root: &Path, cur: &Path, patterns: &[glob::Pattern], out: &mut Vec<PathBuf>) {
+    const SKIP_NAMES: &[&str] = &[
+        ".git",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".next",
+        ".venv",
+        "__pycache__",
+        ".pice",
+    ];
+    let Ok(entries) = std::fs::read_dir(cur) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if SKIP_NAMES.contains(&name_str.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            walk_for_globs(root, &path, patterns, out);
+        } else if file_type.is_file() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel_str = rel.to_string_lossy();
+                if patterns.iter().any(|p| p.matches(&rel_str)) {
+                    out.push(rel.to_path_buf());
+                }
+            }
+        }
+    }
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
@@ -563,6 +645,66 @@ mod tests {
         .join("\n");
         let path = extract_file_path(&section);
         assert_eq!(path, Some("new.rs".to_string()));
+    }
+
+    #[test]
+    fn scan_files_by_globs_finds_all_matching() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/server")).unwrap();
+        std::fs::create_dir_all(root.join("src/client")).unwrap();
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("src/server/main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("src/server/lib.rs"), "pub fn a() {}").unwrap();
+        std::fs::write(root.join("src/client/app.ts"), "export {}").unwrap();
+        std::fs::write(root.join("target/debug/ignored.rs"), "skip me").unwrap();
+
+        let mut found = scan_files_by_globs(root, &["src/server/**".to_string()]);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("src/server/lib.rs"),
+                PathBuf::from("src/server/main.rs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_files_by_globs_skips_noise_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join(".git/config"), "secret").unwrap();
+        std::fs::write(root.join("node_modules/dep.ts"), "code").unwrap();
+        std::fs::write(root.join("src/real.rs"), "fn r() {}").unwrap();
+
+        let found = scan_files_by_globs(root, &["**/*".to_string()]);
+        assert!(found.iter().any(|p| p == &PathBuf::from("src/real.rs")));
+        assert!(
+            !found.iter().any(|p| p.starts_with(".git")),
+            ".git must be skipped: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.starts_with("node_modules")),
+            "node_modules must be skipped: {found:?}"
+        );
+    }
+
+    #[test]
+    fn scan_files_by_globs_empty_globs_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("foo.rs"), "x").unwrap();
+        assert!(scan_files_by_globs(root, &[]).is_empty());
+    }
+
+    #[test]
+    fn scan_files_by_globs_unreadable_root_returns_empty() {
+        let missing = PathBuf::from("/nonexistent/pice-scan-test-root");
+        assert!(scan_files_by_globs(&missing, &["**/*".to_string()]).is_empty());
     }
 
     #[test]

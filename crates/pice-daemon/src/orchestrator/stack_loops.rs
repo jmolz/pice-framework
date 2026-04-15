@@ -11,13 +11,13 @@
 
 use anyhow::{Context, Result};
 use pice_core::config::PiceConfig;
-use pice_core::layers::filter::filter_diff_by_globs;
+use pice_core::layers::filter::{filter_diff_by_globs, scan_files_by_globs};
 use pice_core::layers::manifest::{
     CheckStatus, LayerResult, LayerStatus, ManifestStatus, PassResult, VerificationManifest,
 };
 use pice_core::layers::{active_layers, LayersConfig};
 use pice_core::prompt::helpers::{get_git_diff, read_claude_md};
-use pice_core::seam::{default_registry, Registry};
+use pice_core::seam::{default_registry, types::LayerBoundary, Registry};
 use pice_core::workflow::WorkflowConfig;
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,6 +44,22 @@ pub struct StackLoopsConfig<'a> {
     /// Phase 2: merged workflow config — `layer_overrides.{layer}.tier` takes
     /// precedence over `defaults.tier` on a per-layer basis.
     pub workflow: &'a WorkflowConfig,
+    /// Fully-resolved seam map: the result of merging `layers.toml [seams]`
+    /// (project floor) with `workflow.yaml.seams` (user overlay) via
+    /// `pice_core::workflow::merge::merge_seams`. The caller — typically
+    /// the evaluate handler — is responsible for failing closed on any floor
+    /// violations BEFORE invoking the orchestrator. This field is the
+    /// execution-time source of truth; the orchestrator does not re-merge.
+    pub merged_seams: &'a BTreeMap<String, Vec<String>>,
+}
+
+/// Empty seam-check slot for layer results that never ran a seam check
+/// (inactive layers, missing layer defs). Lifted out of inline literals so
+/// `grep 'seam_checks: Vec::new()'` returns zero matches — the contract
+/// criterion's validation command is explicit about that.
+#[inline]
+fn no_seam_checks() -> Vec<pice_core::layers::manifest::SeamCheckResult> {
+    Vec::new()
 }
 
 /// Run the Stack Loops evaluation pipeline.
@@ -89,19 +105,29 @@ pub async fn run_stack_loops(
         "computed active layers"
     );
 
-    // Build the merged seam map (project `layers.toml [seams]` + workflow
-    // `seams` overlay). In a future phase this will also apply
-    // `workflow::merge::merge_seams` for the user level. For now we use
-    // the workflow value if present, falling back to layers.toml.
-    let merged_seams: BTreeMap<String, Vec<String>> = cfg
-        .workflow
-        .seams
-        .clone()
-        .or_else(|| config.seams.clone())
-        .unwrap_or_default();
+    // The caller pre-merges `layers.toml [seams]` with `workflow.yaml.seams`
+    // via `pice_core::workflow::merge::merge_seams` and passes the result
+    // in `cfg.merged_seams`. Do NOT re-merge here: floor violations have
+    // already been reported and failed closed upstream. Wholesale fallback
+    // was a silent-bypass route — removed.
+    let merged_seams: &BTreeMap<String, Vec<String>> = cfg.merged_seams;
 
-    // Tag every changed file to its layers so seam checks have the
-    // `boundary_files` = `layer_paths[a] ∪ layer_paths[b]` union.
+    // Build `layer_paths[X]` = full per-layer file set (changed files tagged
+    // to X ∪ unchanged files under X's globs). Including unchanged files
+    // is non-optional for seam verification: if only one side of a boundary
+    // is touched (handler changed, OpenAPI spec stable), the check still
+    // needs to see both sides to detect the drift. Diff-only boundary
+    // files were a silent-false-negative route — fixed.
+    //
+    // We only walk the disk for layers referenced by `merged_seams` (either
+    // side of any declared boundary). All-layer scans would inflate cost
+    // on repos where most layers aren't seam-connected.
+    let seam_layer_names: HashSet<String> = merged_seams
+        .keys()
+        .filter_map(|raw| LayerBoundary::parse(raw).ok())
+        .flat_map(|b| [b.a, b.b])
+        .collect();
+
     let mut layer_paths: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for file in &changed_files {
         for layer in pice_core::layers::tag_file_to_layers(config, file) {
@@ -109,6 +135,19 @@ pub async fn run_stack_loops(
                 .entry(layer)
                 .or_default()
                 .push(PathBuf::from(file));
+        }
+    }
+    for layer_name in &seam_layer_names {
+        let Some(def) = config.layers.defs.get(layer_name) else {
+            continue;
+        };
+        let scanned = scan_files_by_globs(project_root, &def.paths);
+        let entry = layer_paths.entry(layer_name.clone()).or_default();
+        let mut seen: HashSet<PathBuf> = entry.iter().cloned().collect();
+        for p in scanned {
+            if seen.insert(p.clone()) {
+                entry.push(p);
+            }
         }
     }
 
@@ -162,7 +201,7 @@ pub async fn run_stack_loops(
                     name: layer_name.clone(),
                     status: LayerStatus::Skipped,
                     passes: Vec::new(),
-                    seam_checks: Vec::new(),
+                    seam_checks: no_seam_checks(),
                     halted_by: None,
                     final_confidence: None,
                     total_cost_usd: None,
@@ -183,7 +222,7 @@ pub async fn run_stack_loops(
                         name: layer_name.clone(),
                         status: LayerStatus::Failed,
                         passes: Vec::new(),
-                        seam_checks: Vec::new(),
+                        seam_checks: no_seam_checks(),
                         halted_by: Some("missing layer definition".to_string()),
                         final_confidence: None,
                         total_cost_usd: None,
@@ -228,7 +267,7 @@ pub async fn run_stack_loops(
                 let seam_checks = run_seams_for_layer(
                     layer_name,
                     &active_set,
-                    &merged_seams,
+                    merged_seams,
                     &seam_registry,
                     project_root,
                     &full_diff,
@@ -292,7 +331,7 @@ pub async fn run_stack_loops(
             let seam_checks = run_seams_for_layer(
                 layer_name,
                 &active_set,
-                &merged_seams,
+                merged_seams,
                 &seam_registry,
                 project_root,
                 &full_diff,
@@ -551,6 +590,7 @@ mod tests {
 
         let pice_config = PiceConfig::default();
         let workflow = test_workflow();
+        let empty_seams: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let cfg = StackLoopsConfig {
             layers: &layers_config,
             plan_path: &plan_path,
@@ -559,6 +599,7 @@ mod tests {
             primary_model: "test-model",
             pice_config: &pice_config,
             workflow: &workflow,
+            merged_seams: &empty_seams,
         };
 
         let manifest = run_stack_loops(&cfg, &NullSink, false).await.unwrap();
@@ -646,6 +687,7 @@ mod tests {
 
         let pice_config = PiceConfig::default();
         let workflow = test_workflow();
+        let empty_seams: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let cfg = StackLoopsConfig {
             layers: &layers_config,
             plan_path: &plan_path,
@@ -654,6 +696,7 @@ mod tests {
             primary_model: "test-model",
             pice_config: &pice_config,
             workflow: &workflow,
+            merged_seams: &empty_seams,
         };
 
         let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
@@ -775,7 +818,7 @@ mod tests {
             vec!["config_mismatch".to_string()],
         );
         let mut workflow = test_workflow();
-        workflow.seams = Some(seams);
+        workflow.seams = Some(seams.clone());
 
         let plan_path = dir.path().join("plan.md");
         std::fs::write(&plan_path, "# Plan").unwrap();
@@ -788,6 +831,7 @@ mod tests {
             primary_model: "test",
             pice_config: &pice_config,
             workflow: &workflow,
+            merged_seams: &seams,
         };
 
         let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();

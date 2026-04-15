@@ -64,11 +64,12 @@ pub async fn run(
             .context("failed to resolve workflow.yaml")?;
 
         // Fail closed on semantic workflow errors (bad triggers, unknown
-        // layer overrides, out-of-range tiers, unknown seam boundaries).
+        // layer overrides, out-of-range tiers, unknown seam boundaries,
+        // and — as of the Phase 3 evaluator findings — seam checks whose
+        // `applies_to()` returns false for their declared boundary).
         // Without this check, a broken workflow.yaml would silently drive
-        // orchestration — e.g. a layer_override referencing a ghost layer
-        // would be ignored at runtime. `pice validate` runs the same
-        // checks; this mirrors them at execution time.
+        // orchestration. `pice validate` runs the same checks; this
+        // mirrors them at execution time.
         let seam_registry = pice_core::seam::default_registry();
         let report = pice_core::workflow::validate::validate_all(
             &workflow,
@@ -85,6 +86,58 @@ pub async fn run(
             return Ok(CommandResponse::Exit { code: 1, message });
         }
 
+        // Merge `layers.toml [seams]` with `workflow.yaml.seams` under the
+        // project-floor contract: the user overlay may REPLACE a project
+        // boundary's check list but cannot REMOVE a boundary or empty-list
+        // it. Floor violations are a HARD fail: running with a silently-
+        // disabled required boundary was a critical silent-bypass route.
+        let mut merged_seams_opt = layers_config.seams.clone();
+        let mut seam_violations: Vec<pice_core::workflow::merge::FloorViolation> = Vec::new();
+        pice_core::workflow::merge::merge_seams(
+            &mut merged_seams_opt,
+            workflow.seams.as_ref(),
+            &mut seam_violations,
+        );
+        if !seam_violations.is_empty() {
+            let mut message = String::from("seam configuration floor violations:\n");
+            for v in &seam_violations {
+                message.push_str(&format!(
+                    "  - {}: {} (project: {}, user: {})\n",
+                    v.field, v.reason, v.project, v.user
+                ));
+            }
+            message.push_str(
+                "\nworkflow.yaml [seams] may REPLACE a layers.toml boundary's check list \
+                 but cannot empty-list it. Omit the key to inherit the project list.\n",
+            );
+            return Ok(CommandResponse::Exit { code: 1, message });
+        }
+        let merged_seams: std::collections::BTreeMap<String, Vec<String>> =
+            merged_seams_opt.unwrap_or_default();
+
+        // Re-validate the MERGED seam map against the registry. `validate_all`
+        // above checked `workflow.seams` alone — but the floor merge may
+        // yield a map with boundaries from `layers.toml` that the workflow
+        // validator never saw. Running the same validator against the
+        // merged view catches unknown check IDs and applies_to mismatches
+        // in layers.toml-declared boundaries too.
+        let mut merged_workflow = workflow.clone();
+        merged_workflow.seams = Some(merged_seams.clone());
+        let merged_report = pice_core::workflow::validate::validate_seams(
+            &merged_workflow,
+            &layers_config,
+            &seam_registry,
+        );
+        if !merged_report.is_ok() {
+            let mut message = String::from(
+                "merged seam map has validation errors (layers.toml + workflow.yaml):\n",
+            );
+            for e in &merged_report.errors {
+                message.push_str(&format!("  - {}: {}\n", e.field, e.message));
+            }
+            return Ok(CommandResponse::Exit { code: 1, message });
+        }
+
         let stack_cfg = crate::orchestrator::stack_loops::StackLoopsConfig {
             layers: &layers_config,
             plan_path: &plan_path,
@@ -93,6 +146,7 @@ pub async fn run(
             primary_model: &config.evaluation.primary.model,
             pice_config: config,
             workflow: &workflow,
+            merged_seams: &merged_seams,
         };
         let manifest =
             crate::orchestrator::stack_loops::run_stack_loops(&stack_cfg, sink, req.json).await?;
@@ -112,6 +166,72 @@ pub async fn run(
             .flat_map(|l| l.seam_checks.iter())
             .filter(|c| c.status == CheckStatus::Failed)
             .count();
+
+        // Persist the evaluation + seam findings to the metrics DB. Without
+        // this write, the new `seam_findings` table, FK cascade, and CHECK
+        // constraints are exercised only by tests, never by production —
+        // that was one of the critical silent-bypass findings in the
+        // adversarial review. Failures here are logged but non-fatal
+        // (per CLAUDE.md — metrics writes must never crash the CLI).
+        let normalized_path = metrics::normalize_plan_path(&plan.path, project_root);
+        if let Ok(Some(db)) = metrics::open_metrics_db(project_root) {
+            // Stack-loops Phase 1 has no per-criterion scores to emit yet —
+            // record the evaluation header so seam findings can FK-attach.
+            let stack_passed = !any_failed_layer && failed_seam_checks == 0;
+            match metrics::store::record_evaluation(
+                &db,
+                &normalized_path,
+                &contract.feature,
+                contract.tier,
+                stack_passed,
+                &config.evaluation.primary.provider,
+                &config.evaluation.primary.model,
+                None,
+                None,
+                Some("stack-loops Phase 1 — contract grading pending; seam findings below"),
+                &[],
+            ) {
+                Ok(eval_id) => {
+                    for layer in &manifest.layers {
+                        for sc in &layer.seam_checks {
+                            let status_wire = match sc.status {
+                                CheckStatus::Passed => "passed",
+                                CheckStatus::Warning => "warning",
+                                CheckStatus::Failed => "failed",
+                                // Skipped seam findings don't map to a DB
+                                // status — the CHECK constraint allows only
+                                // passed/warning/failed. Drop the row.
+                                CheckStatus::Skipped => continue,
+                            };
+                            // Skip rows the CHECK constraint would reject
+                            // (unregistered-check findings carry no category).
+                            let Some(category) = sc.category else {
+                                continue;
+                            };
+                            let row = metrics::store::SeamFindingRow {
+                                layer: &layer.name,
+                                boundary: &sc.boundary,
+                                check_id: &sc.name,
+                                category,
+                                status: status_wire,
+                                details: sc.details.as_deref(),
+                            };
+                            if let Err(e) = metrics::store::insert_seam_finding(&db, eval_id, &row)
+                            {
+                                tracing::warn!(
+                                    layer = %layer.name,
+                                    check = %sc.name,
+                                    "failed to insert seam finding: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to record stack-loops evaluation header: {e}");
+                }
+            }
+        }
 
         // Format and return results from manifest.
         if req.json {

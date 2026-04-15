@@ -104,7 +104,7 @@ async fn env_var_mismatch() {
         vec!["config_mismatch".to_string()],
     );
     let mut workflow = base_workflow();
-    workflow.seams = Some(seams);
+    workflow.seams = Some(seams.clone());
 
     let plan_path = dir.path().join("plan.md");
     std::fs::write(&plan_path, "# Plan").unwrap();
@@ -117,6 +117,7 @@ async fn env_var_mismatch() {
         primary_model: "test",
         pice_config: &pice_config,
         workflow: &workflow,
+        merged_seams: &seams,
     };
 
     let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
@@ -180,7 +181,7 @@ async fn orm_schema_drift() {
         vec!["schema_drift".to_string()],
     );
     let mut workflow = base_workflow();
-    workflow.seams = Some(seams);
+    workflow.seams = Some(seams.clone());
 
     let plan_path = dir.path().join("plan.md");
     std::fs::write(&plan_path, "# Plan").unwrap();
@@ -193,6 +194,7 @@ async fn orm_schema_drift() {
         primary_model: "test",
         pice_config: &pice_config,
         workflow: &workflow,
+        merged_seams: &seams,
     };
 
     let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
@@ -254,7 +256,7 @@ async fn openapi_drift() {
         vec!["openapi_compliance".to_string()],
     );
     let mut workflow = base_workflow();
-    workflow.seams = Some(seams);
+    workflow.seams = Some(seams.clone());
 
     let plan_path = dir.path().join("plan.md");
     std::fs::write(&plan_path, "# Plan").unwrap();
@@ -267,6 +269,7 @@ async fn openapi_drift() {
         primary_model: "test",
         pice_config: &pice_config,
         workflow: &workflow,
+        merged_seams: &seams,
     };
 
     let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
@@ -323,7 +326,7 @@ async fn clean_fixture_passes_all_checks() {
         vec!["config_mismatch".to_string()],
     );
     let mut workflow = base_workflow();
-    workflow.seams = Some(seams);
+    workflow.seams = Some(seams.clone());
 
     let plan_path = dir.path().join("plan.md");
     std::fs::write(&plan_path, "# Plan").unwrap();
@@ -336,6 +339,7 @@ async fn clean_fixture_passes_all_checks() {
         primary_model: "test",
         pice_config: &pice_config,
         workflow: &workflow,
+        merged_seams: &seams,
     };
 
     let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();

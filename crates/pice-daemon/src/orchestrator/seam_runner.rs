@@ -9,13 +9,24 @@
 //! No other layer's contract, diff, or findings is reachable. The
 //! `context_isolation_leak` test verifies this via a distinctive-marker scan.
 //!
+//! # Boundary activation
+//!
+//! A boundary's checks run when **at least one side** is active. Seams exist
+//! to catch drift between layers; a one-sided change (e.g. handler updated,
+//! OpenAPI spec unchanged) is exactly the class of failure seam checks must
+//! surface. `boundary_files` is the union of both layers' full file sets
+//! (not just the changed diff), so checks can compare changed code against
+//! stable counterpart artifacts.
+//!
 //! # Timeout
 //!
-//! Each check runs in a detached thread with a 100ms CPU budget enforced via
-//! `mpsc::Receiver::recv_timeout`. On timeout the runner returns a `Warning`
-//! finding rather than panicking. Rust cannot safely kill a thread, so the
-//! stuck check leaks the thread; v0.2 accepts this as acceptable tail-risk
-//! given checks are deterministic and fast by contract.
+//! The runner enforces a 100ms wall-clock budget **post-hoc**: `check.run()`
+//! executes synchronously, then elapsed time is measured. Overrun NEVER
+//! downgrades a genuine `Failed` result — a failing check that happened to
+//! be slow still blocks the layer; the budget warning is appended to its
+//! findings rather than replacing the result. Rust cannot safely cancel a
+//! thread, so v0.2 accepts that a pathologically stuck plugin check will
+//! block the process — plugin authors are contractually bound to <100ms.
 
 use pice_core::layers::manifest::{CheckStatus, SeamCheckResult};
 use pice_core::seam::types::{LayerBoundary, SeamCheck, SeamContext, SeamFinding, SeamResult};
@@ -32,13 +43,16 @@ const CHECK_BUDGET: Duration = Duration::from_millis(100);
 /// return the results in a deterministic order.
 ///
 /// - `merged_seams`: the fully-merged `{boundary → [check_id]}` map as
-///   resolved by `pice-core::workflow::merge::merge_seams` + whatever the
-///   project's `layers.toml [seams]` supplies.
-/// - `active_layers`: only boundaries where BOTH layers are active are
-///   evaluated. Inactive sides mean no observable diff.
-/// - `layer_paths`: layer-name → list of changed file paths filtered to that
-///   layer's globs. Used to build the per-boundary filtered diff and
-///   `boundary_files` set.
+///   resolved by the evaluate handler via `pice-core::workflow::merge::merge_seams`.
+/// - `active_layers`: boundaries run when AT LEAST ONE side is active
+///   (Phase 3 review fix). If both sides are inactive, nothing changed
+///   that could have introduced drift.
+/// - `layer_paths`: layer-name → per-layer file set (changed files tagged
+///   to that layer, unioned with unchanged files under the layer's globs
+///   via `scan_files_by_globs`). Used to build the per-boundary filtered
+///   diff and `boundary_files` set — full file set, not just the changed
+///   diff, so checks can compare one changed side against the other's
+///   stable counterpart artifact.
 pub fn run_seams_for_layer(
     layer_name: &str,
     active_layers: &HashSet<String>,
@@ -59,7 +73,14 @@ pub fn run_seams_for_layer(
         if !boundary.touches(layer_name) {
             continue;
         }
-        if !active_layers.contains(&boundary.a) || !active_layers.contains(&boundary.b) {
+        // At-least-one-side-active gate. If BOTH sides are inactive, nothing
+        // changed that could have introduced drift on this boundary — skip.
+        // If EITHER side is active, the boundary runs: seam checks compare
+        // the changed code against the other side's stable counterpart
+        // artifacts (the full layer file sets in `layer_paths`). Requiring
+        // both sides active was a silent false-negative route on the exact
+        // case this feature exists to catch — one-sided drift.
+        if !active_layers.contains(&boundary.a) && !active_layers.contains(&boundary.b) {
             continue;
         }
 
@@ -108,12 +129,15 @@ pub fn run_seams_for_layer(
 /// leak threads AND require the trait object to cross thread boundaries,
 /// which requires `'static` bounds not available on `&dyn SeamCheck`.
 ///
-/// Since every default check is contractually bound to <100ms and is pure
-/// over the boundary file set, running inline is correct. If a check exceeds
-/// the budget post-hoc, we downgrade its result to a `Warning` with a
-/// budget-exceeded finding — the contract test ensures the 12 default
-/// checks stay comfortably below. Plugin crates that ship misbehaving
-/// checks will surface as Warnings, not crashes.
+/// ## Budget handling (HARD rule)
+///
+/// A genuine `Failed` result is NEVER downgraded to `Warning` by the budget
+/// path — a correct-but-slow failing check must still block the layer.
+/// Overrun appends a budget-exceeded `SeamFinding` to the existing result:
+///
+/// - `Passed` + overrun → `Warning([budget_finding])` (informational)
+/// - `Warning(findings)` + overrun → `Warning(findings + budget_finding)`
+/// - `Failed(findings)` + overrun → `Failed(findings + budget_finding)`
 fn run_with_timeout(
     check: &(dyn SeamCheck + Send + Sync),
     boundary: &LayerBoundary,
@@ -131,15 +155,26 @@ fn run_with_timeout(
     let start = std::time::Instant::now();
     let result = check.run(&ctx);
     let elapsed = start.elapsed();
-    if elapsed > CHECK_BUDGET {
-        return SeamResult::Warning(vec![SeamFinding::new(format!(
-            "seam check '{}' exceeded {}ms budget (took {}ms)",
-            check.id(),
-            CHECK_BUDGET.as_millis(),
-            elapsed.as_millis()
-        ))]);
+    if elapsed <= CHECK_BUDGET {
+        return result;
     }
-    result
+    let budget_finding = SeamFinding::new(format!(
+        "seam check '{}' exceeded {}ms budget (took {}ms)",
+        check.id(),
+        CHECK_BUDGET.as_millis(),
+        elapsed.as_millis()
+    ));
+    match result {
+        SeamResult::Failed(mut findings) => {
+            findings.push(budget_finding);
+            SeamResult::Failed(findings)
+        }
+        SeamResult::Warning(mut findings) => {
+            findings.push(budget_finding);
+            SeamResult::Warning(findings)
+        }
+        SeamResult::Passed => SeamResult::Warning(vec![budget_finding]),
+    }
 }
 
 fn seam_result_to_record(
@@ -303,14 +338,60 @@ mod tests {
     }
 
     #[test]
-    fn skips_boundary_with_inactive_side() {
+    fn runs_boundary_when_only_one_side_active() {
+        // At-least-one-side semantics: backend is active, infrastructure is
+        // NOT active, but the boundary still runs because the drift case
+        // this feature exists to catch is exactly "changed one side, forgot
+        // the other." The runner relies on `layer_paths` carrying the full
+        // per-layer file set so the check still sees the unchanged side.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        // Infra side has an orphan env var declared but never read by app.
+        std::fs::write(dir.path().join("Dockerfile"), "ENV ORPHAN_VAR=x\n").unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
         let mut seams = BTreeMap::new();
         seams.insert(
             "backend↔infrastructure".into(),
             vec!["config_mismatch".into()],
         );
-        // infrastructure NOT active
+        // infrastructure NOT active — backend changed, infra untouched.
         let active = make_active(&["backend"]);
+        let mut paths = BTreeMap::new();
+        paths.insert("backend".to_string(), vec![PathBuf::from("src/main.rs")]);
+        paths.insert(
+            "infrastructure".to_string(),
+            vec![PathBuf::from("Dockerfile")],
+        );
+        let results = run_seams_for_layer(
+            "backend",
+            &active,
+            &seams,
+            &default_registry(),
+            dir.path(),
+            "",
+            &paths,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].status,
+            CheckStatus::Failed,
+            "one-sided drift must produce a finding, not a silent Passed: {:?}",
+            results[0].details
+        );
+    }
+
+    #[test]
+    fn skips_boundary_when_both_sides_inactive() {
+        // True skip case: nothing changed on either side, so no seam drift
+        // could have been introduced.
+        let mut seams = BTreeMap::new();
+        seams.insert(
+            "backend↔infrastructure".into(),
+            vec!["config_mismatch".into()],
+        );
+        // Only frontend is active — neither backend nor infrastructure.
+        let active = make_active(&["frontend"]);
         let dir = tempfile::tempdir().unwrap();
         let results = run_seams_for_layer(
             "backend",
@@ -321,7 +402,10 @@ mod tests {
             "",
             &empty_paths(),
         );
-        assert!(results.is_empty());
+        assert!(
+            results.is_empty(),
+            "expected skip when neither side of the boundary is active"
+        );
     }
 
     #[test]
@@ -481,5 +565,223 @@ diff --git a/src/app.rs b/src/app.rs
         let ids_1: Vec<&str> = r1.iter().map(|r| r.name.as_str()).collect();
         let ids_2: Vec<&str> = r2.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(ids_1, ids_2);
+    }
+
+    // ─── Budget-enforcement tests ────────────────────────────────────────
+
+    /// Deterministic stub that sleeps and then returns a chosen [`SeamResult`].
+    /// Used to exercise the over-budget path without depending on any real
+    /// default check's timing behavior.
+    struct SleepyStub {
+        id_: &'static str,
+        category_: u8,
+        sleep_ms: u64,
+        outcome: fn() -> SeamResult,
+    }
+
+    impl SeamCheck for SleepyStub {
+        fn id(&self) -> &str {
+            self.id_
+        }
+        fn category(&self) -> u8 {
+            self.category_
+        }
+        fn applies_to(&self, _: &LayerBoundary) -> bool {
+            true
+        }
+        fn run(&self, _: &SeamContext<'_>) -> SeamResult {
+            std::thread::sleep(Duration::from_millis(self.sleep_ms));
+            (self.outcome)()
+        }
+    }
+
+    fn single_finding(msg: &str) -> Vec<SeamFinding> {
+        vec![SeamFinding::new(msg.to_string())]
+    }
+
+    /// Budget overrun on a check that returned Failed MUST NOT downgrade the
+    /// result to Warning — the fail-closed guarantee depends on this.
+    /// Regression test for the critical silent-bypass found during the Phase 3
+    /// adversarial review.
+    #[test]
+    fn over_budget_preserves_failed_result() {
+        let boundary = LayerBoundary::new("a", "b");
+        let check = SleepyStub {
+            id_: "slow_failer",
+            category_: 9,
+            sleep_ms: 150, // CHECK_BUDGET is 100ms
+            outcome: || SeamResult::Failed(single_finding("underlying failure")),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_with_timeout(&check, &boundary, "", dir.path(), &[]);
+        match result {
+            SeamResult::Failed(findings) => {
+                assert!(
+                    findings
+                        .iter()
+                        .any(|f| f.message.contains("underlying failure")),
+                    "original finding must be preserved: {findings:?}"
+                );
+                assert!(
+                    findings.iter().any(|f| f.message.contains("budget")),
+                    "budget warning must be appended: {findings:?}"
+                );
+            }
+            other => panic!("over-budget Failed must stay Failed, got {other:?}"),
+        }
+    }
+
+    /// Budget overrun on a Passed check downgrades to Warning with a single
+    /// budget-exceeded finding.
+    #[test]
+    fn over_budget_passed_becomes_warning() {
+        let boundary = LayerBoundary::new("a", "b");
+        let check = SleepyStub {
+            id_: "slow_passer",
+            category_: 2,
+            sleep_ms: 150,
+            outcome: || SeamResult::Passed,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_with_timeout(&check, &boundary, "", dir.path(), &[]);
+        match result {
+            SeamResult::Warning(findings) => {
+                assert_eq!(findings.len(), 1);
+                assert!(findings[0].message.contains("budget"));
+                assert!(findings[0].message.contains("slow_passer"));
+            }
+            other => panic!("over-budget Passed must become Warning, got {other:?}"),
+        }
+    }
+
+    /// Budget overrun on an existing Warning appends the budget finding
+    /// without dropping the original findings.
+    #[test]
+    fn over_budget_warning_appends_budget_finding() {
+        let boundary = LayerBoundary::new("a", "b");
+        let check = SleepyStub {
+            id_: "slow_warner",
+            category_: 5,
+            sleep_ms: 150,
+            outcome: || SeamResult::Warning(single_finding("advisory note")),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_with_timeout(&check, &boundary, "", dir.path(), &[]);
+        match result {
+            SeamResult::Warning(findings) => {
+                assert_eq!(findings.len(), 2);
+                assert!(findings.iter().any(|f| f.message.contains("advisory note")));
+                assert!(findings.iter().any(|f| f.message.contains("budget")));
+            }
+            other => panic!("over-budget Warning must stay Warning, got {other:?}"),
+        }
+    }
+
+    /// Under-budget path preserves the result exactly — no budget finding is
+    /// appended when the check completes in time.
+    #[test]
+    fn under_budget_result_is_untouched() {
+        let boundary = LayerBoundary::new("a", "b");
+        let check = SleepyStub {
+            id_: "fast_failer",
+            category_: 1,
+            sleep_ms: 1,
+            outcome: || SeamResult::Failed(single_finding("fast failure")),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let result = run_with_timeout(&check, &boundary, "", dir.path(), &[]);
+        match result {
+            SeamResult::Failed(findings) => {
+                assert_eq!(findings.len(), 1);
+                assert!(!findings[0].message.contains("budget"));
+            }
+            other => panic!("under-budget result must be preserved, got {other:?}"),
+        }
+    }
+
+    /// Every default check must complete under the 100ms budget on a
+    /// representative fixture. This is the hard rule from
+    /// `.claude/rules/stack-loops.md` — adaptive-pass budgets depend on it.
+    #[test]
+    fn every_default_check_under_budget_on_fixture() {
+        let registry = default_registry();
+        let dir = tempfile::tempdir().unwrap();
+        // Seed a minimal fixture so checks that read files don't short-circuit.
+        std::fs::write(
+            dir.path().join("Dockerfile"),
+            "FROM alpine\nENV DATABASE_URL=x\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/app.rs"),
+            "fn main() { std::env::var(\"DATABASE_URL\").unwrap(); }",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("prisma")).unwrap();
+        std::fs::write(
+            dir.path().join("prisma/schema.prisma"),
+            "model User { id Int @id }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("migrations")).unwrap();
+        std::fs::write(
+            dir.path().join("migrations/001.sql"),
+            "CREATE TABLE User (id INT PRIMARY KEY);",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("openapi.yaml"), "paths: {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"x","version":"1.0.0","dependencies":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  web:\n    image: alpine\n",
+        )
+        .unwrap();
+
+        let boundary_files: Vec<PathBuf> = vec![
+            PathBuf::from("Dockerfile"),
+            PathBuf::from("src/app.rs"),
+            PathBuf::from("prisma/schema.prisma"),
+            PathBuf::from("migrations/001.sql"),
+            PathBuf::from("openapi.yaml"),
+            PathBuf::from("package.json"),
+            PathBuf::from("docker-compose.yml"),
+        ];
+        // Use boundaries that touch a wide variety of layers so every
+        // check's `applies_to()` has at least one boundary that matches.
+        let boundaries = [
+            LayerBoundary::new("backend", "infrastructure"),
+            LayerBoundary::new("api", "frontend"),
+            LayerBoundary::new("backend", "database"),
+            LayerBoundary::new("backend", "deployment"),
+            LayerBoundary::new("api", "observability"),
+        ];
+        for (id, check) in registry.iter() {
+            let boundary = boundaries
+                .iter()
+                .find(|b| check.applies_to(b))
+                .unwrap_or(&boundaries[0]);
+            let ctx = SeamContext {
+                boundary,
+                filtered_diff: "",
+                repo_root: dir.path(),
+                boundary_files: &boundary_files,
+                args: None,
+            };
+            let start = std::time::Instant::now();
+            let _ = check.run(&ctx);
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed <= CHECK_BUDGET,
+                "default check '{id}' exceeded {}ms budget (took {}ms) — \
+                 adaptive-pass budgets depend on every default staying under",
+                CHECK_BUDGET.as_millis(),
+                elapsed.as_millis()
+            );
+        }
     }
 }

@@ -112,6 +112,8 @@ layer_overrides:
     let workflow = loader::resolve(root).expect("workflow should resolve");
     let pice_config = PiceConfig::default();
 
+    let empty_seams: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     let cfg = StackLoopsConfig {
         layers: &layers_config,
         plan_path: &root.join(".claude/plans/feature.md"),
@@ -120,6 +122,7 @@ layer_overrides:
         primary_model: "test-model",
         pice_config: &pice_config,
         workflow: &workflow,
+        merged_seams: &empty_seams,
     };
 
     let manifest = run_stack_loops(&cfg, &NullSink, false).await.unwrap();
@@ -200,6 +203,8 @@ paths = ["src/server/**"]
     let workflow = loader::resolve(root).unwrap();
     let pice_config = PiceConfig::default();
 
+    let empty_seams: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     let cfg = StackLoopsConfig {
         layers: &layers_config,
         plan_path: &root.join(".claude/plans/f.md"),
@@ -208,6 +213,7 @@ paths = ["src/server/**"]
         primary_model: "test-model",
         pice_config: &pice_config,
         workflow: &workflow,
+        merged_seams: &empty_seams,
     };
 
     let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();

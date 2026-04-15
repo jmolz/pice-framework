@@ -400,18 +400,40 @@ pub fn validate_seams(
             }
         }
 
-        // Rule 4: every check ID must be registered.
+        // Rule 4: every check ID must be registered AND applicable to this
+        // boundary. A registered check whose `applies_to()` returns false for
+        // the boundary would be silently skipped at runtime — indistinguishable
+        // from "no check configured". Surface it as a config error so users
+        // don't believe a boundary is covered when it isn't.
         for id in check_ids {
-            if !registry.contains(id) {
-                let known_ids = registry.ids_in_order().join(", ");
-                report.errors.push(ValidationError {
-                    field: format!("seams.{raw_key}"),
-                    message: format!(
-                        "unknown seam check id '{id}'; registered checks: {known_ids}"
-                    ),
-                    line: None,
-                    column: None,
-                });
+            match registry.get(id) {
+                None => {
+                    let known_ids = registry.ids_in_order().join(", ");
+                    report.errors.push(ValidationError {
+                        field: format!("seams.{raw_key}"),
+                        message: format!(
+                            "unknown seam check id '{id}'; registered checks: {known_ids}"
+                        ),
+                        line: None,
+                        column: None,
+                    });
+                }
+                Some(check) if !check.applies_to(&boundary) => {
+                    report.errors.push(ValidationError {
+                        field: format!("seams.{raw_key}"),
+                        message: format!(
+                            "seam check '{id}' does not apply to boundary \
+                             '{}↔{}' (category {}); pick a check whose applies_to() \
+                             accepts this boundary or remove it from the seams map",
+                            boundary.a,
+                            boundary.b,
+                            check.category(),
+                        ),
+                        line: None,
+                        column: None,
+                    });
+                }
+                Some(_) => {}
             }
         }
     }
@@ -817,9 +839,11 @@ mod tests {
         let mut seams = BTreeMap::new();
         // BTreeMap iteration is alphabetical — `backend↔frontend` comes
         // before `frontend↔backend`. The second (inverted) key should
-        // surface as the duplicate error.
-        seams.insert("backend↔frontend".into(), vec!["config_mismatch".into()]);
-        seams.insert("frontend↔backend".into(), vec!["config_mismatch".into()]);
+        // surface as the duplicate error. Use `openapi_compliance` because
+        // its `applies_to` covers backend+frontend — otherwise the new
+        // applies_to validation (rule 4b) would emit a noise error here.
+        seams.insert("backend↔frontend".into(), vec!["openapi_compliance".into()]);
+        seams.insert("frontend↔backend".into(), vec!["openapi_compliance".into()]);
         cfg.seams = Some(seams);
         let report = validate_seams(&cfg, &sample_layers(), &sample_registry());
         assert!(!report.is_ok());
@@ -831,6 +855,30 @@ mod tests {
             "expected inverted duplicate error, got: {:?}",
             report.errors
         );
+    }
+
+    #[test]
+    fn seam_validator_rejects_check_that_does_not_apply() {
+        // A registered check whose `applies_to()` returns false for this
+        // boundary would be silently skipped at runtime. Surfacing this as
+        // a config error prevents silent-bypass: users configuring a
+        // boundary think they have coverage when they don't.
+        let mut cfg = embedded_defaults();
+        let mut seams = BTreeMap::new();
+        // `config_mismatch` applies to infrastructure/deployment boundaries
+        // only. `backend↔frontend` doesn't touch either.
+        seams.insert("backend↔frontend".into(), vec!["config_mismatch".into()]);
+        cfg.seams = Some(seams);
+        let report = validate_seams(&cfg, &sample_layers(), &sample_registry());
+        assert!(!report.is_ok());
+        let err = report
+            .errors
+            .iter()
+            .find(|e| e.message.contains("does not apply"))
+            .unwrap_or_else(|| panic!("expected applies_to error, got: {:?}", report.errors));
+        assert!(err.message.contains("config_mismatch"));
+        assert!(err.message.contains("backend"));
+        assert!(err.message.contains("frontend"));
     }
 
     #[test]
