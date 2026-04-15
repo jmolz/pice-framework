@@ -30,28 +30,26 @@ impl SeamCheck for OpenApiComplianceCheck {
         let mut spec_file: BTreeMap<String, PathBuf> = BTreeMap::new();
         let mut handler_props: BTreeMap<String, String> = BTreeMap::new();
         let mut handler_file: BTreeMap<String, PathBuf> = BTreeMap::new();
+        let mut saw_spec_file = false;
+        let mut saw_handler_file = false;
+        let mut spec_file_paths: Vec<PathBuf> = Vec::new();
+        let mut handler_file_paths: Vec<PathBuf> = Vec::new();
 
         for rel in ctx.boundary_files {
             let full = ctx.repo_root.join(rel);
             let Ok(content) = std::fs::read_to_string(&full) else {
                 continue;
             };
-            let fname = rel
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            let is_spec = fname.starts_with("openapi.")
-                || fname.starts_with("swagger.")
-                || rel
-                    .components()
-                    .any(|c| c.as_os_str().eq_ignore_ascii_case("openapi"));
-            if is_spec {
+            if looks_like_spec_file(rel) {
+                saw_spec_file = true;
+                spec_file_paths.push(rel.clone());
                 for (name, ty) in parse_openapi_properties(&content) {
                     spec_props.entry(name.clone()).or_insert(ty);
                     spec_file.entry(name).or_insert(rel.clone());
                 }
-            } else {
+            } else if looks_like_handler_file(rel, &content) {
+                saw_handler_file = true;
+                handler_file_paths.push(rel.clone());
                 for (name, ty) in parse_handler_returns(&content) {
                     handler_props.entry(name.clone()).or_insert(ty);
                     handler_file.entry(name).or_insert(rel.clone());
@@ -60,9 +58,67 @@ impl SeamCheck for OpenApiComplianceCheck {
         }
 
         let mut findings: Vec<SeamFinding> = Vec::new();
-        if spec_props.is_empty() || handler_props.is_empty() {
-            // Nothing to compare — no finding.
-            return SeamResult::Passed;
+
+        // Asymmetry cases — we could see one side but not the other. Emit
+        // Warning so operators investigate rather than silently Passed.
+        // (Phase 3 adversarial review: a renamed/moved spec OR a handler the
+        // parser could not recognize would otherwise produce a clean boundary.)
+        match (saw_spec_file, saw_handler_file) {
+            (false, false) => return SeamResult::Passed,
+            (true, false) => {
+                let mut f = SeamFinding::new(
+                    "OpenAPI spec file detected on this boundary but no recognizable \
+                     handler response found — boundary could not be compared. If handler \
+                     sources live outside the layer globs, widen them; otherwise migrate \
+                     the spec-side parser."
+                        .to_string(),
+                );
+                if let Some(p) = spec_file_paths.first() {
+                    f = f.with_file(p.clone());
+                }
+                return SeamResult::Warning(vec![f]);
+            }
+            (false, true) => {
+                let mut f = SeamFinding::new(
+                    "Handler response code detected on this boundary but no OpenAPI/Swagger \
+                     spec file found — boundary could not be compared. Add the spec to the \
+                     boundary layer globs, or rename it to match `openapi.*` / `swagger.*` / \
+                     an `openapi` path component."
+                        .to_string(),
+                );
+                if let Some(p) = handler_file_paths.first() {
+                    f = f.with_file(p.clone());
+                }
+                return SeamResult::Warning(vec![f]);
+            }
+            (true, true) => {}
+        }
+
+        // Both sides present but one parsed zero properties — the parser
+        // couldn't recognize the shape; report a Warning so it's visible.
+        if spec_props.is_empty() {
+            let mut f = SeamFinding::new(
+                "OpenAPI spec file present but parser extracted zero properties — \
+                 boundary could not be compared. Spec may use $ref-only schemas or \
+                 a structure this parser does not recognize."
+                    .to_string(),
+            );
+            if let Some(p) = spec_file_paths.first() {
+                f = f.with_file(p.clone());
+            }
+            return SeamResult::Warning(vec![f]);
+        }
+        if handler_props.is_empty() {
+            let mut f = SeamFinding::new(
+                "Handler file(s) present but parser extracted zero response properties — \
+                 boundary could not be compared. Handler may use a response helper or \
+                 shape this parser does not recognize."
+                    .to_string(),
+            );
+            if let Some(p) = handler_file_paths.first() {
+                f = f.with_file(p.clone());
+            }
+            return SeamResult::Warning(vec![f]);
         }
 
         let spec_keys: BTreeSet<&String> = spec_props.keys().collect();
@@ -118,6 +174,40 @@ impl SeamCheck for OpenApiComplianceCheck {
             SeamResult::Failed(findings)
         }
     }
+}
+
+/// Spec-file detection: filename-based (`openapi.*`, `swagger.*`) OR path
+/// component containing `openapi`. Filename heuristic is narrow by design —
+/// handler files rarely match it, and renamed specs fall into the asymmetry
+/// warning path rather than silently being treated as handlers.
+fn looks_like_spec_file(rel: &std::path::Path) -> bool {
+    let fname = rel
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    fname.starts_with("openapi.")
+        || fname.starts_with("swagger.")
+        || rel
+            .components()
+            .any(|c| c.as_os_str().eq_ignore_ascii_case("openapi"))
+}
+
+/// Handler-file detection: a recognized source extension AND content that
+/// contains a shape the parser can evaluate. If neither marker is present,
+/// the file is ignored (a stray TOML or README won't count as a "handler
+/// file present" on the asymmetry path).
+fn looks_like_handler_file(rel: &std::path::Path, content: &str) -> bool {
+    let ext = rel
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_source = matches!(
+        ext.as_str(),
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "py" | "go" | "java" | "kt"
+    );
+    is_source && (content.contains("return {") || content.contains(".json("))
 }
 
 /// Parse OpenAPI YAML/JSON for response property names and types. Skips over
@@ -409,5 +499,74 @@ mod tests {
     fn out_of_scope_when_boundary_is_infra_only() {
         let b = LayerBoundary::new("infrastructure", "deployment");
         assert!(!OpenApiComplianceCheck.applies_to(&b));
+    }
+
+    #[test]
+    fn warns_when_handler_present_but_spec_missing() {
+        // Handler in the boundary but no OpenAPI/Swagger file — previously
+        // silently Passed; now Warning so operators surface the gap.
+        let (dir, rels) = fixture(&[(
+            "src/handlers.ts",
+            "export function h() { return { id: 1, name: 'a' }; }\n",
+        )]);
+        let boundary = LayerBoundary::new("api", "frontend");
+        let result = OpenApiComplianceCheck.run(&ctx(&dir, &boundary, &rels));
+        assert!(
+            matches!(result, SeamResult::Warning(_)),
+            "handler-without-spec must Warning, got {result:?}"
+        );
+        assert!(result.findings()[0]
+            .message
+            .contains("no OpenAPI/Swagger spec file found"));
+    }
+
+    #[test]
+    fn warns_when_spec_present_but_handler_missing() {
+        let (dir, rels) = fixture(&[(
+            "openapi.yaml",
+            "paths:\n  /x:\n    get:\n      responses:\n        '200':\n          content:\n            application/json:\n              schema:\n                properties:\n                  id:\n                    type: integer\n",
+        )]);
+        let boundary = LayerBoundary::new("api", "frontend");
+        let result = OpenApiComplianceCheck.run(&ctx(&dir, &boundary, &rels));
+        assert!(
+            matches!(result, SeamResult::Warning(_)),
+            "spec-without-handler must Warning, got {result:?}"
+        );
+        assert!(result.findings()[0]
+            .message
+            .contains("no recognizable handler response found"));
+    }
+
+    #[test]
+    fn warns_when_spec_renamed_to_non_heuristic_path() {
+        // Codex finding: a renamed/moved spec (e.g., `api-spec.yaml`) with a
+        // real handler previously looked clean. Now it raises Warning because
+        // the spec is not recognized → asymmetric → boundary uncompared.
+        let (dir, rels) = fixture(&[
+            (
+                "specs/api-spec.yaml",
+                "paths:\n  /x:\n    get:\n      responses:\n        '200':\n          content:\n            application/json:\n              schema:\n                properties:\n                  id:\n                    type: integer\n",
+            ),
+            (
+                "src/handlers.ts",
+                "export function h() { return { id: 1 }; }\n",
+            ),
+        ]);
+        let boundary = LayerBoundary::new("api", "frontend");
+        let result = OpenApiComplianceCheck.run(&ctx(&dir, &boundary, &rels));
+        assert!(
+            matches!(result, SeamResult::Warning(_)),
+            "renamed spec must surface as Warning, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn passes_when_no_artifacts_on_boundary() {
+        // Neither spec nor handler on this boundary — nothing to evaluate,
+        // no silent bypass concern (no parsable artifacts exist).
+        let (dir, rels) = fixture(&[("src/util.ts", "export const K = 1;\n")]);
+        let boundary = LayerBoundary::new("api", "frontend");
+        let result = OpenApiComplianceCheck.run(&ctx(&dir, &boundary, &rels));
+        assert_eq!(result, SeamResult::Passed);
     }
 }

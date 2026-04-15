@@ -222,15 +222,33 @@ paths = ["Dockerfile"]
     let json: serde_json::Value = serde_json::from_str(&stdout)
         .unwrap_or_else(|e| panic!("expected JSON on stdout; parse error: {e}\n{stdout}"));
     let layers_arr = json["layers"].as_array().expect("layers array");
-    // Every seam check across every layer should be status=passed.
+
+    // Adversarial-review finding: the previous version of this test only
+    // inspected seam_checks when present — a regression that dropped the
+    // array entirely would still pass. Now require at least one populated
+    // seam_checks array with the configured config_mismatch check at
+    // status=passed, AND reject any Warning/Failed on the clean fixture.
+    let mut saw_populated_config_mismatch_passed = false;
     for layer in layers_arr {
-        if let Some(checks) = layer["seam_checks"].as_array() {
-            for c in checks {
-                assert_ne!(
-                    c["status"], "failed",
-                    "clean fixture must not contain Failed seam findings: {c}"
-                );
+        let checks = layer["seam_checks"]
+            .as_array()
+            .unwrap_or_else(|| panic!("layer is missing seam_checks array: {layer}"));
+        for c in checks {
+            // Criterion 15: clean fixture must have status=passed for every
+            // seam check — not just "not failed". A Warning on the clean
+            // fixture would mean the parser couldn't evaluate the boundary.
+            assert_eq!(
+                c["status"], "passed",
+                "clean fixture seam check must be passed: {c}"
+            );
+            if c["name"] == "config_mismatch" {
+                saw_populated_config_mismatch_passed = true;
             }
         }
     }
+    assert!(
+        saw_populated_config_mismatch_passed,
+        "clean fixture must emit at least one passed config_mismatch check in \
+         layers[].seam_checks[]; got: {json}"
+    );
 }

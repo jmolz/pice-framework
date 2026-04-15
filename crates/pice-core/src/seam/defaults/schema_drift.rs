@@ -60,6 +60,7 @@ impl SeamCheck for SchemaDriftCheck {
         }
 
         let mut findings: Vec<SeamFinding> = Vec::new();
+        let mut matched_tables: BTreeSet<String> = BTreeSet::new();
 
         for (model, fields) in &model_fields {
             // Match model → table by case-insensitive name (Prisma default).
@@ -68,8 +69,20 @@ impl SeamCheck for SchemaDriftCheck {
                 .find(|t| t.eq_ignore_ascii_case(model))
                 .cloned();
             let Some(table) = table_key else {
+                // Fail-closed: an ORM model with no matching DDL is schema
+                // drift — the archetypal "changed ORM, forgot the migration"
+                // case. This path used to silently return Passed.
+                let mut f = SeamFinding::new(format!(
+                    "ORM model '{model}' has no matching migration table — \
+                     schema drift: migration is missing or the table was renamed"
+                ));
+                if let Some(p) = model_file.get(model).cloned() {
+                    f = f.with_file(p);
+                }
+                findings.push(f);
                 continue;
             };
+            matched_tables.insert(table.clone());
             let columns = ddl_columns.get(&table).cloned().unwrap_or_default();
             for field in fields.difference(&columns) {
                 let mut f = SeamFinding::new(format!(
@@ -91,6 +104,26 @@ impl SeamCheck for SchemaDriftCheck {
                 }
                 findings.push(f);
             }
+        }
+
+        // Symmetric pass: migration tables with no matching ORM model are also
+        // drift (migration added without updating the ORM, or model renamed).
+        for table in ddl_columns.keys() {
+            if matched_tables.contains(table) {
+                continue;
+            }
+            let has_model = model_fields.keys().any(|m| m.eq_ignore_ascii_case(table));
+            if has_model {
+                continue;
+            }
+            let mut f = SeamFinding::new(format!(
+                "migration table '{table}' has no matching ORM model — \
+                 schema drift: ORM is missing or the model was renamed"
+            ));
+            if let Some(p) = ddl_file.get(table).cloned() {
+                f = f.with_file(p);
+            }
+            findings.push(f);
         }
 
         if findings.is_empty() {
@@ -334,6 +367,71 @@ mod tests {
     fn out_of_scope_when_boundary_does_not_touch_data_layer() {
         let b = LayerBoundary::new("frontend", "infrastructure");
         assert!(!SchemaDriftCheck.applies_to(&b));
+    }
+
+    #[test]
+    fn fails_when_orm_model_has_no_matching_migration() {
+        // The archetypal category-9 drift: added a model, forgot to migrate.
+        let (dir, rels) = fixture(&[
+            (
+                "prisma/schema.prisma",
+                "model User {\n  id Int @id\n  email String\n}\nmodel Order {\n  id Int @id\n}\n",
+            ),
+            (
+                "migrations/001.sql",
+                "CREATE TABLE User (id INT PRIMARY KEY, email TEXT);",
+            ),
+        ]);
+        let boundary = LayerBoundary::new("backend", "database");
+        let ctx = ctx(&dir, &boundary, &rels);
+        let result = SchemaDriftCheck.run(&ctx);
+        assert!(
+            result.is_failed(),
+            "model with no migration must be Failed, got {result:?}"
+        );
+        let msgs: Vec<&str> = result
+            .findings()
+            .iter()
+            .map(|f| f.message.as_str())
+            .collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("Order") && m.contains("no matching migration table")),
+            "finding should name the orphan model: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn fails_when_migration_table_has_no_matching_model() {
+        // Reverse direction: added a table, forgot the ORM model.
+        let (dir, rels) = fixture(&[
+            (
+                "prisma/schema.prisma",
+                "model User {\n  id Int @id\n  email String\n}\n",
+            ),
+            (
+                "migrations/001.sql",
+                "CREATE TABLE User (id INT PRIMARY KEY, email TEXT);\n\
+                 CREATE TABLE LegacyAudit (id INT PRIMARY KEY, note TEXT);",
+            ),
+        ]);
+        let boundary = LayerBoundary::new("backend", "database");
+        let ctx = ctx(&dir, &boundary, &rels);
+        let result = SchemaDriftCheck.run(&ctx);
+        assert!(
+            result.is_failed(),
+            "table with no ORM model must be Failed, got {result:?}"
+        );
+        let msgs: Vec<&str> = result
+            .findings()
+            .iter()
+            .map(|f| f.message.as_str())
+            .collect();
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("LegacyAudit") && m.contains("no matching ORM model")),
+            "finding should name the orphan table: {msgs:?}"
+        );
     }
 
     #[test]

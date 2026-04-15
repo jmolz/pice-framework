@@ -78,6 +78,24 @@ pub async fn run(
             Some(&seam_registry),
         );
         if !report.is_ok() {
+            if req.json {
+                let errors: Vec<serde_json::Value> = report
+                    .errors
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "field": e.field,
+                            "message": e.message,
+                        })
+                    })
+                    .collect();
+                let value = serde_json::json!({
+                    "status": "workflow-validation-failed",
+                    "errors": errors,
+                    "hint": "Run `pice validate` for full details.",
+                });
+                return Ok(CommandResponse::ExitJson { code: 1, value });
+            }
             let mut message = String::from("workflow.yaml has validation errors:\n");
             for e in &report.errors {
                 message.push_str(&format!("  - {}: {}\n", e.field, e.message));
@@ -99,6 +117,27 @@ pub async fn run(
             &mut seam_violations,
         );
         if !seam_violations.is_empty() {
+            if req.json {
+                let violations: Vec<serde_json::Value> = seam_violations
+                    .iter()
+                    .map(|v| {
+                        serde_json::json!({
+                            "field": v.field,
+                            "reason": v.reason,
+                            "project": v.project,
+                            "user": v.user,
+                        })
+                    })
+                    .collect();
+                let value = serde_json::json!({
+                    "status": "seam-floor-violation",
+                    "violations": violations,
+                    "hint": "workflow.yaml [seams] may REPLACE a layers.toml boundary's \
+                            check list but cannot empty-list it. Omit the key to inherit \
+                            the project list.",
+                });
+                return Ok(CommandResponse::ExitJson { code: 1, value });
+            }
             let mut message = String::from("seam configuration floor violations:\n");
             for v in &seam_violations {
                 message.push_str(&format!(
@@ -129,6 +168,23 @@ pub async fn run(
             &seam_registry,
         );
         if !merged_report.is_ok() {
+            if req.json {
+                let errors: Vec<serde_json::Value> = merged_report
+                    .errors
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "field": e.field,
+                            "message": e.message,
+                        })
+                    })
+                    .collect();
+                let value = serde_json::json!({
+                    "status": "merged-seam-validation-failed",
+                    "errors": errors,
+                });
+                return Ok(CommandResponse::ExitJson { code: 1, value });
+            }
             let mut message = String::from(
                 "merged seam map has validation errors (layers.toml + workflow.yaml):\n",
             );
