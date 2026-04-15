@@ -11,6 +11,7 @@
 //! server is needed.
 
 use assert_cmd::Command;
+use pice_core::cli::ExitJsonStatus;
 use std::fs;
 use std::path::Path;
 
@@ -286,7 +287,7 @@ paths = ["src/**"]
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("missing-plan failure must emit JSON on stdout; parse error: {e}\n{stdout}")
     });
-    assert_eq!(json["status"], "plan-not-found");
+    assert_eq!(json["status"], ExitJsonStatus::PlanNotFound.as_str());
     assert!(json["plan_path"].is_string());
 }
 
@@ -330,7 +331,7 @@ paths = ["src/**"]
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("no-contract failure must emit JSON on stdout; parse error: {e}\n{stdout}")
     });
-    assert_eq!(json["status"], "no-contract-section");
+    assert_eq!(json["status"], ExitJsonStatus::NoContractSection.as_str());
     assert!(json["plan_path"].is_string());
 }
 
@@ -379,6 +380,196 @@ paths = ["src/**"]
     let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
         panic!("plan-parse failure must emit JSON on stdout; parse error: {e}\n{stdout}")
     });
-    assert_eq!(json["status"], "plan-parse-failed");
+    assert_eq!(json["status"], ExitJsonStatus::PlanParseFailed.as_str());
     assert!(json["error"].is_string());
+}
+
+/// Phase 3 round-4 adversarial fix: workflow.yaml validation failure under
+/// `--json` must emit ExitJson on stdout with exit 1, not plain text on
+/// stderr. Two of three round-2 ExitJson statuses lacked CLI binary tests
+/// (the third — workflow-validation-failed — is asserted here). Two
+/// evaluators independently flagged this gap.
+#[test]
+fn evaluate_json_workflow_validation_failure_emits_exit_json_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+
+    let layers = r#"
+[layers]
+order = ["backend"]
+
+[layers.backend]
+paths = ["src/**"]
+"#;
+    fs::create_dir_all(dir.path().join(".pice")).unwrap();
+    fs::write(dir.path().join(".pice/layers.toml"), layers).unwrap();
+
+    // workflow.yaml that validate_all rejects: an unknown layer override.
+    // (`unknown_layer` does not appear in layers.toml `order`.)
+    let workflow = r#"schema_version: "0.2"
+defaults:
+  tier: 2
+  min_confidence: 0.90
+  max_passes: 5
+  model: sonnet
+  budget_usd: 2.0
+  cost_cap_behavior: halt
+layer_overrides:
+  unknown_layer:
+    tier: 3
+"#;
+    fs::write(dir.path().join(".pice/workflow.yaml"), workflow).unwrap();
+
+    let plan = write_minimal_plan(dir.path());
+
+    let output = pice_cmd()
+        .current_dir(dir.path())
+        .args(["evaluate", plan.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "workflow validation failure must exit 1; stderr: {}, stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("workflow-validation failure must emit JSON on stdout; parse error: {e}\n{stdout}")
+    });
+    assert_eq!(
+        json["status"],
+        ExitJsonStatus::WorkflowValidationFailed.as_str()
+    );
+    assert!(
+        json["errors"].is_array(),
+        "must include errors array: {json}"
+    );
+}
+
+/// Phase 3 round-4 adversarial fix: seam floor violation under `--json` must
+/// emit ExitJson on stdout. The user empty-lists a project-required boundary.
+#[test]
+fn evaluate_json_seam_floor_violation_emits_exit_json_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+
+    // layers.toml declares a seam boundary with required checks (the floor).
+    let layers = r#"
+[layers]
+order = ["backend", "infrastructure"]
+
+[layers.backend]
+paths = ["src/**"]
+
+[layers.infrastructure]
+paths = ["Dockerfile"]
+
+[seams]
+"backend↔infrastructure" = ["config_mismatch"]
+"#;
+    fs::create_dir_all(dir.path().join(".pice")).unwrap();
+    fs::write(dir.path().join(".pice/layers.toml"), layers).unwrap();
+
+    // workflow.yaml empty-lists the same boundary — that's the floor
+    // violation: the project required at least one check, the user said zero.
+    let workflow = r#"schema_version: "0.2"
+defaults:
+  tier: 2
+  min_confidence: 0.90
+  max_passes: 5
+  model: sonnet
+  budget_usd: 2.0
+  cost_cap_behavior: halt
+seams:
+  "backend↔infrastructure": []
+"#;
+    fs::write(dir.path().join(".pice/workflow.yaml"), workflow).unwrap();
+
+    write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+    write_file(dir.path(), "Dockerfile", "FROM alpine\n");
+    let plan = write_minimal_plan(dir.path());
+
+    let output = pice_cmd()
+        .current_dir(dir.path())
+        .args(["evaluate", plan.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "seam floor violation must exit 1; stderr: {}, stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("seam-floor-violation must emit JSON on stdout; parse error: {e}\n{stdout}")
+    });
+    assert_eq!(json["status"], ExitJsonStatus::SeamFloorViolation.as_str());
+    assert!(
+        json["violations"].is_array(),
+        "must include violations array: {json}"
+    );
+}
+
+/// Phase 3 round-4 adversarial fix: merged-seam validation failure under
+/// `--json` must emit ExitJson on stdout. The merged map (layers.toml +
+/// workflow.yaml) is re-validated against the registry — declare a
+/// boundary in layers.toml that uses an unknown check id.
+#[test]
+fn evaluate_json_merged_seam_validation_failure_emits_exit_json_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    git_init(dir.path());
+
+    // layers.toml declares an unknown seam check id — `validate_all` only
+    // checks workflow.seams; the merged-seam re-validation catches this.
+    let layers = r#"
+[layers]
+order = ["backend", "infrastructure"]
+
+[layers.backend]
+paths = ["src/**"]
+
+[layers.infrastructure]
+paths = ["Dockerfile"]
+
+[seams]
+"backend↔infrastructure" = ["this_check_id_does_not_exist"]
+"#;
+    fs::create_dir_all(dir.path().join(".pice")).unwrap();
+    fs::write(dir.path().join(".pice/layers.toml"), layers).unwrap();
+
+    write_file(dir.path(), "src/main.rs", "fn main() {}\n");
+    write_file(dir.path(), "Dockerfile", "FROM alpine\n");
+    let plan = write_minimal_plan(dir.path());
+
+    let output = pice_cmd()
+        .current_dir(dir.path())
+        .args(["evaluate", plan.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "merged-seam validation failure must exit 1; stderr: {}, stdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf-8");
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("merged-seam-validation-failed must emit JSON on stdout; parse error: {e}\n{stdout}")
+    });
+    assert_eq!(
+        json["status"],
+        ExitJsonStatus::MergedSeamValidationFailed.as_str()
+    );
+    assert!(
+        json["errors"].is_array(),
+        "must include errors array: {json}"
+    );
 }

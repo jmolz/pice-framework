@@ -1,7 +1,7 @@
 //! `pice evaluate` handler — grade contract criteria with dual-model evaluation.
 
 use anyhow::{Context, Result};
-use pice_core::cli::{CommandResponse, EvaluateRequest};
+use pice_core::cli::{CommandResponse, EvaluateRequest, ExitJsonStatus};
 use pice_core::plan_parser::ParsedPlan;
 use pice_core::prompt::helpers::{get_git_diff, read_claude_md};
 use pice_protocol::CriterionScore;
@@ -35,7 +35,7 @@ pub async fn run(
             return Ok(CommandResponse::ExitJson {
                 code: 1,
                 value: json!({
-                    "status": "plan-not-found",
+                    "status": ExitJsonStatus::PlanNotFound.as_str(),
                     "plan_path": plan_path.display().to_string(),
                 }),
             });
@@ -54,7 +54,7 @@ pub async fn run(
                 return Ok(CommandResponse::ExitJson {
                     code: 1,
                     value: json!({
-                        "status": "plan-parse-failed",
+                        "status": ExitJsonStatus::PlanParseFailed.as_str(),
                         "plan_path": plan_path.display().to_string(),
                         "error": e.to_string(),
                     }),
@@ -74,7 +74,7 @@ pub async fn run(
                 return Ok(CommandResponse::ExitJson {
                     code: 2,
                     value: json!({
-                        "status": "no-contract-section",
+                        "status": ExitJsonStatus::NoContractSection.as_str(),
                         "plan_path": plan_path.display().to_string(),
                     }),
                 });
@@ -122,7 +122,7 @@ pub async fn run(
                     })
                     .collect();
                 let value = serde_json::json!({
-                    "status": "workflow-validation-failed",
+                    "status": ExitJsonStatus::WorkflowValidationFailed.as_str(),
                     "errors": errors,
                     "hint": "Run `pice validate` for full details.",
                 });
@@ -162,7 +162,7 @@ pub async fn run(
                     })
                     .collect();
                 let value = serde_json::json!({
-                    "status": "seam-floor-violation",
+                    "status": ExitJsonStatus::SeamFloorViolation.as_str(),
                     "violations": violations,
                     "hint": "workflow.yaml [seams] may REPLACE a layers.toml boundary's \
                             check list but cannot empty-list it. Omit the key to inherit \
@@ -212,7 +212,7 @@ pub async fn run(
                     })
                     .collect();
                 let value = serde_json::json!({
-                    "status": "merged-seam-validation-failed",
+                    "status": ExitJsonStatus::MergedSeamValidationFailed.as_str(),
                     "errors": errors,
                 });
                 return Ok(CommandResponse::ExitJson { code: 1, value });
@@ -280,6 +280,18 @@ pub async fn run(
                 &[],
             ) {
                 Ok(eval_id) => {
+                    // Phase 3 round-4 adversarial review fix: when both
+                    // sides of a boundary are active, run_seams_for_layer
+                    // attributes the SAME (boundary, check_id) result to
+                    // BOTH layers' `seam_checks`. The per-layer manifest
+                    // copy is intentional (each layer's view is a complete
+                    // picture). But persisting both as separate rows would
+                    // double-count category analytics. Dedupe here on
+                    // (boundary, check_id) and attribute the canonical row
+                    // to the alphabetically-first layer the check appeared
+                    // on (deterministic across runs).
+                    let mut seen: std::collections::HashSet<(String, String)> =
+                        std::collections::HashSet::new();
                     for layer in &manifest.layers {
                         for sc in &layer.seam_checks {
                             let status_wire = match sc.status {
@@ -296,6 +308,12 @@ pub async fn run(
                             let Some(category) = sc.category else {
                                 continue;
                             };
+                            // Bilateral dedupe: one DB row per
+                            // (eval_id, boundary, check_id).
+                            let key = (sc.boundary.clone(), sc.name.clone());
+                            if !seen.insert(key) {
+                                continue;
+                            }
                             let row = metrics::store::SeamFindingRow {
                                 layer: &layer.name,
                                 boundary: &sc.boundary,

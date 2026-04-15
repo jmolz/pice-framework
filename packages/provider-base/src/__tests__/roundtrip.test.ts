@@ -16,6 +16,9 @@ import type {
   ResponseToolUseParams,
   EvaluateCreateParams,
   SeamCheckSpec,
+  SeamCheckResult,
+  SeamCheckStatus,
+  SeamFinding,
   EvaluateScoreResult,
   CriterionScore,
   EvaluateResultParams,
@@ -355,6 +358,92 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     const json = JSON.stringify(spec);
     const parsed: SeamCheckSpec = JSON.parse(json);
     expect(parsed).toEqual(spec);
+  });
+
+  // Phase 3 round-4 adversarial review fix: round-1 only mirrored
+  // SeamCheckSpec on the TS side, leaving result/finding shapes uncovered
+  // by protocol-level types. CLAUDE.md / providers.md rule: "both sides
+  // (Rust + TS) must have serialization roundtrip tests for every new
+  // message type." These tests pin the wire shape against what the daemon
+  // emits in `LayerResult.seam_checks[]` and the SQLite `seam_findings`
+  // table.
+
+  it('SeamFinding roundtrips with all optional fields', () => {
+    const finding: SeamFinding = {
+      message: "ORM model 'User' has no matching migration table",
+      file: 'prisma/schema.prisma',
+      line: 12,
+    };
+    const json = JSON.stringify(finding);
+    const parsed: SeamFinding = JSON.parse(json);
+    expect(parsed).toEqual(finding);
+    expect(parsed.message).toBe(finding.message);
+    expect(parsed.file).toBe('prisma/schema.prisma');
+    expect(parsed.line).toBe(12);
+  });
+
+  it('SeamFinding roundtrips with optional fields omitted', () => {
+    const finding: SeamFinding = {
+      message: 'budget exceeded — heuristic check did not complete in 100ms',
+    };
+    const json = JSON.stringify(finding);
+    expect(json).not.toContain('"file"');
+    expect(json).not.toContain('"line"');
+    const parsed: SeamFinding = JSON.parse(json);
+    expect(parsed.message).toBe(finding.message);
+    expect(parsed.file).toBeUndefined();
+    expect(parsed.line).toBeUndefined();
+  });
+
+  it('SeamCheckStatus accepts every wire variant', () => {
+    // Wire variants emitted by the daemon (kebab-case via serde).
+    // Compile-time exhaustiveness: this list must mirror the Rust
+    // `CheckStatus` enum. If a new variant is added there, the assignment
+    // below fails to type-check.
+    const variants: SeamCheckStatus[] = [
+      'passed',
+      'warning',
+      'failed',
+      'skipped',
+    ];
+    for (const v of variants) {
+      const result: SeamCheckResult = {
+        name: 'config_mismatch',
+        status: v,
+        boundary: 'backend↔infrastructure',
+      };
+      const json = JSON.stringify(result);
+      const parsed: SeamCheckResult = JSON.parse(json);
+      expect(parsed.status).toBe(v);
+    }
+  });
+
+  it('SeamCheckResult roundtrips a full Failed payload', () => {
+    const result: SeamCheckResult = {
+      name: 'config_mismatch',
+      status: 'failed',
+      boundary: 'backend↔infrastructure',
+      category: 1,
+      details: "env var 'ORPHAN_VAR' declared in Dockerfile but not read",
+    };
+    const json = JSON.stringify(result);
+    const parsed: SeamCheckResult = JSON.parse(json);
+    expect(parsed).toEqual(result);
+    expect(parsed.category).toBe(1);
+  });
+
+  it('SeamCheckResult roundtrips a Passed payload with null category', () => {
+    // Unregistered-check synthetic rows carry a null category.
+    const result: SeamCheckResult = {
+      name: 'unknown_check',
+      status: 'failed',
+      boundary: 'backend↔infrastructure',
+      category: null,
+      details: "seam check id 'unknown_check' is not registered",
+    };
+    const json = JSON.stringify(result);
+    const parsed: SeamCheckResult = JSON.parse(json);
+    expect(parsed.category).toBeNull();
   });
 
   it('error codes match between TS and Rust', () => {

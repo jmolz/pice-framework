@@ -78,6 +78,56 @@ pub enum CommandResponse {
     ExitJson { code: i32, value: serde_json::Value },
 }
 
+/// Stable discriminant strings carried in the `value.status` field of an
+/// `ExitJson` payload. Promoted from raw `json!` literals (Phase 3 round-4
+/// adversarial review fix) so a typo at the call site fails to compile and
+/// CLI integration tests can pin the wire string against the same constants
+/// the handler emits. Serialized via the kebab-case rename so the wire
+/// shape (`"plan-not-found"`) is unchanged.
+///
+/// Add a new variant here when introducing a new structured failure path —
+/// callers MUST pattern-match exhaustively on this enum, not on the wire
+/// strings. Each variant must have a CLI binary integration test that
+/// asserts the exact serialized value (see
+/// `crates/pice-cli/tests/evaluate_integration.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExitJsonStatus {
+    /// `pice evaluate <plan> --json` — plan file does not exist on disk.
+    PlanNotFound,
+    /// `pice evaluate <plan> --json` — plan file exists but failed to parse.
+    PlanParseFailed,
+    /// `pice evaluate <plan> --json` — plan parsed but has no `## Contract` section.
+    NoContractSection,
+    /// `pice evaluate <plan> --json` — workflow.yaml has validation errors
+    /// (bad triggers, unknown layer overrides, unknown seam boundaries, etc.).
+    WorkflowValidationFailed,
+    /// `pice evaluate <plan> --json` — the merged seams map (layers.toml +
+    /// workflow.yaml) violates the project floor (e.g. user empty-listed a
+    /// boundary the project requires).
+    SeamFloorViolation,
+    /// `pice evaluate <plan> --json` — the floor-merged seams map fails the
+    /// registry validator (unknown check id or applies_to mismatch in a
+    /// boundary declared by layers.toml).
+    MergedSeamValidationFailed,
+}
+
+impl ExitJsonStatus {
+    /// Returns the serialized wire string. Used by tests so the assertion
+    /// runs against the same enum the handler emits — no risk of typo drift
+    /// between handler call site and test fixture.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PlanNotFound => "plan-not-found",
+            Self::PlanParseFailed => "plan-parse-failed",
+            Self::NoContractSection => "no-contract-section",
+            Self::WorkflowValidationFailed => "workflow-validation-failed",
+            Self::SeamFloorViolation => "seam-floor-violation",
+            Self::MergedSeamValidationFailed => "merged-seam-validation-failed",
+        }
+    }
+}
+
 // ─── Request structs ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

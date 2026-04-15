@@ -118,6 +118,42 @@ export interface SeamCheckSpec {
   args?: Record<string, unknown>;
 }
 
+/**
+ * A single observation from a seam check. Mirrors `SeamFinding` in the Rust
+ * `pice-core::seam` crate. Phase 3 round-4 adversarial review fix: the
+ * round-1 implementation only mirrored `SeamCheckSpec` on the TS side,
+ * leaving result/finding shapes without protocol-level type coverage.
+ */
+export interface SeamFinding {
+  message: string;
+  /** Repository-relative path implicated by the finding, if any. */
+  file?: string;
+  /** 1-indexed line number within `file`, if known. */
+  line?: number;
+}
+
+/**
+ * Per-check status reported by the seam runner. Mirrors `CheckStatus` in
+ * Rust (`pice-core::layers::manifest`). Wire form is kebab-case via serde.
+ */
+export type SeamCheckStatus = "passed" | "warning" | "failed" | "skipped";
+
+/**
+ * Result of running a single seam check on one boundary. Mirrors
+ * `SeamCheckResult` in Rust (`pice-core::layers::manifest`). Carried inside
+ * `LayerResult.seam_checks[]` and persisted to SQLite by the daemon.
+ */
+export interface SeamCheckResult {
+  /** Check id (registry key, e.g. `"config_mismatch"`). */
+  name: string;
+  status: SeamCheckStatus;
+  /** Canonical boundary string (`"a↔b"` with `a ≤ b` alphabetically). */
+  boundary: string;
+  /** PRDv2 category 1..=12, or null for unregistered-check synthetic rows. */
+  category?: number | null;
+  details?: string | null;
+}
+
 export interface EvaluateCreateResult {
   sessionId: string;
 }
