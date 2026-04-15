@@ -112,7 +112,9 @@ fn parse_prisma(content: &str) -> BTreeMap<String, BTreeSet<String>> {
         }
         if let Some(rest) = line.strip_prefix("model ") {
             // `model Foo {` — name ends at first whitespace or `{`.
-            let end = rest.find(|c: char| c.is_whitespace() || c == '{').unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '{')
+                .unwrap_or(rest.len());
             let name = rest[..end].trim().to_string();
             if !name.is_empty() {
                 current = Some(name);
@@ -135,7 +137,9 @@ fn parse_prisma(content: &str) -> BTreeMap<String, BTreeSet<String>> {
                 .unwrap_or("")
                 .trim_end_matches('?');
             if !name.is_empty() && name.chars().next().is_some_and(|c| c.is_alphabetic()) {
-                out.entry(model.clone()).or_default().insert(name.to_string());
+                out.entry(model.clone())
+                    .or_default()
+                    .insert(name.to_string());
             }
         }
     }
@@ -320,7 +324,10 @@ mod tests {
         let result = SchemaDriftCheck.run(&ctx);
         assert!(result.is_failed(), "expected drift finding, got {result:?}");
         let msg = &result.findings()[0].message;
-        assert!(msg.contains("phone"), "finding should mention drifted column: {msg}");
+        assert!(
+            msg.contains("phone"),
+            "finding should mention drifted column: {msg}"
+        );
     }
 
     #[test]
@@ -341,7 +348,8 @@ mod tests {
 
     #[test]
     fn parse_sql_handles_if_not_exists_and_pk_clause() {
-        let sql = "CREATE TABLE IF NOT EXISTS User (\n  id INT,\n  email TEXT,\n  PRIMARY KEY (id)\n);";
+        let sql =
+            "CREATE TABLE IF NOT EXISTS User (\n  id INT,\n  email TEXT,\n  PRIMARY KEY (id)\n);";
         let parsed = parse_create_table(sql);
         let cols = parsed.get("User").unwrap();
         assert!(cols.contains("id"));

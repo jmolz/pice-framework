@@ -114,7 +114,10 @@ mod tests {
             ("src/main.rs", r#"fn main() { env::var("DATABASE_URL"); }"#),
         ]);
         let b = LayerBoundary::new("backend", "infrastructure");
-        assert_eq!(ConfigMismatchCheck.run(&ctx(&dir, &b, &rels)), SeamResult::Passed);
+        assert_eq!(
+            ConfigMismatchCheck.run(&ctx(&dir, &b, &rels)),
+            SeamResult::Passed
+        );
     }
 
     #[test]

@@ -1232,7 +1232,9 @@ mod tests {
         let project = base_with_seams(&[("backend↔infrastructure", &["config_mismatch"])]);
         let user = overlay_with_seams(&[("backend↔infrastructure", &[])]);
         let err = merge_with_floor(project, user).unwrap_err();
-        let fv: &FloorViolations = err.downcast_ref::<FloorViolations>().expect("FloorViolations");
+        let fv: &FloorViolations = err
+            .downcast_ref::<FloorViolations>()
+            .expect("FloorViolations");
         assert!(fv
             .violations
             .iter()
@@ -1245,15 +1247,16 @@ mod tests {
         let project = base();
         let user = overlay_with_seams(&[("backend↔infrastructure", &[])]);
         let err = merge_with_floor(project, user).unwrap_err();
-        let fv: &FloorViolations = err.downcast_ref::<FloorViolations>().expect("FloorViolations");
+        let fv: &FloorViolations = err
+            .downcast_ref::<FloorViolations>()
+            .expect("FloorViolations");
         assert!(fv.violations.iter().any(|v| v.user == "[]"));
     }
 
     #[test]
     fn seam_user_may_add_new_boundary() {
         let project = base_with_seams(&[("backend↔database", &["schema_drift"])]);
-        let user =
-            overlay_with_seams(&[("frontend↔api", &["openapi_compliance"])]);
+        let user = overlay_with_seams(&[("frontend↔api", &["openapi_compliance"])]);
         let merged = merge_with_floor(project, user).unwrap();
         let seams = merged.seams.unwrap();
         assert!(seams.contains_key("backend↔database"));
@@ -1267,8 +1270,7 @@ mod tests {
         // boundary by setting it to a new list; but this test just verifies
         // overlay's additive behavior for seams.
         let framework = base_with_seams(&[("backend↔infrastructure", &["config_mismatch"])]);
-        let project =
-            overlay_with_seams(&[("frontend↔api", &["openapi_compliance"])]);
+        let project = overlay_with_seams(&[("frontend↔api", &["openapi_compliance"])]);
         let merged = overlay(framework, project);
         let seams = merged.seams.unwrap();
         assert!(seams.contains_key("backend↔infrastructure"));
@@ -1297,8 +1299,7 @@ mod tests {
         // User expresses the boundary in inverted form with `<->`; it
         // must collide with the project's canonical `↔` form and replace.
         let project = base_with_seams(&[("backend↔infrastructure", &["config_mismatch"])]);
-        let user =
-            overlay_with_seams(&[("infrastructure<->backend", &["version_skew"])]);
+        let user = overlay_with_seams(&[("infrastructure<->backend", &["version_skew"])]);
         let merged = merge_with_floor(project, user).unwrap();
         let seams = merged.seams.unwrap();
         // The project's original key is gone; user's raw key wins.

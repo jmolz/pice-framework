@@ -381,15 +381,15 @@ mod tests {
             .unwrap();
         assert_eq!(before, 1);
         db.conn()
-            .execute("DELETE FROM evaluations WHERE id = ?", rusqlite::params![eid])
+            .execute(
+                "DELETE FROM evaluations WHERE id = ?",
+                rusqlite::params![eid],
+            )
             .unwrap();
         let after: i64 = db
             .conn()
             .query_row("SELECT COUNT(*) FROM seam_findings", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(
-            after, 0,
-            "FK cascade should have deleted the seam finding"
-        );
+        assert_eq!(after, 0, "FK cascade should have deleted the seam finding");
     }
 }

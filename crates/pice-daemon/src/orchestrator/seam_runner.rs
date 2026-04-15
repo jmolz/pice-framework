@@ -92,7 +92,8 @@ pub fn run_seams_for_layer(
                 continue;
             }
 
-            let result = run_with_timeout(check, &boundary, &filtered_diff, repo_root, &boundary_files);
+            let result =
+                run_with_timeout(check, &boundary, &filtered_diff, repo_root, &boundary_files);
             out.push(seam_result_to_record(check, &boundary, result));
         }
     }
@@ -295,7 +296,10 @@ mod tests {
             "",
             &empty_paths(),
         );
-        assert!(results.is_empty(), "frontend shouldn't run backend↔infra checks");
+        assert!(
+            results.is_empty(),
+            "frontend shouldn't run backend↔infra checks"
+        );
     }
 
     #[test]
@@ -370,11 +374,7 @@ mod tests {
         // Plant distinctive markers in the repo that are outside the boundary
         // files and assert they never reach the context the check sees.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("Dockerfile"),
-            "ENV DATABASE_URL=x\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("Dockerfile"), "ENV DATABASE_URL=x\n").unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(
             dir.path().join("src/app.rs"),
@@ -428,10 +428,7 @@ diff --git a/src/app.rs b/src/app.rs
 
         // Now explicitly verify the filtered diff we would pass to the check
         // does not contain the distinctive markers.
-        let boundary_files = vec![
-            PathBuf::from("src/app.rs"),
-            PathBuf::from("Dockerfile"),
-        ];
+        let boundary_files = vec![PathBuf::from("src/app.rs"), PathBuf::from("Dockerfile")];
         let filtered = filter_diff_to_paths(full_diff, &boundary_files);
         assert!(
             !filtered.contains("layer_a_contract_marker"),
@@ -458,7 +455,10 @@ diff --git a/src/app.rs b/src/app.rs
         let active = make_active(&["backend", "infrastructure"]);
         let mut paths = BTreeMap::new();
         paths.insert("backend".to_string(), vec![PathBuf::from("app.rs")]);
-        paths.insert("infrastructure".to_string(), vec![PathBuf::from("Dockerfile")]);
+        paths.insert(
+            "infrastructure".to_string(),
+            vec![PathBuf::from("Dockerfile")],
+        );
 
         let r1 = run_seams_for_layer(
             "backend",

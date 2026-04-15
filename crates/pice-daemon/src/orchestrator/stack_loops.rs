@@ -304,10 +304,7 @@ pub async fn run_stack_loops(
                 .map(|c| c.name.clone());
 
             let (layer_status, halted_by) = match first_failed {
-                Some(failed_id) => (
-                    LayerStatus::Failed,
-                    Some(format!("seam:{failed_id}")),
-                ),
+                Some(failed_id) => (LayerStatus::Failed, Some(format!("seam:{failed_id}"))),
                 None => (
                     LayerStatus::Pending,
                     Some(format!("phase-1-pending-tier-{effective_tier}")),
@@ -765,11 +762,7 @@ mod tests {
         std::fs::write(dir.path().join("src/server/main.rs"), "fn main() {}\n").unwrap();
         // Infrastructure declares FOO that backend never reads.
         std::fs::create_dir_all(dir.path().join("terraform")).unwrap();
-        std::fs::write(
-            dir.path().join("terraform/env.tf"),
-            "# unused tf file\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("terraform/env.tf"), "# unused tf file\n").unwrap();
         std::fs::write(dir.path().join("Dockerfile"), "FROM alpine\nENV FOO=1\n").unwrap();
 
         // Build layers + workflow with a seam boundary declaring config_mismatch.
@@ -815,8 +808,10 @@ mod tests {
             "halted_by should reference the failed check id"
         );
         assert!(
-            backend.seam_checks.iter().any(|c| c.name == "config_mismatch"
-                && c.status == CheckStatus::Failed),
+            backend
+                .seam_checks
+                .iter()
+                .any(|c| c.name == "config_mismatch" && c.status == CheckStatus::Failed),
             "seam_checks should include the Failed config_mismatch entry"
         );
     }

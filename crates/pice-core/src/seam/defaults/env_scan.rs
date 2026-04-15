@@ -112,7 +112,9 @@ fn collect_between(content: &str, start: &str, end: &str, out: &mut BTreeSet<Str
     let mut rest = content;
     while let Some(idx) = rest.find(start) {
         let after = &rest[idx + start.len()..];
-        let Some(end_idx) = after.find(end) else { break };
+        let Some(end_idx) = after.find(end) else {
+            break;
+        };
         let name = &after[..end_idx];
         if is_shouty_snake(name) {
             out.insert(name.to_string());

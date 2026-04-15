@@ -90,12 +90,18 @@ impl SeamCheck for OpenApiComplianceCheck {
         }
         // Type mismatches for shared fields — only when both sides declared a type.
         for name in spec_keys.intersection(&handler_keys) {
-            let spec_ty = spec_props.get(*name).map(|s| s.to_lowercase()).unwrap_or_default();
+            let spec_ty = spec_props
+                .get(*name)
+                .map(|s| s.to_lowercase())
+                .unwrap_or_default();
             let handler_ty = handler_props
                 .get(*name)
                 .map(|s| s.to_lowercase())
                 .unwrap_or_default();
-            if !spec_ty.is_empty() && !handler_ty.is_empty() && !types_compatible(&spec_ty, &handler_ty) {
+            if !spec_ty.is_empty()
+                && !handler_ty.is_empty()
+                && !types_compatible(&spec_ty, &handler_ty)
+            {
                 let mut f = SeamFinding::new(format!(
                     "field '{name}' type mismatch: OpenAPI spec says '{spec_ty}', handler returns '{handler_ty}'"
                 ));
@@ -266,7 +272,9 @@ fn find_matching(s: &str, open: char, close: char) -> Option<usize> {
 
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
@@ -284,8 +292,15 @@ fn infer_literal_type(val: &str) -> String {
     if v == "true" || v == "false" {
         return "boolean".into();
     }
-    if v.chars().next().is_some_and(|c| c.is_ascii_digit() || c == '-') {
-        return if v.contains('.') { "number".into() } else { "integer".into() };
+    if v.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() || c == '-')
+    {
+        return if v.contains('.') {
+            "number".into()
+        } else {
+            "integer".into()
+        };
     }
     String::new()
 }
@@ -382,7 +397,11 @@ mod tests {
         let boundary = LayerBoundary::new("api", "frontend");
         let result = OpenApiComplianceCheck.run(&ctx(&dir, &boundary, &rels));
         assert!(result.is_failed());
-        let msgs: Vec<&str> = result.findings().iter().map(|f| f.message.as_str()).collect();
+        let msgs: Vec<&str> = result
+            .findings()
+            .iter()
+            .map(|f| f.message.as_str())
+            .collect();
         assert!(msgs.iter().any(|m| m.contains("email")));
     }
 

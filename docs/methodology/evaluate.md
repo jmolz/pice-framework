@@ -187,9 +187,62 @@ it fails, the developer reviews failing criteria and adversarial findings, then 
 the issues, revises the plan, or adjusts thresholds. Failed evaluations are stored in
 the metrics database for trend analysis via `pice metrics`.
 
+## Seam Verification (v0.2+)
+
+After per-layer contract grading, the evaluator runs **seam checks** at every
+declared layer boundary. Seam checks target the 12 empirically validated
+failure categories from Google SRE, Adyen, and related research — the 68% of
+outage causes that contract grading alone can miss.
+
+| Category | Check ID               | Example drift                                    |
+|----------|------------------------|--------------------------------------------------|
+| 1        | `config_mismatch`      | Env var declared in Dockerfile, unused by app    |
+| 2        | `version_skew`         | `serde = "1.0"` in one crate, `"2.0"` in another |
+| 3        | `openapi_compliance`   | Spec says `id: integer`, handler returns string  |
+| 4        | `auth_handoff`         | `JWT_SECRET` declared in infra, missing in app   |
+| 5        | `cascade_timeout`      | retries × timeout exceeds upstream patience      |
+| 6        | `retry_storm`          | Retry count above safe threshold                 |
+| 7        | `service_discovery`    | App connects to undeclared compose service       |
+| 8        | `health_check`         | `/healthz` exists but probes no upstream         |
+| 9        | `schema_drift`         | ORM model field missing from migration DDL       |
+| 10       | `cold_start_order`     | compose services lack `depends_on`               |
+| 11       | `network_topology`     | Hardcoded AZ/region in source                    |
+| 12       | `resource_exhaustion`  | Pool size above safe threshold                   |
+
+### Configuration
+
+Declare boundaries and checks in `.pice/layers.toml` or `.pice/workflow.yaml`:
+
+```yaml
+seams:
+  "backend↔infrastructure": [config_mismatch, auth_handoff]
+  "backend↔database": [schema_drift]
+  "api↔frontend": [openapi_compliance]
+```
+
+Boundary keys accept `↔` or `<->`. Both canonicalize to `↔` for storage and
+error messages.
+
+### How findings surface
+
+- Each check runs in <100ms against a context-isolated filtered diff. Stuck
+  checks emit a Warning rather than crashing.
+- `Failed` findings set `LayerResult.status = Failed` with
+  `halted_by = "seam:<check-id>"`. The overall manifest becomes `Failed`.
+- `Warning` findings are advisory and do NOT fail the layer.
+- Every finding writes a row to the `seam_findings` SQLite table with its
+  `category` label for later aggregation via `pice metrics`.
+- `pice evaluate --json` emits `layers[].seam_checks[]` with `name`,
+  `boundary`, `category`, `status`, and `details` fields. Exit code is 2 on
+  any failed finding, 0 otherwise.
+
+See [Authoring Seam Checks](../guides/authoring-seam-checks.md) for
+writing your own.
+
 ## Further Reading
 
 - [PICE Overview](overview.md) -- The full lifecycle
 - [Plan Phase](plan.md) -- Where contracts are negotiated
 - [Implement Phase](implement.md) -- What evaluation grades
 - [Contract Format](contract.md) -- The criteria and thresholds evaluated against
+- [Authoring Seam Checks](../guides/authoring-seam-checks.md) -- Writing your own

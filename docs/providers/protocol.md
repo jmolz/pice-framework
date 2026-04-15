@@ -164,6 +164,13 @@ Create an evaluation session. Evaluation sessions are context-isolated -- they r
 | `claudeMd` | `string` | Yes | Project CLAUDE.md contents |
 | `model` | `string` | No | Model override |
 | `effort` | `string` | No | Effort level (e.g., `"high"`, `"xhigh"`) |
+| `seamChecks` | `SeamCheckSpec[]` | No | Seam checks to run for this layer's boundaries (v0.2+) |
+
+Each `SeamCheckSpec` is `{ id: string, boundary?: string, args?: object }`.
+Providers that don't declare `seamChecks` capability should ignore this
+field; the daemon runs seam checks in-process using its built-in registry
+when the provider omits support. See [Seam Verification](../methodology/evaluate.md#seam-verification-v02)
+and [Authoring Seam Checks](../guides/authoring-seam-checks.md).
 
 **Result:** `{ sessionId: string }`
 

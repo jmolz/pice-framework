@@ -123,9 +123,22 @@ pub trait SeamCheck {
 - Community check plugins ship as separate crates (e.g., `pice-seam-checks-grpc`)
 - Daemon discovers plugins at startup via a registry pattern
 - Per-boundary checks are declared in `.pice/layers.toml` under `[seams]`
-- v0.2 ships ~30 static checks. LLM-based seam reasoning is deferred to v0.4 implicit contract inference.
+- v0.2 ships 12 default checks, one per PRDv2 category. LLM-based seam reasoning is deferred to v0.4 implicit contract inference.
 - Static checks must be **deterministic and fast** (< 100ms each) — run on every pass, not cached
 - Seam findings are written to `seam_findings` SQLite table with `category` (1–12) labeled
+
+### Phase 3 implementation invariants
+
+These are codified in the v0.2 Phase 3 implementation and enforced by tests:
+
+- **`LayerBoundary::parse` canonicalizes alphabetically.** `"A↔B"` and `"B↔A"` compare equal via canonical form `{a≤b}↔{b≥a}`. Raw user spellings (including `<->`) are accepted; storage is always `↔`.
+- **Boundary seam runs require BOTH layers active.** If either side is inactive, the boundary's checks are skipped — no diff to compare.
+- **Context isolation via `SeamContext`.** The struct has no `Debug` derive to prevent accidental `{:?}` leaks of other layers' data. The seam runner assembles `boundary_files = layer_paths[a] ∪ layer_paths[b]` before constructing the context.
+- **Fail-closed rollup in `run_stack_loops`.** Any `SeamCheckResult.status == Failed` sets `LayerResult.status = Failed` with `halted_by = "seam:<check-id>"`. `Warning` findings preserve `Pending` (they are advisory, never block).
+- **Merge semantics are NOT floor-guarded on check-list content.** Users may swap `schema_drift` for `config_mismatch` — the floor is only on boundary *existence*. An empty check list for a project-declared boundary is a floor violation (equivalent to "silently turn off"); `merge_seams` in `pice-core::workflow::merge` rejects it.
+- **Heuristic checks (categories 5, 10, 11, and retry_storm cat 6) always emit `Warning`**, never `Failed`. They document this in their module docstring. Full runtime semantics are v0.4 scope.
+- **100ms budget is enforced post-hoc.** The runner records elapsed wall time after `run()` returns; overruns are downgraded to `Warning` with a budget-exceeded finding. Rust threads cannot be safely cancelled — v0.2 accepts that a pathologically stuck plugin check would hang the process.
+- **`seam_findings` CHECK constraints are load-bearing.** `category BETWEEN 1 AND 12` and `status IN ('passed','warning','failed')` catch bad insertions at the DB layer. `PRAGMA foreign_keys = ON` is set on every connection so `ON DELETE CASCADE` on `evaluation_id` works.
 
 ## IaC (meta-layer) semantics
 

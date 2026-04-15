@@ -83,7 +83,11 @@ fn parse_compose_services(content: &str) -> BTreeSet<String> {
         if in_services && indent == services_indent + 2 {
             if let Some(cut) = line.find(':') {
                 let name = line[..cut].trim().to_string();
-                if !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                if !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                {
                     out.insert(name);
                 }
             }
@@ -96,7 +100,14 @@ fn parse_compose_services(content: &str) -> BTreeSet<String> {
 /// `redis://redis:6379`, `http://api:3000`, etc.
 fn parse_referenced_hosts(content: &str) -> BTreeSet<String> {
     let mut out: BTreeSet<String> = Default::default();
-    for scheme in ["postgres://", "postgresql://", "mysql://", "redis://", "http://", "https://"] {
+    for scheme in [
+        "postgres://",
+        "postgresql://",
+        "mysql://",
+        "redis://",
+        "http://",
+        "https://",
+    ] {
         let mut rest = content;
         while let Some(idx) = rest.find(scheme) {
             let after = &rest[idx + scheme.len()..];
@@ -104,14 +115,18 @@ fn parse_referenced_hosts(content: &str) -> BTreeSet<String> {
             let host_start = after.find('@').map(|i| i + 1).unwrap_or(0);
             let host_slice = &after[host_start..];
             let host_end = host_slice
-                .find(|c: char| c == '/' || c == ':' || c == '?' || c == '"' || c == '\'' || c.is_whitespace())
+                .find(|c: char| {
+                    c == '/' || c == ':' || c == '?' || c == '"' || c == '\'' || c.is_whitespace()
+                })
                 .unwrap_or(host_slice.len());
             let host = &host_slice[..host_end];
             // Skip IP addresses and localhost.
             if !host.is_empty()
                 && host != "localhost"
                 && !host.chars().next().is_some_and(|c| c.is_ascii_digit())
-                && host.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
+                && host
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.')
                 && !host.contains('.')
             {
                 out.insert(host.to_string());

@@ -54,11 +54,7 @@ impl SeamCheck for VersionSkewCheck {
         let mut findings: Vec<SeamFinding> = Vec::new();
         for (name, by_version) in &versions {
             if by_version.len() > 1 {
-                let list = by_version
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let list = by_version.keys().cloned().collect::<Vec<_>>().join(", ");
                 findings.push(SeamFinding::new(format!(
                     "package '{name}' has conflicting versions across boundary: {list}"
                 )));
@@ -89,9 +85,9 @@ fn extract_cargo_deps(content: &str) -> Vec<(String, String)> {
         if let Some(eq) = line.find('=') {
             let name = line[..eq].trim().to_string();
             let value = line[eq + 1..].trim();
-            if value.starts_with('"') {
-                let end = value[1..].find('"').unwrap_or(0);
-                let version = value[1..1 + end].to_string();
+            if let Some(rest) = value.strip_prefix('"') {
+                let end = rest.find('"').unwrap_or(0);
+                let version = rest[..end].to_string();
                 if !name.is_empty() && !version.is_empty() {
                     out.push((name, version));
                 }
@@ -124,14 +120,22 @@ fn extract_json_kv(block: &str) -> Vec<(String, String)> {
     let mut rest = block;
     while let Some(start) = rest.find('"') {
         let after = &rest[start + 1..];
-        let Some(key_end) = after.find('"') else { break };
+        let Some(key_end) = after.find('"') else {
+            break;
+        };
         let key = after[..key_end].to_string();
         let after_key = &after[key_end + 1..];
-        let Some(colon) = after_key.find(':') else { break };
+        let Some(colon) = after_key.find(':') else {
+            break;
+        };
         let tail = &after_key[colon + 1..];
-        let Some(val_start) = tail.find('"') else { break };
+        let Some(val_start) = tail.find('"') else {
+            break;
+        };
         let after_val = &tail[val_start + 1..];
-        let Some(val_end) = after_val.find('"') else { break };
+        let Some(val_end) = after_val.find('"') else {
+            break;
+        };
         let value = after_val[..val_end].to_string();
         out.push((key, value));
         rest = &after_val[val_end + 1..];
@@ -177,14 +181,8 @@ mod tests {
     #[test]
     fn passes_when_versions_align() {
         let (dir, rels) = fixture(&[
-            (
-                "crates/a/Cargo.toml",
-                "[dependencies]\nserde = \"1.0\"\n",
-            ),
-            (
-                "crates/b/Cargo.toml",
-                "[dependencies]\nserde = \"1.0\"\n",
-            ),
+            ("crates/a/Cargo.toml", "[dependencies]\nserde = \"1.0\"\n"),
+            ("crates/b/Cargo.toml", "[dependencies]\nserde = \"1.0\"\n"),
         ]);
         let b = LayerBoundary::new("api", "backend");
         let ctx = SeamContext {
@@ -200,14 +198,8 @@ mod tests {
     #[test]
     fn fails_when_versions_diverge() {
         let (dir, rels) = fixture(&[
-            (
-                "crates/a/Cargo.toml",
-                "[dependencies]\nserde = \"1.0\"\n",
-            ),
-            (
-                "crates/b/Cargo.toml",
-                "[dependencies]\nserde = \"2.0\"\n",
-            ),
+            ("crates/a/Cargo.toml", "[dependencies]\nserde = \"1.0\"\n"),
+            ("crates/b/Cargo.toml", "[dependencies]\nserde = \"2.0\"\n"),
         ]);
         let b = LayerBoundary::new("api", "backend");
         let ctx = SeamContext {

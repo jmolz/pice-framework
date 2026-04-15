@@ -97,10 +97,7 @@ mod tests {
 
     #[test]
     fn warns_on_hardcoded_region() {
-        let (dir, rels) = fixture(&[(
-            "src/aws.rs",
-            r#"let region = "us-east-1";"#,
-        )]);
+        let (dir, rels) = fixture(&[("src/aws.rs", r#"let region = "us-east-1";"#)]);
         let b = LayerBoundary::new("api", "backend");
         let ctx = SeamContext {
             boundary: &b,

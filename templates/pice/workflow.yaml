@@ -47,3 +47,21 @@ review:
   timeout_hours: 24
   on_timeout: reject        # reject | approve | skip
   notification: stdout
+
+# Seam verification — per-boundary static checks. See PRDv2 § Feature 6 and
+# .claude/rules/stack-loops.md. Boundary keys use `A↔B` or `A<->B`.
+# Example:
+#
+# seams:
+#   "backend↔infrastructure":
+#     - config_mismatch
+#     - auth_handoff
+#   "backend↔database":
+#     - schema_drift
+#   "api↔frontend":
+#     - openapi_compliance
+#
+# Available check IDs (see `pice seam list`): config_mismatch, version_skew,
+# openapi_compliance, auth_handoff, cascade_timeout, retry_storm,
+# service_discovery, health_check, schema_drift, cold_start_order,
+# network_topology, resource_exhaustion.

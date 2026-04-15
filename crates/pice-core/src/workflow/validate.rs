@@ -818,14 +818,8 @@ mod tests {
         // BTreeMap iteration is alphabetical — `backend↔frontend` comes
         // before `frontend↔backend`. The second (inverted) key should
         // surface as the duplicate error.
-        seams.insert(
-            "backend↔frontend".into(),
-            vec!["config_mismatch".into()],
-        );
-        seams.insert(
-            "frontend↔backend".into(),
-            vec!["config_mismatch".into()],
-        );
+        seams.insert("backend↔frontend".into(), vec!["config_mismatch".into()]);
+        seams.insert("frontend↔backend".into(), vec!["config_mismatch".into()]);
         cfg.seams = Some(seams);
         let report = validate_seams(&cfg, &sample_layers(), &sample_registry());
         assert!(!report.is_ok());

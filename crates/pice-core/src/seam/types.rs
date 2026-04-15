@@ -378,7 +378,10 @@ mod tests {
         };
         let json = serde_json::to_string(&spec).unwrap();
         // args = None must be omitted from the wire form.
-        assert!(!json.contains("args"), "None args should be skipped: {json}");
+        assert!(
+            !json.contains("args"),
+            "None args should be skipped: {json}"
+        );
         let back: SeamCheckSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
     }

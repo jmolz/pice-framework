@@ -27,7 +27,8 @@ impl SeamCheck for RetryStormCheck {
             let Ok(content) = std::fs::read_to_string(&full) else {
                 continue;
             };
-            for (key, value) in scan_numeric(&content, &["retries", "max_attempts", "retry_count"]) {
+            for (key, value) in scan_numeric(&content, &["retries", "max_attempts", "retry_count"])
+            {
                 if value > MAX_SAFE_RETRIES {
                     findings.push(
                         SeamFinding::new(format!(

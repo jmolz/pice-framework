@@ -97,52 +97,105 @@ pub async fn run(
         let manifest =
             crate::orchestrator::stack_loops::run_stack_loops(&stack_cfg, sink, req.json).await?;
 
-        // Format and return results from manifest
-        if req.json {
-            return Ok(CommandResponse::Json {
-                value: serde_json::to_value(&manifest)?,
-            });
-        } else {
-            let mut output = format!(
-                "\nStack Loops Evaluation — {} layers\n",
-                manifest.layers.len()
-            );
-            output.push_str(&"=".repeat(39));
-            output.push('\n');
-            for lr in &manifest.layers {
-                let status_str = match lr.status {
-                    pice_core::layers::manifest::LayerStatus::Passed => "PASS",
-                    pice_core::layers::manifest::LayerStatus::Failed => "FAIL",
-                    pice_core::layers::manifest::LayerStatus::Pending => "PENDING",
-                    pice_core::layers::manifest::LayerStatus::InProgress => "IN-PROGRESS",
-                    pice_core::layers::manifest::LayerStatus::Skipped => "SKIP",
-                };
-                let detail = lr
-                    .halted_by
-                    .as_ref()
-                    .map(|r| format!(" — {r}"))
-                    .unwrap_or_default();
-                output.push_str(&format!("  [{status_str}] {}{detail}\n", lr.name));
-            }
-            let overall = match manifest.overall_status {
-                pice_core::layers::manifest::ManifestStatus::Passed => "PASS",
-                pice_core::layers::manifest::ManifestStatus::InProgress => "IN-PROGRESS",
-                _ => "FAIL",
-            };
-            output.push_str(&format!("\nOverall: {overall}\n"));
+        // Seam-aware exit code: if any layer is Failed (including via a
+        // seam finding), we exit 2. Overall status being InProgress from
+        // Phase 1 (provider not wired) is NOT a failure — exit 0.
+        use pice_core::layers::manifest::{CheckStatus, LayerStatus, ManifestStatus};
+        let any_failed_layer = manifest
+            .layers
+            .iter()
+            .any(|l| l.status == LayerStatus::Failed);
+        let total_seam_checks: usize = manifest.layers.iter().map(|l| l.seam_checks.len()).sum();
+        let failed_seam_checks: usize = manifest
+            .layers
+            .iter()
+            .flat_map(|l| l.seam_checks.iter())
+            .filter(|c| c.status == CheckStatus::Failed)
+            .count();
 
-            if matches!(
-                manifest.overall_status,
-                pice_core::layers::manifest::ManifestStatus::Passed
-            ) {
-                return Ok(CommandResponse::Text { content: output });
-            } else {
-                return Ok(CommandResponse::Exit {
-                    code: 2,
-                    message: output,
-                });
+        // Format and return results from manifest.
+        if req.json {
+            let value = serde_json::to_value(&manifest)?;
+            if any_failed_layer {
+                // Structured JSON-mode failure — `ExitJson` routes to stdout
+                // with exit 2. See `.claude/rules/daemon.md` → "Structured
+                // JSON failure responses".
+                return Ok(CommandResponse::ExitJson { code: 2, value });
+            }
+            return Ok(CommandResponse::Json { value });
+        }
+
+        let mut output = format!(
+            "\nStack Loops Evaluation — {} layers\n",
+            manifest.layers.len()
+        );
+        output.push_str(&"=".repeat(39));
+        output.push('\n');
+        for lr in &manifest.layers {
+            let status_str = match lr.status {
+                LayerStatus::Passed => "PASS",
+                LayerStatus::Failed => "FAIL",
+                LayerStatus::Pending => "PENDING",
+                LayerStatus::InProgress => "IN-PROGRESS",
+                LayerStatus::Skipped => "SKIP",
+            };
+            let detail = lr
+                .halted_by
+                .as_ref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default();
+            output.push_str(&format!("  [{status_str}] {}{detail}\n", lr.name));
+
+            if !lr.seam_checks.is_empty() {
+                let passed = lr
+                    .seam_checks
+                    .iter()
+                    .filter(|c| c.status == CheckStatus::Passed)
+                    .count();
+                output.push_str(&format!(
+                    "    seam: {}/{} passed\n",
+                    passed,
+                    lr.seam_checks.len()
+                ));
+                for c in &lr.seam_checks {
+                    if c.status == CheckStatus::Failed {
+                        let details = c.details.as_deref().unwrap_or("");
+                        output.push_str(&format!(
+                            "      ✗ {} ({}): {}\n",
+                            c.name, c.boundary, details
+                        ));
+                    } else if c.status == CheckStatus::Warning {
+                        let details = c.details.as_deref().unwrap_or("");
+                        output.push_str(&format!(
+                            "      ! {} ({}): {}\n",
+                            c.name, c.boundary, details
+                        ));
+                    }
+                }
             }
         }
+        if total_seam_checks > 0 {
+            output.push_str(&format!(
+                "\nSeam checks: {}/{} passed ({} failed)\n",
+                total_seam_checks - failed_seam_checks,
+                total_seam_checks,
+                failed_seam_checks
+            ));
+        }
+        let overall = match manifest.overall_status {
+            ManifestStatus::Passed => "PASS",
+            ManifestStatus::InProgress => "IN-PROGRESS",
+            _ => "FAIL",
+        };
+        output.push_str(&format!("\nOverall: {overall}\n"));
+
+        if any_failed_layer {
+            return Ok(CommandResponse::Exit {
+                code: 2,
+                message: output,
+            });
+        }
+        return Ok(CommandResponse::Text { content: output });
     }
 
     // v0.1: Single-loop evaluation (existing code below)

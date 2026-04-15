@@ -529,7 +529,10 @@ mod tests {
             details: None,
         };
         let json = serde_json::to_string(&result).unwrap();
-        assert!(!json.contains("category"), "None category should be skipped: {json}");
+        assert!(
+            !json.contains("category"),
+            "None category should be skipped: {json}"
+        );
     }
 
     #[test]
