@@ -110,6 +110,11 @@ pub enum ExitJsonStatus {
     /// registry validator (unknown check id or applies_to mismatch in a
     /// boundary declared by layers.toml).
     MergedSeamValidationFailed,
+    /// `pice evaluate <plan> --json` — evaluation ran to completion but at
+    /// least one layer finished in `Failed` status (SPRT reject, ADTS
+    /// exhaustion, or a failed seam check). Phase 4 contract criterion #11
+    /// (CLI exit-code routing) locks this wire form.
+    EvaluationFailed,
 }
 
 impl ExitJsonStatus {
@@ -124,6 +129,7 @@ impl ExitJsonStatus {
             Self::WorkflowValidationFailed => "workflow-validation-failed",
             Self::SeamFloorViolation => "seam-floor-violation",
             Self::MergedSeamValidationFailed => "merged-seam-validation-failed",
+            Self::EvaluationFailed => "evaluation-failed",
         }
     }
 }
@@ -584,6 +590,7 @@ mod tests {
             ExitJsonStatus::WorkflowValidationFailed,
             ExitJsonStatus::SeamFloorViolation,
             ExitJsonStatus::MergedSeamValidationFailed,
+            ExitJsonStatus::EvaluationFailed,
         ];
         for variant in &all_variants {
             let serde_output = serde_json::to_string(variant).unwrap();

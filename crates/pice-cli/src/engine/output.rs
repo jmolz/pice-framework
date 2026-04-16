@@ -119,6 +119,50 @@ pub fn print_evaluation_report(
     println!("\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}");
 }
 
+/// Adaptive per-layer summary surfaced by `pice status` and consumed by
+/// dashboard adapters. Mirrors the `layers[]` block written by
+/// `pice-daemon::handlers::status` so a single struct anchors the wire shape.
+///
+/// The CLI's only responsibility is to render this — the daemon owns load and
+/// aggregation. Phase 4 contract criterion #11 (CLI exit-code routing) and
+/// #15 (determinism) both depend on this shape staying byte-stable, so it is
+/// intentionally a serde-derived public type rather than ad-hoc JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AdaptiveLayerSummary {
+    pub name: String,
+    pub status: String,
+    pub passes_used: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub halted_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_usd: Option<f64>,
+}
+
+/// Render a per-layer adaptive summary as a one-line stdout string.
+///
+/// Used by adapters that surface `pice status --json` output in TTY form
+/// without re-parsing the daemon's full Unicode-box block. Keeps the field
+/// order stable: name, passes, halted_by, confidence, cost.
+pub fn format_adaptive_layer_summary(summary: &AdaptiveLayerSummary) -> String {
+    let conf = summary
+        .final_confidence
+        .map(|c| format!("conf={c:.3}"))
+        .unwrap_or_else(|| "conf=-".to_string());
+    let cost = summary
+        .total_cost_usd
+        .map(|c| format!("cost=${c:.4}"))
+        .unwrap_or_else(|| "cost=-".to_string());
+    let halted = summary.halted_by.as_deref().unwrap_or("-");
+    format!(
+        "{name} [{status}] passes={passes} halted_by={halted} {conf} {cost}",
+        name = summary.name,
+        status = summary.status,
+        passes = summary.passes_used,
+    )
+}
+
 /// Build JSON output for --json mode.
 pub fn evaluation_json(
     primary_results: &EvaluateResultParams,
@@ -229,5 +273,80 @@ mod tests {
         let result = truncate("日本語のテスト文字列です", 8);
         assert!(result.ends_with("..."));
         assert!(result.chars().count() <= 8);
+    }
+
+    #[test]
+    fn adaptive_layer_summary_roundtrips_through_json() {
+        // Phase 4 contract criterion #15 (determinism) depends on the wire
+        // shape staying stable across daemon → CLI marshaling. A roundtrip
+        // covers both `Some` and `None` for the optional fields.
+        let summary = AdaptiveLayerSummary {
+            name: "backend".to_string(),
+            status: "passed".to_string(),
+            passes_used: 3,
+            halted_by: Some("sprt_confidence_reached".to_string()),
+            final_confidence: Some(0.912),
+            total_cost_usd: Some(0.03),
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        let back: AdaptiveLayerSummary = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, "backend");
+        assert_eq!(back.passes_used, 3);
+        assert_eq!(back.halted_by.as_deref(), Some("sprt_confidence_reached"));
+        assert_eq!(back.final_confidence, Some(0.912));
+        assert_eq!(back.total_cost_usd, Some(0.03));
+    }
+
+    #[test]
+    fn adaptive_layer_summary_omits_none_fields_in_json() {
+        // Legacy (pre-Phase-4) layers must not surface spurious nulls.
+        let summary = AdaptiveLayerSummary {
+            name: "legacy".to_string(),
+            status: "passed".to_string(),
+            passes_used: 0,
+            halted_by: None,
+            final_confidence: None,
+            total_cost_usd: None,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("halted_by"), "expected halted_by omitted: {json}");
+        assert!(!json.contains("final_confidence"), "expected final_confidence omitted: {json}");
+        assert!(!json.contains("total_cost_usd"), "expected total_cost_usd omitted: {json}");
+    }
+
+    #[test]
+    fn format_adaptive_layer_summary_renders_all_fields() {
+        let summary = AdaptiveLayerSummary {
+            name: "backend".to_string(),
+            status: "passed".to_string(),
+            passes_used: 3,
+            halted_by: Some("sprt_confidence_reached".to_string()),
+            final_confidence: Some(0.912),
+            total_cost_usd: Some(0.03),
+        };
+        let line = format_adaptive_layer_summary(&summary);
+        assert!(line.contains("backend"));
+        assert!(line.contains("[passed]"));
+        assert!(line.contains("passes=3"));
+        assert!(line.contains("halted_by=sprt_confidence_reached"));
+        assert!(line.contains("conf=0.912"));
+        assert!(line.contains("cost=$0.0300"));
+    }
+
+    #[test]
+    fn format_adaptive_layer_summary_renders_dashes_when_legacy() {
+        let summary = AdaptiveLayerSummary {
+            name: "legacy".to_string(),
+            status: "passed".to_string(),
+            passes_used: 0,
+            halted_by: None,
+            final_confidence: None,
+            total_cost_usd: None,
+        };
+        let line = format_adaptive_layer_summary(&summary);
+        assert!(line.contains("legacy"));
+        assert!(line.contains("halted_by=-"));
+        assert!(line.contains("conf=-"));
+        assert!(line.contains("cost=-"));
     }
 }

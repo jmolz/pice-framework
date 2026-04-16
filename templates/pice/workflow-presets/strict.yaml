@@ -1,13 +1,19 @@
 # Preset: strict
 # Intended for safety-critical codebases where every infrastructure and
-# deployment change must be reviewed. Tier-3 everywhere, confidence ≥ 0.95.
+# deployment change must be reviewed. Tier-3 everywhere, confidence ≥ 0.96.
+#
+# Phase 4 tuning: `max_passes: 8` with `min_confidence: 0.96` pushes toward
+# the correlated-Condorcet ceiling (~0.966 — see
+# `docs/research/convergence-analysis.md`). `adts` catches claude/codex
+# divergence so the loop escalates compute (Level 2 → effort=xhigh)
+# before halting on disagreement.
 
 schema_version: "0.2"
 
 defaults:
   tier: 3
-  min_confidence: 0.95
-  max_passes: 10
+  min_confidence: 0.96
+  max_passes: 8
   model: opus
   budget_usd: 1.50
   cost_cap_behavior: halt

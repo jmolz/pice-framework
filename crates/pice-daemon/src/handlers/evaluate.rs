@@ -455,8 +455,21 @@ pub async fn run(
 
         // Format and return results from manifest.
         if req.json {
-            let value = serde_json::to_value(&manifest)?;
+            let mut value = serde_json::to_value(&manifest)?;
             if any_failed_layer {
+                // Phase 4 contract criterion #11: inject the typed status
+                // discriminant so CLI-boundary tests can pattern-match on
+                // `ExitJsonStatus::EvaluationFailed.as_str()` rather than
+                // a literal wire string. The manifest fields remain
+                // top-level for backwards compatibility with existing
+                // exit-2 fixture consumers (e.g. `evaluate_integration.rs`
+                // reads `json["layers"]` directly).
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(
+                        "status".to_string(),
+                        serde_json::json!(ExitJsonStatus::EvaluationFailed.as_str()),
+                    );
+                }
                 // Structured JSON-mode failure — `ExitJson` routes to stdout
                 // with exit 2. See `.claude/rules/daemon.md` → "Structured
                 // JSON failure responses".

@@ -36,6 +36,23 @@ phases:
     seam_checks: true
     adaptive_algorithm: bayesian_sprt   # bayesian_sprt | adts | vec | none
     # model_override: {}               # map of layer name -> model name
+    #
+    # Adaptive algorithm tuning (Phase 4) — uncomment to override defaults.
+    # All values are PRDv2:1156–1165 baselines; the embedded defaults are
+    # already correct for most teams.
+    #
+    # sprt:
+    #   prior_alpha: 1.0          # Beta(α, β) prior; Beta(1,1) = uniform
+    #   prior_beta: 1.0
+    #   accept_threshold: 19.0    # ≈95% target — A in Wald's SPRT
+    #   reject_threshold: 0.053   # 1/19 — B in Wald's SPRT
+    #
+    # adts:
+    #   divergence_threshold: 2.0           # |claude − codex| on 0–10 scale
+    #   max_divergence_escalations: 2       # Level1 + Level2 then Exhaust
+    #
+    # vec:
+    #   entropy_floor: 0.01       # halt when ΔH per pass < this many bits
 
 # Per-layer overrides. Empty by default — projects opt in.
 layer_overrides: {}

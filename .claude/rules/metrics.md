@@ -172,6 +172,40 @@ CREATE TABLE seam_findings (
 
 These tables are populated by the daemon. The CLI reads from them for `pice status` and `pice metrics`. Dashboard (v0.3) reads the same tables.
 
+## v0.4+ Adaptive Evaluation
+
+Phase 4 adds the `pass_events` table (one row per provider invocation) and five new columns on `evaluations` (post-loop adaptive summary). Schema migrations are guarded by `PRAGMA table_info` so they're idempotent across daemon restarts.
+
+```sql
+-- New columns added to existing evaluations table
+ALTER TABLE evaluations ADD COLUMN passes_used         INTEGER;
+ALTER TABLE evaluations ADD COLUMN halted_by           TEXT;
+ALTER TABLE evaluations ADD COLUMN adaptive_algorithm  TEXT;
+ALTER TABLE evaluations ADD COLUMN final_confidence    REAL;
+ALTER TABLE evaluations ADD COLUMN final_total_cost_usd REAL;
+
+-- New table: per-pass audit trail
+CREATE TABLE pass_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id INTEGER NOT NULL,
+    pass_index INTEGER NOT NULL,            -- 1-indexed within the layer's loop
+    model TEXT NOT NULL,                    -- "stub-echo" | "claude-opus-4-7" | ...
+    score REAL,                             -- nullable: provider may not score
+    cost_usd REAL,                          -- nullable: provider may omit cost
+    timestamp TEXT NOT NULL,                -- ISO 8601
+    FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE
+);
+```
+
+### Write-path invariants
+
+- **Header insert before the loop, finalize after.** `insert_evaluation_header` writes a placeholder row with `passed=0, summary=NULL` so the adaptive loop has a valid `evaluation_id` to FK-attach pass_events to. `finalize_evaluation` rewrites `passed` and `summary` after the loop returns.
+- **`pass_events` writes happen BEFORE the halt-decision check.** A budget-halted loop still records the triggering pass cost. Skipping this would silently undercount on every budget halt.
+- **`update_evaluation_adaptive_summary` aggregates across layers.** `passes_used = SUM(layer.passes.len())`, `final_total_cost_usd = SUM(layer.total_cost_usd)` (so `evaluations.final_total_cost_usd` matches `SUM(pass_events.cost_usd)` per evaluation_id within 1e-9).
+- **`MetricsDb` is `!Sync`.** The rusqlite Connection's prepared-statement cache uses `RefCell`. The daemon wraps it in `Arc<Mutex<MetricsDb>>` so the per-pass sink can stay `Send` across the orchestrator's `await`. No contention because the sink is the only writer during the loop.
+- **`PRAGMA foreign_keys = ON` is set on every connection.** Required for `ON DELETE CASCADE` to fire when an evaluation row is deleted (e.g., during retention-policy GC).
+- **Concurrent isolation.** Two concurrent evaluations on different features write to disjoint `evaluation_id` groups in the same DB. There is no shared lock between evaluations beyond per-DB serialization (Phase 4 contract criterion #17).
+
 ## v0.5 Predictive Selection Data
 
 When v0.5 ships, `check_outcomes` captures the label needed for model training:

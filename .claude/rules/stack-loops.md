@@ -180,3 +180,17 @@ Contracts distinguish:
 - `retry.fresh_context: true` (default) destroys and recreates the provider session between attempts — never reuse context from a failed attempt, it biases the retry
 - Retries consume the layer's budget
 - Exceeding max_attempts → layer marked `failed` → feature halts unless workflow allows proceeding (e.g., when evaluating always-run layers after an upstream failure)
+
+## Adaptive pass loop invariants (v0.4 / Phase 4)
+
+These are codified in `crates/pice-daemon/src/orchestrator/adaptive_loop.rs` and enforced by tests in `crates/pice-daemon/tests/adaptive_integration.rs`.
+
+- **Sink writes happen BEFORE the halt decision.** A budget-halted loop still persists the triggering pass cost. Without this invariant, `SUM(pass_events.cost_usd)` would silently undercount on every budget halt — breaking cost reconciliation (Phase 4 contract criterion #16).
+- **`next_*_params` reset after non-ADTS verdicts.** ADTS flags (`fresh_context`, `effort=xhigh`) apply to the immediately following pass only. A `Continue` verdict rolls them back to the project baseline. Missing this causes "escalation bleed" — flags from a Level-1 pass leak into subsequent passes that should run at baseline.
+- **`escalation_events` only populated for ADTS.** SPRT, VEC, and None never emit level transitions. `LayerResult.escalation_events` is `None` for those algorithms — never `Some(vec![])` — so legacy manifest readers don't see a spurious empty array.
+- **Confidence ceiling (~96.6%) enforced in `decide_halt`.** No reported confidence ever exceeds `CONFIDENCE_CEILING` (Phase 4 contract criterion #1). The cap applies even on budget-halted loops with 100+ consecutive successes — `posterior_mean_capped` enforces it before the value reaches the manifest.
+- **`run_adts` exhaustion is the ONLY halt that bypasses `decide_halt`.** All other halt reasons (SPRT accept/reject, VEC entropy, budget, max_passes) flow through the universal dispatcher. ADTS Level 3 exhaustion is the orchestrator's concern — the pure-functional `decide_halt` does not know about adversarial divergence.
+- **Per-pass context isolation extends Phase 3's per-layer rule.** Each pass's `evaluate/create` payload is byte-identical for a given layer across `pass_index = 1..N`. Prior-pass scores or findings are NEVER replayed into subsequent passes. Re-creating the provider session per pass enforces this at the protocol layer; verified by Phase 4 contract criterion #11.
+- **`AdaptiveAlgo::None` respects budget AND max_passes.** None disables algorithm-driven halting but the universal guardrails still apply. A user who truly wants unbounded evaluation must raise `budget_usd` explicitly — there is no escape hatch.
+- **Cold-start budget seed is `budget_usd / max_passes`.** When `CostStats` has zero observations, the projection falls back to this seed. A tight budget where the seed alone exceeds remaining capacity halts the loop on the pre-pass-1 check — see `cold_start_seed_blocks_overspend_on_pass_one` integration test.
+- **Determinism is a first-class invariant.** Two back-to-back evaluations with identical `PICE_STUB_SCORES`, plan, and workflow produce byte-identical `passes[].index/score/cost_usd`, `halted_by`, `final_confidence`, `total_cost_usd`, `escalation_events`. Only `passes[].timestamp` and `evaluations.timestamp` may differ. Any non-deterministic source (HashMap iteration order, unsynchronized parallel ordering for ADTS `tokio::join!`) breaks contract criterion #15.

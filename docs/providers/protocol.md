@@ -165,6 +165,9 @@ Create an evaluation session. Evaluation sessions are context-isolated -- they r
 | `model` | `string` | No | Model override |
 | `effort` | `string` | No | Effort level (e.g., `"high"`, `"xhigh"`) |
 | `seamChecks` | `SeamCheckSpec[]` | No | Seam checks to run for this layer's boundaries (v0.2+) |
+| `passIndex` | `number` | No | 1-indexed pass number within the adaptive loop (v0.4+) |
+| `freshContext` | `boolean` | No | Recreate provider session, drop prior conversation (ADTS Level 1+, v0.4+) |
+| `effortOverride` | `string` | No | Per-pass effort override (e.g. `"xhigh"` for ADTS Level 2, v0.4+) |
 
 Each `SeamCheckSpec` is `{ id: string, boundary?: string, args?: object }`.
 Providers that don't declare `seamChecks` capability should ignore this
@@ -172,7 +175,12 @@ field; the daemon runs seam checks in-process using its built-in registry
 when the provider omits support. See [Seam Verification](../methodology/evaluate.md#seam-verification-v02)
 and [Authoring Seam Checks](../guides/authoring-seam-checks.md).
 
-**Result:** `{ sessionId: string }`
+**Result:** `{ sessionId: string, costUsd?: number, confidence?: number }`
+
+Cost and confidence (v0.4+) are optional self-reports from the provider.
+The daemon uses `costUsd` for budget enforcement and `confidence` for
+adaptive halting. Providers without cost telemetry should omit these
+fields — the daemon falls back to its own posterior estimate.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"evaluate/create","params":{"contract":{"criteria":[{"name":"Tests pass","threshold":7},{"name":"No unwrap in lib","threshold":8}]},"diff":"+fn new_feature() -> Result<()> {\n+    Ok(())\n+}","claudeMd":"# Rules\n- Never unwrap in lib code"}}

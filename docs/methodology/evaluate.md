@@ -239,6 +239,96 @@ error messages.
 See [Authoring Seam Checks](../guides/authoring-seam-checks.md) for
 writing your own.
 
+## Adaptive Evaluation (v0.4 / Phase 4)
+
+Stack Loops grade per layer in repeated **passes**. Adaptive evaluation
+governs how many passes run and when to stop, balancing confidence against
+cost. Configure per layer in `.pice/workflow.yaml`:
+
+```yaml
+defaults:
+  min_confidence: 0.90
+  max_passes: 5
+  budget_usd: 2.00
+
+phases:
+  evaluate:
+    adaptive_algorithm: bayesian_sprt   # bayesian_sprt | adts | vec | none
+```
+
+### Algorithms
+
+- **`bayesian_sprt`** (default) — Bayesian Sequential Probability Ratio Test.
+  Updates a `Beta(α, β)` posterior over "the contract is met" after each
+  pass. Halts when the log-likelihood ratio crosses Wald's `A` (accept) or
+  `B` (reject). Sample-efficient when scores are confidently high or low.
+- **`adts`** — Adversarial Divergence-Triggered Scaling. Runs primary +
+  adversarial each pass; on disagreement (> `divergence_threshold`),
+  schedules an extra pass with `fresh_context=true` (Level 1) → then
+  `effort=xhigh` (Level 2) → then halts with `adts_escalation_exhausted`
+  (Level 3). Catches "both confident, both wrong" scenarios.
+- **`vec`** — Verification Entropy Convergence. Halts when the marginal
+  entropy reduction of the posterior drops below `entropy_floor`
+  (default 0.01 bits). Useful when the posterior is neither strongly
+  accepted nor rejected — additional passes provide negligible information.
+- **`none`** — disable algorithm-driven halting. The loop still respects
+  the universal guardrails (budget, max_passes) — there is no escape
+  hatch for unbounded evaluation.
+
+### Confidence ceiling
+
+For dual-model correlated evaluators (`ρ ≈ 0.35` between Claude and Codex),
+reported confidence never exceeds **~96.6%**. This is a derivation of the
+correlated Condorcet Jury Theorem (Kim et al., ICML 2025; full proof in
+`docs/research/convergence-analysis.md`). Adaptive algorithms halt at the
+target — they do not pretend more passes breach the ceiling.
+
+| Passes | Effective N | Confidence |
+|--------|-------------|------------|
+| 1      | 1.00        | 88.0%      |
+| 3      | 1.87        | 94.0%      |
+| 5      | 2.27        | 95.4%      |
+| 10     | 2.63        | 96.2%      |
+| ∞      | 2.86        | ~96.6%     |
+
+### `halted_by` field
+
+Each layer's `LayerResult.halted_by` records why the loop stopped. The wire
+form (string) is one of:
+
+| `halted_by`                  | Resulting `LayerStatus` | Exit code |
+|------------------------------|-------------------------|-----------|
+| `sprt_confidence_reached`    | `Passed`                | 0         |
+| `vec_entropy`                | `Passed`                | 0         |
+| `sprt_rejected`              | `Failed`                | 2         |
+| `adts_escalation_exhausted`  | `Failed`                | 2         |
+| `budget`                     | `Pending` (re-run)      | 0         |
+| `max_passes`                 | `Pending` (re-run)      | 0         |
+| `seam:<check-id>`            | `Failed`                | 2         |
+
+Pending is intentionally distinct from Failed — a budget halt is "not done
+yet," not a contract violation. Re-run with a higher budget when ready.
+
+### Per-pass audit trail
+
+Every provider invocation writes one row to the SQLite `pass_events` table
+(`evaluation_id`, `pass_index`, `model`, `score`, `cost_usd`, `timestamp`)
+BEFORE the halt decision runs. A budget-halted loop still records the
+triggering pass cost — required for cost reconciliation
+(`SUM(pass_events.cost_usd) ≈ evaluations.final_total_cost_usd`
+within 1e-9).
+
+ADTS additionally writes the level transitions to
+`LayerResult.escalation_events`:
+
+```json
+"escalation_events": [
+  { "Level1FreshContext":   { "at_pass": 1 } },
+  { "Level2ElevatedEffort": { "at_pass": 2 } },
+  { "Level3Exhausted":      { "at_pass": 3 } }
+]
+```
+
 ## Further Reading
 
 - [PICE Overview](overview.md) -- The full lifecycle
