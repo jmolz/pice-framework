@@ -432,7 +432,7 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     expect(parsed.category).toBe(1);
   });
 
-  it('SeamCheckResult roundtrips a Passed payload with null category', () => {
+  it('SeamCheckResult roundtrips a payload with null category', () => {
     // Unregistered-check synthetic rows carry a null category.
     const result: SeamCheckResult = {
       name: 'unknown_check',
@@ -444,6 +444,19 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     const json = JSON.stringify(result);
     const parsed: SeamCheckResult = JSON.parse(json);
     expect(parsed.category).toBeNull();
+  });
+
+  it('SeamCheckResult without category key matches Rust skip_serializing_if shape', () => {
+    // Phase 3 round-5 adversarial review fix: Rust uses
+    // `#[serde(skip_serializing_if = "Option::is_none")]` on `category`,
+    // so when category is None the key is OMITTED, not set to null.
+    // TS must parse both shapes — key-omitted (Rust wire) and explicit
+    // null (TS-side construction). This test validates key-omitted parsing.
+    const rustWireShape = '{"name":"unknown","status":"failed","boundary":"a↔b","details":"msg"}';
+    const parsed: SeamCheckResult = JSON.parse(rustWireShape);
+    expect(parsed.name).toBe('unknown');
+    expect(parsed.status).toBe('failed');
+    expect(parsed.category).toBeUndefined();
   });
 
   it('error codes match between TS and Rust', () => {

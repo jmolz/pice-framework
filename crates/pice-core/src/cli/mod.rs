@@ -569,4 +569,30 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
+
+    /// Phase 3 round-5 adversarial review fix: lock `ExitJsonStatus::as_str()`
+    /// to the serde `rename_all = "kebab-case"` output. The handler emits via
+    /// `as_str()` directly (bypassing serde), so the two paths can silently
+    /// drift. This test fails on mismatch, forcing future variant renames to
+    /// update BOTH the serde derive AND the `as_str()` match arm.
+    #[test]
+    fn exit_json_status_as_str_matches_serde_kebab_case() {
+        let all_variants = [
+            ExitJsonStatus::PlanNotFound,
+            ExitJsonStatus::PlanParseFailed,
+            ExitJsonStatus::NoContractSection,
+            ExitJsonStatus::WorkflowValidationFailed,
+            ExitJsonStatus::SeamFloorViolation,
+            ExitJsonStatus::MergedSeamValidationFailed,
+        ];
+        for variant in &all_variants {
+            let serde_output = serde_json::to_string(variant).unwrap();
+            let expected = format!("\"{}\"", variant.as_str());
+            assert_eq!(
+                serde_output, expected,
+                "ExitJsonStatus::{variant:?} — serde output {serde_output} != as_str() {expected}; \
+                 update the as_str() match arm or the serde rename to stay in sync"
+            );
+        }
+    }
 }
