@@ -141,6 +141,186 @@ pub fn insert_seam_finding(
     Ok(db.conn().last_insert_rowid())
 }
 
+/// Insert an evaluation header with placeholder values for fields that are
+/// only known after the adaptive loop completes. Returns the new row id so
+/// the caller can attach `pass_events`, `seam_findings`, and (later)
+/// finalize the adaptive summary via [`finalize_evaluation`].
+///
+/// The `passed` column is seeded to 0 and `summary` to NULL — both are
+/// rewritten in `finalize_evaluation`. This split lets the adaptive loop
+/// write per-pass rows BEFORE the loop halts (the crash-safety invariant
+/// called out in the Phase 4 plan).
+#[allow(clippy::too_many_arguments)]
+pub fn insert_evaluation_header(
+    db: &MetricsDb,
+    plan_path: &str,
+    feature_name: &str,
+    tier: u8,
+    primary_provider: &str,
+    primary_model: &str,
+    adversarial_provider: Option<&str>,
+    adversarial_model: Option<&str>,
+) -> Result<i64> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    db.conn()
+        .execute(
+            "INSERT INTO evaluations (plan_path, feature_name, tier, passed, \
+             primary_provider, primary_model, adversarial_provider, adversarial_model, \
+             summary, timestamp) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, NULL, ?8)",
+            rusqlite::params![
+                plan_path,
+                feature_name,
+                tier,
+                primary_provider,
+                primary_model,
+                adversarial_provider,
+                adversarial_model,
+                timestamp,
+            ],
+        )
+        .context("failed to insert evaluation header")?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+/// Update an evaluation row with the final `passed` verdict and summary
+/// string. Called after the adaptive loop completes. This UPDATE is separate
+/// from [`update_evaluation_adaptive_summary`] because the existing non-
+/// adaptive path in `handlers/evaluate.rs` still uses [`record_evaluation`]
+/// and neither call path should pay for columns it doesn't need.
+pub fn finalize_evaluation(
+    db: &MetricsDb,
+    evaluation_id: i64,
+    passed: bool,
+    summary: Option<&str>,
+) -> Result<()> {
+    db.conn()
+        .execute(
+            "UPDATE evaluations SET passed = ?1, summary = ?2 WHERE id = ?3",
+            rusqlite::params![passed as i32, summary, evaluation_id],
+        )
+        .context("failed to finalize evaluation")?;
+    Ok(())
+}
+
+/// A single pass event row to insert. Mirrors the `pass_events` table
+/// schema from the v3 migration.
+#[derive(Debug, Clone)]
+pub struct PassEventRow<'a> {
+    pub pass_index: u32,
+    pub model: &'a str,
+    pub score: Option<f64>,
+    pub cost_usd: Option<f64>,
+}
+
+/// [`PassMetricsSink`] implementation that writes to SQLite. Errors are
+/// logged via `tracing` and do not abort the adaptive loop — metrics
+/// failures must never crash the CLI per the daemon rules.
+///
+/// Owns an `Arc<Mutex<MetricsDb>>` so the future holding the sink across
+/// await points is `Send`. `MetricsDb` wraps a rusqlite `Connection` whose
+/// prepared-statement cache contains `RefCell` — making it `!Sync`, so
+/// holding `&MetricsDb` across an await inside a `tokio::spawn`'d task
+/// won't compile. The mutex keeps the handle thread-safe while remaining
+/// lock-free for the single sequential caller.
+///
+/// [`PassMetricsSink`]: crate::orchestrator::PassMetricsSink
+pub struct DbBackedPassSink {
+    pub db: std::sync::Arc<std::sync::Mutex<MetricsDb>>,
+    pub evaluation_id: i64,
+}
+
+impl crate::orchestrator::PassMetricsSink for DbBackedPassSink {
+    fn record_pass(
+        &mut self,
+        pass_index: u32,
+        model: &str,
+        score: Option<f64>,
+        cost_usd: Option<f64>,
+    ) {
+        let row = PassEventRow {
+            pass_index,
+            model,
+            score,
+            cost_usd,
+        };
+        let guard = self.db.lock().expect("metrics DB mutex poisoned");
+        if let Err(e) = insert_pass_event(&guard, self.evaluation_id, &row) {
+            tracing::warn!(
+                evaluation_id = self.evaluation_id,
+                pass_index,
+                model,
+                "failed to persist pass_event: {e}"
+            );
+        }
+    }
+}
+
+/// Insert a pass event attached to the given evaluation. Returns the new row
+/// id. Called by the adaptive loop BEFORE the halt-decision check for pass
+/// `pass_index` — this guarantees budget-halted passes still have their
+/// triggering cost persisted. The caller passes the evaluation id returned
+/// by `record_evaluation` or by a prior `insert_pass_event`.
+pub fn insert_pass_event(
+    db: &MetricsDb,
+    evaluation_id: i64,
+    event: &PassEventRow<'_>,
+) -> Result<i64> {
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    db.conn()
+        .execute(
+            "INSERT INTO pass_events (evaluation_id, pass_index, model, score, cost_usd, timestamp) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                evaluation_id,
+                event.pass_index,
+                event.model,
+                event.score,
+                event.cost_usd,
+                timestamp,
+            ],
+        )
+        .context("failed to insert pass event")?;
+    Ok(db.conn().last_insert_rowid())
+}
+
+/// Populate the adaptive summary columns on an existing `evaluations` row.
+/// Called at the end of the adaptive loop once the per-layer outcome is
+/// known. `adaptive_algorithm` is the snake_case wire form of the enum
+/// variant (e.g. `"bayesian_sprt"`, `"none"`); `halted_by` is the
+/// [`pice_core::adaptive::HaltReason`] wire form or a seam-prefixed string
+/// (e.g. `"seam:config_mismatch"`).
+#[allow(clippy::too_many_arguments)]
+pub fn update_evaluation_adaptive_summary(
+    db: &MetricsDb,
+    evaluation_id: i64,
+    passes_used: u32,
+    halted_by: Option<&str>,
+    adaptive_algorithm: Option<&str>,
+    final_confidence: Option<f64>,
+    final_total_cost_usd: Option<f64>,
+) -> Result<()> {
+    db.conn()
+        .execute(
+            "UPDATE evaluations SET \
+                passes_used = ?1, \
+                halted_by = ?2, \
+                adaptive_algorithm = ?3, \
+                final_confidence = ?4, \
+                final_total_cost_usd = ?5 \
+             WHERE id = ?6",
+            rusqlite::params![
+                passes_used,
+                halted_by,
+                adaptive_algorithm,
+                final_confidence,
+                final_total_cost_usd,
+                evaluation_id,
+            ],
+        )
+        .context("failed to update evaluation adaptive summary")?;
+    Ok(())
+}
+
 /// Record a lifecycle event (plan_created, execute_started, etc.).
 pub fn record_loop_event(
     db: &MetricsDb,
@@ -434,6 +614,220 @@ mod tests {
         let db = test_db();
         let pending = get_pending_telemetry(&db, 10).unwrap();
         assert!(pending.is_empty());
+    }
+
+    // ─── Phase 4 pass_events & adaptive summary tests ─────────────────
+
+    /// Insert a pass event and read it back through a raw SELECT. Proves the
+    /// column mapping matches and NULLable fields round-trip correctly.
+    #[test]
+    fn pass_event_insert_and_read_roundtrip() {
+        let db = test_db();
+        let scores = vec![CriterionScore {
+            name: "t".to_string(),
+            score: 8,
+            threshold: 7,
+            passed: true,
+            findings: None,
+        }];
+        let eval_id = record_evaluation(
+            &db,
+            "plan.md",
+            "feature",
+            2,
+            true,
+            "claude-code",
+            "opus",
+            None,
+            None,
+            None,
+            &scores,
+        )
+        .unwrap();
+
+        let row_id = insert_pass_event(
+            &db,
+            eval_id,
+            &PassEventRow {
+                pass_index: 1,
+                model: "claude-sonnet-4",
+                score: Some(9.25),
+                cost_usd: Some(0.0123),
+            },
+        )
+        .unwrap();
+        assert!(row_id > 0);
+
+        let (evid, pi, model, score, cost): (i64, i64, String, f64, f64) = db
+            .conn()
+            .query_row(
+                "SELECT evaluation_id, pass_index, model, score, cost_usd \
+                 FROM pass_events WHERE id = ?",
+                rusqlite::params![row_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(evid, eval_id);
+        assert_eq!(pi, 1);
+        assert_eq!(model, "claude-sonnet-4");
+        assert!((score - 9.25).abs() < 1e-12);
+        assert!((cost - 0.0123).abs() < 1e-12);
+    }
+
+    /// NULL score + NULL cost must round-trip without type coercion errors.
+    #[test]
+    fn pass_event_null_score_and_cost_roundtrip() {
+        let db = test_db();
+        let scores = vec![CriterionScore {
+            name: "t".to_string(),
+            score: 8,
+            threshold: 7,
+            passed: true,
+            findings: None,
+        }];
+        let eval_id = record_evaluation(
+            &db, "p.md", "f", 1, true, "x", "y", None, None, None, &scores,
+        )
+        .unwrap();
+        insert_pass_event(
+            &db,
+            eval_id,
+            &PassEventRow {
+                pass_index: 1,
+                model: "m",
+                score: None,
+                cost_usd: None,
+            },
+        )
+        .unwrap();
+
+        let (score, cost): (Option<f64>, Option<f64>) = db
+            .conn()
+            .query_row(
+                "SELECT score, cost_usd FROM pass_events WHERE evaluation_id = ?",
+                rusqlite::params![eval_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(score.is_none());
+        assert!(cost.is_none());
+    }
+
+    /// Deleting an evaluation cascades to pass_events via FK.
+    ///
+    /// Uses a raw SQL insert (not `record_evaluation`) because
+    /// `criteria_scores.evaluation_id` is a plain FK without CASCADE — a
+    /// future v3 migration could add cascade there too, but for now we
+    /// exercise the pass_events cascade in isolation.
+    #[test]
+    fn pass_events_cascade_delete() {
+        let db = test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO evaluations (plan_path, feature_name, tier, passed, \
+                 primary_provider, primary_model, timestamp) \
+                 VALUES ('p.md', 'f', 1, 1, 'x', 'y', 't')",
+                [],
+            )
+            .unwrap();
+        let eval_id = db.conn().last_insert_rowid();
+        for i in 1..=3 {
+            insert_pass_event(
+                &db,
+                eval_id,
+                &PassEventRow {
+                    pass_index: i,
+                    model: "m",
+                    score: Some(f64::from(i) + 5.0),
+                    cost_usd: Some(0.01),
+                },
+            )
+            .unwrap();
+        }
+        let before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pass_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 3);
+
+        db.conn()
+            .execute(
+                "DELETE FROM evaluations WHERE id = ?",
+                rusqlite::params![eval_id],
+            )
+            .unwrap();
+        let after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pass_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "FK cascade should clear pass_events");
+    }
+
+    /// Updating the adaptive summary columns on a known evaluation. Default
+    /// columns are NULL until this runs.
+    #[test]
+    fn update_evaluation_adaptive_summary_populates_columns() {
+        let db = test_db();
+        let scores = vec![CriterionScore {
+            name: "t".to_string(),
+            score: 8,
+            threshold: 7,
+            passed: true,
+            findings: None,
+        }];
+        let eval_id = record_evaluation(
+            &db, "p.md", "f", 2, true, "x", "y", None, None, None, &scores,
+        )
+        .unwrap();
+
+        // Before the update, all adaptive columns should be NULL.
+        type AdaptiveRow = (
+            Option<u32>,
+            Option<String>,
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+        );
+        let (pu, hb, algo, conf, cost): AdaptiveRow = db
+            .conn()
+            .query_row(
+                "SELECT passes_used, halted_by, adaptive_algorithm, final_confidence, \
+                 final_total_cost_usd FROM evaluations WHERE id = ?",
+                rusqlite::params![eval_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert!(pu.is_none());
+        assert!(hb.is_none());
+        assert!(algo.is_none());
+        assert!(conf.is_none());
+        assert!(cost.is_none());
+
+        update_evaluation_adaptive_summary(
+            &db,
+            eval_id,
+            4,
+            Some("sprt_confidence_reached"),
+            Some("bayesian_sprt"),
+            Some(0.951),
+            Some(0.089),
+        )
+        .unwrap();
+
+        let (pu, hb, algo, conf, cost): (u32, String, String, f64, f64) = db
+            .conn()
+            .query_row(
+                "SELECT passes_used, halted_by, adaptive_algorithm, final_confidence, \
+                 final_total_cost_usd FROM evaluations WHERE id = ?",
+                rusqlite::params![eval_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(pu, 4);
+        assert_eq!(hb, "sprt_confidence_reached");
+        assert_eq!(algo, "bayesian_sprt");
+        assert!((conf - 0.951).abs() < 1e-12);
+        assert!((cost - 0.089).abs() < 1e-12);
     }
 
     #[test]

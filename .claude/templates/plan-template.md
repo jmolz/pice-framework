@@ -192,6 +192,28 @@ Execute in order, top to bottom. Each task is atomic.
 
 ---
 
+## Adversarial Review
+
+> Populated during `/plan-feature` Phase 5.5. Findings from fresh Claude sub-agent + Codex GPT-5.4 (Tier 2+) or self-critique (Tier 1) against the Karpathy four principles + PoetiQ cross-model verification. Critical findings are resolved or explicitly Acknowledged before the contract is drafted.
+
+**Tier**: {1 | 2 | 3}
+**Reviewers**: {"self-critique" | "Claude sub-agent + Codex GPT-5.4"}
+**Refinement cycles**: {N}
+
+### Critical (resolved before proceeding)
+
+1. {dimension}: {specific weakness} — section: {heading} — resolution: {revised text | Acknowledged with reasoning}
+
+### Consider (flagged, not acted on)
+
+1. {dimension}: {specific weakness} — section: {heading}
+
+### Reasoning divergence (alternative paths not taken)
+
+1. {alternative approach} — why not: {reasoning}
+
+---
+
 ## Notes
 
 {Design decisions, trade-offs, potential follow-up work, known limitations}

@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use pice_core::config::PiceConfig;
 use pice_core::provider::registry;
 use pice_protocol::{
-    EvaluateCreateParams, EvaluateResultParams, EvaluateScoreParams, InitializeParams,
+    EvaluateCreateParams, EvaluateCreateResult, EvaluateResultParams, EvaluateScoreParams,
+    InitializeParams,
 };
 use serde_json::Value;
 use std::time::Duration;
@@ -16,6 +17,19 @@ const EVAL_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(300);
 pub struct ProviderOrchestrator {
     host: ProviderHost,
     provider_name: String,
+}
+
+/// Per-pass outcome returned by [`ProviderOrchestrator::evaluate_one_pass`].
+///
+/// Bundles the final `evaluate/result` notification with the per-pass
+/// `costUsd` / `confidence` fields that were emitted on the `evaluate/create`
+/// reply. The adaptive loop owns the Beta-posterior confidence math;
+/// `confidence` here is the provider's own self-report (secondary signal).
+#[derive(Debug, Clone)]
+pub struct PerPassOutcome {
+    pub result: EvaluateResultParams,
+    pub cost_usd: Option<f64>,
+    pub confidence: Option<f64>,
 }
 
 impl ProviderOrchestrator {
@@ -139,6 +153,80 @@ impl ProviderOrchestrator {
             })?
             .context("evaluation result notification not received")?;
         Ok(result)
+    }
+
+    /// Run a single adaptive pass. Phase 4 sibling of [`Self::evaluate`] that
+    /// threads `pass_index` through to the provider and captures the per-pass
+    /// `costUsd` / `confidence` fields emitted on the `evaluate/create` reply.
+    ///
+    /// The adaptive loop invokes this once per pass; the old `evaluate` path
+    /// stays in place for legacy Tier 1/2 non-adaptive callers.
+    pub async fn evaluate_one_pass(
+        &mut self,
+        contract: Value,
+        diff: String,
+        claude_md: String,
+        model: Option<String>,
+        effort: Option<String>,
+        pass_index: Option<u32>,
+    ) -> Result<PerPassOutcome> {
+        let (tx, rx) = tokio::sync::oneshot::channel::<EvaluateResultParams>();
+        let tx = std::sync::Mutex::new(Some(tx));
+
+        self.on_notification(Box::new(move |method, params| {
+            if method == "evaluate/result" {
+                if let Some(params) = params {
+                    if let Ok(result) = serde_json::from_value::<EvaluateResultParams>(params) {
+                        if let Ok(mut guard) = tx.lock() {
+                            if let Some(tx) = guard.take() {
+                                tx.send(result).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let create_params = serde_json::to_value(EvaluateCreateParams {
+            contract,
+            diff,
+            claude_md,
+            model,
+            effort,
+            seam_checks: None,
+            pass_index,
+        })?;
+        let raw = self.request("evaluate/create", Some(create_params)).await?;
+        let create_res: EvaluateCreateResult = serde_json::from_value(raw)
+            .context("evaluate/create response was not a valid EvaluateCreateResult")?;
+
+        let deadline = tokio::time::Instant::now() + EVAL_NOTIFICATION_TIMEOUT;
+        let score_params = serde_json::to_value(EvaluateScoreParams {
+            session_id: create_res.session_id.clone(),
+        })?;
+        self.request_with_timeout(
+            "evaluate/score",
+            Some(score_params),
+            EVAL_NOTIFICATION_TIMEOUT,
+        )
+        .await?;
+
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let result = tokio::time::timeout(remaining, rx)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "evaluation timed out waiting for result notification ({}s budget)",
+                    EVAL_NOTIFICATION_TIMEOUT.as_secs()
+                )
+            })?
+            .context("evaluation result notification not received")?;
+
+        Ok(PerPassOutcome {
+            result,
+            cost_usd: create_res.cost_usd,
+            confidence: create_res.confidence,
+        })
     }
 
     /// Gracefully shutdown the provider.

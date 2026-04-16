@@ -24,7 +24,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-use super::{run_seams_for_layer, StreamSink};
+use super::adaptive_loop::{
+    run_adaptive_passes, AdaptiveContext, AdaptiveOutcome, PassMetricsSink,
+};
+use super::{run_seams_for_layer, ProviderOrchestrator, StreamSink};
 use crate::prompt::layer_builder::build_layer_evaluation_prompt;
 
 /// Configuration for a Stack Loops evaluation run.
@@ -76,6 +79,7 @@ pub async fn run_stack_loops(
     cfg: &StackLoopsConfig<'_>,
     sink: &dyn StreamSink,
     json_mode: bool,
+    pass_sink: &mut dyn PassMetricsSink,
 ) -> Result<VerificationManifest> {
     let config = cfg.layers;
     let plan_path = cfg.plan_path;
@@ -215,6 +219,7 @@ pub async fn run_stack_loops(
                     halted_by: None,
                     final_confidence: None,
                     total_cost_usd: None,
+                    escalation_events: None,
                 });
                 continue;
             }
@@ -236,6 +241,7 @@ pub async fn run_stack_loops(
                         halted_by: Some("missing layer definition".to_string()),
                         final_confidence: None,
                         total_cost_usd: None,
+                        escalation_events: None,
                     });
                     continue;
                 }
@@ -299,6 +305,7 @@ pub async fn run_stack_loops(
                     halted_by: Some(final_reason),
                     final_confidence: None,
                     total_cost_usd: None,
+                    escalation_events: None,
                 });
                 if !json_mode {
                     sink.send_chunk(&format!("  [{layer_name}] {label} (no file changes)\n"));
@@ -315,7 +322,9 @@ pub async fn run_stack_loops(
             // Load layer contract or fall back to plan contract
             let contract_content = load_layer_contract(project_root, layer_name, layer_def);
 
-            // Build context-isolated prompt
+            // Build context-isolated prompt (returned for future Phase 5
+            // prompt-inspection hooks; the adaptive loop below re-builds its
+            // own view from contract + diff + claude_md).
             let _prompt = build_layer_evaluation_prompt(
                 layer_name,
                 &contract_content,
@@ -323,21 +332,27 @@ pub async fn run_stack_loops(
                 &claude_md,
             );
 
-            // Phase 1: Record as PENDING — no provider evaluation yet.
-            // Full provider evaluation is wired in Phase 2. We fail closed:
-            // layers are NOT marked as PASSED without real evaluation.
-            //
-            // Phase 2 observability: the effective tier (from workflow
-            // `layer_overrides.{layer}.tier` with fallback to `defaults.tier`)
-            // is recorded in `halted_by` so workflow.yaml changes drive
-            // observable manifest output (PRDv2 Phase 2 validation criterion).
             let effective_tier = effective_tier_for(cfg.workflow, layer_name);
-            let timestamp = chrono::Utc::now().to_rfc3339();
 
-            // Phase 3 — run seam checks between this layer and its active
-            // boundary peers. Fail-closed: any `Failed` finding transitions
-            // the layer from `Pending` to `Failed` with `halted_by = "seam:<id>"`.
-            // `Warning` findings are advisory (do not downgrade status).
+            // Attempt to spawn the provider(s) and run the adaptive pass
+            // loop. If provider startup fails (common in test environments
+            // without a resolved binary), fall back to the Phase-1-pending
+            // placeholder so orchestration flow stays observable. This is
+            // a fail-closed path — no layer gets marked `Passed` on a
+            // provider failure.
+            let adaptive_outcome = try_run_layer_adaptive(
+                cfg,
+                layer_name,
+                &contract_content,
+                &filtered_diff,
+                &claude_md,
+                pass_sink,
+            )
+            .await;
+
+            // Phase 3 — seam checks. Run AFTER the adaptive loop completes;
+            // seam failures still downgrade layer status to Failed regardless
+            // of the adaptive halt reason.
             let seam_checks = run_seams_for_layer(
                 layer_name,
                 &active_set,
@@ -347,46 +362,31 @@ pub async fn run_stack_loops(
                 &full_diff,
                 &layer_paths,
             );
-            let first_failed = seam_checks
+            let first_failed_seam = seam_checks
                 .iter()
                 .find(|c| c.status == CheckStatus::Failed)
                 .map(|c| c.name.clone());
 
-            let (layer_status, halted_by) = match first_failed {
-                Some(failed_id) => (LayerStatus::Failed, Some(format!("seam:{failed_id}"))),
-                None => (
-                    LayerStatus::Pending,
-                    Some(format!("phase-1-pending-tier-{effective_tier}")),
+            let layer_result = match adaptive_outcome {
+                Some(outcome) => build_adaptive_layer_result(
+                    layer_name.clone(),
+                    outcome,
+                    seam_checks,
+                    first_failed_seam,
+                ),
+                None => phase1_pending_layer_result(
+                    layer_name.clone(),
+                    effective_tier,
+                    filtered_diff.len(),
+                    seam_checks,
+                    first_failed_seam,
                 ),
             };
 
-            let layer_result = LayerResult {
-                name: layer_name.clone(),
-                status: layer_status,
-                passes: vec![PassResult {
-                    index: 0,
-                    model: "phase-1-pending".to_string(),
-                    score: None,
-                    cost_usd: None,
-                    timestamp,
-                    findings: vec![format!(
-                        "Awaiting provider evaluation — {} bytes of filtered diff prepared",
-                        filtered_diff.len()
-                    )],
-                }],
-                seam_checks,
-                halted_by,
-                final_confidence: None,
-                total_cost_usd: None,
-            };
-
-            manifest.add_layer_result(layer_result);
-
             if !json_mode {
-                sink.send_chunk(&format!(
-                    "  [{layer_name}] PENDING (provider evaluation deferred)\n"
-                ));
+                sink.send_chunk(&format!("  [{}] {:?}\n", layer_name, layer_result.status));
             }
+            manifest.add_layer_result(layer_result);
 
             // Checkpoint: persist manifest after each layer result
             if let Some(ref path) = manifest_path {
@@ -459,6 +459,192 @@ pub async fn run_stack_loops(
     Ok(manifest)
 }
 
+/// Attempt to run the per-layer adaptive pass loop.
+///
+/// Starts primary (and adversarial when ADTS is active) providers, invokes
+/// [`run_adaptive_passes`], and shuts them down. Returns `None` if any
+/// provider fails to start — the caller falls back to the Phase-1-pending
+/// placeholder. This graceful-degrade path preserves existing test fixtures
+/// where the provider binary isn't resolvable.
+async fn try_run_layer_adaptive(
+    cfg: &StackLoopsConfig<'_>,
+    layer_name: &str,
+    contract_toml: &str,
+    filtered_diff: &str,
+    claude_md: &str,
+    pass_sink: &mut dyn PassMetricsSink,
+) -> Option<AdaptiveOutcome> {
+    let workflow = cfg.workflow;
+    let algo = effective_adaptive_algo_for(workflow, layer_name);
+    let min_confidence = effective_min_confidence_for(workflow, layer_name);
+    let max_passes = effective_max_passes_for(workflow, layer_name);
+    let budget_usd = effective_budget_usd_for(workflow, layer_name);
+
+    // Build the per-layer contract payload. Providers expect JSON; the
+    // layer contract is a TOML fragment, so wrap it in an object with a
+    // `contract_toml` string field. Providers that understand the layered
+    // shape deserialize it; opaque providers pass it through.
+    let contract_json = serde_json::json!({
+        "layer": layer_name,
+        "contract_toml": contract_toml,
+    });
+
+    let mut primary = match ProviderOrchestrator::start(cfg.primary_provider, cfg.pice_config).await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(layer = %layer_name, "failed to start primary provider, falling back to phase-1-pending: {e}");
+            return None;
+        }
+    };
+
+    // Start the adversarial provider only when ADTS is selected.
+    let mut adversarial: Option<ProviderOrchestrator> = if algo
+        == pice_core::workflow::schema::AdaptiveAlgo::Adts
+        && cfg.pice_config.evaluation.adversarial.enabled
+    {
+        match ProviderOrchestrator::start(
+            &cfg.pice_config.evaluation.adversarial.provider,
+            cfg.pice_config,
+        )
+        .await
+        {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!(layer = %layer_name, "failed to start adversarial provider for ADTS: {e}");
+                // ADTS without adversarial is degenerate — shut down primary and fall back.
+                let _ = primary.shutdown().await;
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    let ctx = AdaptiveContext {
+        algo,
+        sprt: workflow.phases.evaluate.sprt,
+        adts: workflow.phases.evaluate.adts,
+        vec: workflow.phases.evaluate.vec,
+        min_confidence,
+        max_passes,
+        budget_usd,
+        contract: contract_json,
+        diff: filtered_diff.to_string(),
+        claude_md: claude_md.to_string(),
+        primary_model: cfg.primary_model.to_string(),
+        adversarial_model: Some(cfg.pice_config.evaluation.adversarial.model.clone()),
+        base_effort: if cfg.pice_config.evaluation.adversarial.effort.is_empty() {
+            None
+        } else {
+            Some(cfg.pice_config.evaluation.adversarial.effort.clone())
+        },
+    };
+
+    let result = run_adaptive_passes(&ctx, &mut primary, adversarial.as_mut(), pass_sink).await;
+
+    // Always shut the providers down, even on loop error.
+    let _ = primary.shutdown().await;
+    if let Some(adv) = adversarial {
+        let _ = adv.shutdown().await;
+    }
+
+    match result {
+        Ok(outcome) => Some(outcome),
+        Err(e) => {
+            warn!(layer = %layer_name, "adaptive pass loop failed: {e}");
+            None
+        }
+    }
+}
+
+/// Derive a `LayerResult` from an adaptive loop outcome and the seam-check
+/// findings. Seam failures override the halt reason and downgrade the layer
+/// status to `Failed`. Otherwise, the `halted_by` string selects the status:
+///
+/// | halted_by                      | status (no seam fail) |
+/// |--------------------------------|------------------------|
+/// | sprt_confidence_reached        | Passed                 |
+/// | vec_entropy                    | Passed                 |
+/// | sprt_rejected                  | Failed                 |
+/// | adts_escalation_exhausted      | Failed                 |
+/// | budget                         | Pending (re-run)       |
+/// | max_passes                     | Pending (re-run)       |
+/// | (anything else)                | Pending (conservative) |
+fn build_adaptive_layer_result(
+    layer_name: String,
+    outcome: AdaptiveOutcome,
+    seam_checks: Vec<SeamCheckResult>,
+    first_failed_seam: Option<String>,
+) -> LayerResult {
+    let (status, halted_by) = if let Some(failed_id) = first_failed_seam {
+        // Seam failure always wins — per stack-loops.md §"Fail-closed rollup".
+        (LayerStatus::Failed, Some(format!("seam:{failed_id}")))
+    } else {
+        match outcome.halted_by.as_deref() {
+            Some("sprt_confidence_reached") | Some("vec_entropy") => {
+                (LayerStatus::Passed, outcome.halted_by.clone())
+            }
+            Some("sprt_rejected") | Some("adts_escalation_exhausted") => {
+                (LayerStatus::Failed, outcome.halted_by.clone())
+            }
+            Some("budget") | Some("max_passes") => {
+                (LayerStatus::Pending, outcome.halted_by.clone())
+            }
+            _ => (LayerStatus::Pending, outcome.halted_by.clone()),
+        }
+    };
+
+    LayerResult {
+        name: layer_name,
+        status,
+        passes: outcome.passes,
+        seam_checks,
+        halted_by,
+        final_confidence: outcome.final_confidence,
+        total_cost_usd: outcome.total_cost_usd,
+        escalation_events: outcome.escalation_events,
+    }
+}
+
+/// Phase-1-pending fallback: records the layer as Pending with a placeholder
+/// pass so the manifest is well-formed and downstream tools see the layer
+/// was recognized but never evaluated.
+fn phase1_pending_layer_result(
+    layer_name: String,
+    effective_tier: u8,
+    filtered_diff_bytes: usize,
+    seam_checks: Vec<SeamCheckResult>,
+    first_failed_seam: Option<String>,
+) -> LayerResult {
+    let (status, halted_by) = match first_failed_seam {
+        Some(failed_id) => (LayerStatus::Failed, Some(format!("seam:{failed_id}"))),
+        None => (
+            LayerStatus::Pending,
+            Some(format!("phase-1-pending-tier-{effective_tier}")),
+        ),
+    };
+    LayerResult {
+        name: layer_name,
+        status,
+        passes: vec![PassResult {
+            index: 0,
+            model: "phase-1-pending".to_string(),
+            score: None,
+            cost_usd: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            findings: vec![format!(
+                "Awaiting provider evaluation — {filtered_diff_bytes} bytes of filtered diff prepared"
+            )],
+        }],
+        seam_checks,
+        halted_by,
+        final_confidence: None,
+        total_cost_usd: None,
+        escalation_events: None,
+    }
+}
+
 /// Resolve the effective tier for a layer: override wins, else defaults.
 fn effective_tier_for(workflow: &WorkflowConfig, layer_name: &str) -> u8 {
     workflow
@@ -469,8 +655,6 @@ fn effective_tier_for(workflow: &WorkflowConfig, layer_name: &str) -> u8 {
 }
 
 /// Resolve the effective `min_confidence` for a layer.
-/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
-#[allow(dead_code)]
 fn effective_min_confidence_for(workflow: &WorkflowConfig, layer_name: &str) -> f64 {
     workflow
         .layer_overrides
@@ -480,8 +664,6 @@ fn effective_min_confidence_for(workflow: &WorkflowConfig, layer_name: &str) -> 
 }
 
 /// Resolve the effective `max_passes` for a layer.
-/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
-#[allow(dead_code)]
 fn effective_max_passes_for(workflow: &WorkflowConfig, layer_name: &str) -> u32 {
     workflow
         .layer_overrides
@@ -491,8 +673,6 @@ fn effective_max_passes_for(workflow: &WorkflowConfig, layer_name: &str) -> u32 
 }
 
 /// Resolve the effective `budget_usd` for a layer.
-/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
-#[allow(dead_code)]
 fn effective_budget_usd_for(workflow: &WorkflowConfig, layer_name: &str) -> f64 {
     workflow
         .layer_overrides
@@ -528,8 +708,6 @@ fn effective_adaptive_config_for(
 
 /// Resolve the effective `AdaptiveAlgo` for a specific layer. Layer override
 /// wins; else falls back to the project-wide `evaluate.adaptive_algorithm`.
-/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
-#[allow(dead_code)]
 fn effective_adaptive_algo_for(
     workflow: &WorkflowConfig,
     layer_name: &str,
@@ -727,7 +905,10 @@ mod tests {
             merged_seams: &empty_seams,
         };
 
-        let manifest = run_stack_loops(&cfg, &NullSink, false).await.unwrap();
+        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
+        let manifest = run_stack_loops(&cfg, &NullSink, false, &mut pass_sink)
+            .await
+            .unwrap();
 
         // Should have results for all 3 layers
         assert_eq!(manifest.layers.len(), 3);
@@ -824,7 +1005,10 @@ mod tests {
             merged_seams: &empty_seams,
         };
 
-        let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
+        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
+        let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+            .await
+            .unwrap();
 
         // With no changes: non-always_run layers are inactive → Skipped.
         // always_run layers are active but have empty diffs → Pending
@@ -959,7 +1143,10 @@ mod tests {
             merged_seams: &seams,
         };
 
-        let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
+        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
+        let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+            .await
+            .unwrap();
         let backend = manifest
             .layers
             .iter()

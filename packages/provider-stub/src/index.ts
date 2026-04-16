@@ -12,8 +12,24 @@ let nextSessionId = 1;
  *   `response/chunk` notifications followed by `response/complete`
  * - Declares no real capabilities (workflow: false, evaluation: false)
  */
+/**
+ * Per-session state for stub evaluations. The score used at `evaluate/score`
+ * time depends on the pass index declared at `evaluate/create` time — so we
+ * resolve the `PICE_STUB_SCORES` entry once at create and stash it here.
+ */
+interface StubEvalState {
+  contract: unknown;
+  /** 0-indexed pass position from `evaluate/create` params (defaults to 0). */
+  passIndex: number;
+  /**
+   * Pre-resolved stub entry for this pass. `undefined` when `PICE_STUB_SCORES`
+   * is unset — `evaluate/score` then falls back to `defaultScore = 8`.
+   */
+  stubEntry?: StubScoreEntry;
+}
+
 export class StubProvider extends BaseProvider {
-  private evalContracts = new Map<string, unknown>();
+  private evalContracts = new Map<string, StubEvalState>();
   private stubScores: StubScoreEntry[];
 
   constructor(version: string) {
@@ -66,10 +82,15 @@ export class StubProvider extends BaseProvider {
       this.requireInitialized();
       const sessionId = `stub-eval-${nextSessionId++}`;
       const p = params as EvaluateCreateParams;
-      this.evalContracts.set(sessionId, p.contract);
 
       const passIndex = p.passIndex ?? 0;
       const entry = getStubEntry(this.stubScores, passIndex);
+
+      this.evalContracts.set(sessionId, {
+        contract: p.contract,
+        passIndex,
+        stubEntry: entry,
+      });
 
       return {
         sessionId,
@@ -81,25 +102,41 @@ export class StubProvider extends BaseProvider {
       this.requireInitialized();
       const { sessionId } = params as { sessionId: string };
 
+      // Default score if `PICE_STUB_SCORES` is not configured. Kept at 8 for
+      // backward compatibility with pre-Phase-4 tests; the Phase 4 adaptive
+      // loop integration tests SHOULD set `PICE_STUB_SCORES` for determinism.
       const defaultScore = 8;
-      const contract = this.evalContracts.get(sessionId) as
+      const state = this.evalContracts.get(sessionId);
+      // Use the per-pass stub score (rounded to nearest integer for the
+      // 0–10 `CriterionScore.score` wire type) when set; else fall back.
+      const rawScore = state?.stubEntry?.score ?? defaultScore;
+      const passScore = Math.max(0, Math.min(10, Math.round(rawScore)));
+      const contract = state?.contract as
         | { criteria?: Array<{ name: string; threshold: number }> }
         | undefined;
       const criteria = contract?.criteria ?? [];
       const scores = criteria.length > 0
         ? criteria.map((c: { name: string; threshold: number }) => ({
             name: c.name,
-            score: defaultScore,
+            score: passScore,
             threshold: c.threshold,
-            passed: defaultScore >= c.threshold,
-            findings: 'Stub evaluation — criterion passes by default',
+            passed: passScore >= c.threshold,
+            findings: 'Stub evaluation — scored via PICE_STUB_SCORES or default',
           }))
-        : [{ name: 'stub-criterion', score: defaultScore, threshold: 7, passed: true, findings: 'Stub evaluation' }];
+        : [{
+            name: 'stub-criterion',
+            score: passScore,
+            threshold: 7,
+            passed: passScore >= 7,
+            findings: 'Stub evaluation',
+          }];
 
       transport.sendNotification('evaluate/result', {
         sessionId,
         scores,
-        passed: true,
+        // `passed` reflects the effective pass score, not a hard-coded true.
+        // Phase 4 tests that expect SPRT-rejected need this to swing false.
+        passed: scores.every((s) => s.passed),
         summary: 'Stub evaluation complete',
       });
 

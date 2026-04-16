@@ -81,6 +81,9 @@ impl MetricsDb {
         if current < 2 {
             self.migrate_v2()?;
         }
+        if current < 3 {
+            self.migrate_v3()?;
+        }
         Ok(())
     }
 
@@ -131,6 +134,80 @@ impl MetricsDb {
             ",
             )
             .context("failed to run v1 migration")?;
+        Ok(())
+    }
+
+    /// Phase 4 — add adaptive-evaluation columns to `evaluations` and create
+    /// the `pass_events` table for per-pass audit trails. Idempotent:
+    /// column adds check `PRAGMA table_info` first; the table is created with
+    /// `IF NOT EXISTS`. `ON DELETE CASCADE` on `evaluation_id` deletes a
+    /// pass's events when its evaluation row is deleted (matches the
+    /// `seam_findings` cascade contract).
+    fn migrate_v3(&self) -> Result<()> {
+        // Check which adaptive columns already exist on `evaluations`
+        // (needed for idempotent re-run and for migrating v1→v3 or v2→v3
+        // on databases older than current).
+        let existing_cols: std::collections::HashSet<String> = self
+            .conn
+            .prepare("PRAGMA table_info(evaluations)")
+            .context("failed to introspect evaluations columns")?
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to read evaluations columns")?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Adaptive summary columns. Each ALTER is a separate statement and
+        // guarded so migrating a fresh v3 DB or re-running is a no-op.
+        let adaptive_cols: &[(&str, &str)] = &[
+            (
+                "passes_used",
+                "ALTER TABLE evaluations ADD COLUMN passes_used INTEGER",
+            ),
+            (
+                "halted_by",
+                "ALTER TABLE evaluations ADD COLUMN halted_by TEXT",
+            ),
+            (
+                "adaptive_algorithm",
+                "ALTER TABLE evaluations ADD COLUMN adaptive_algorithm TEXT",
+            ),
+            (
+                "final_confidence",
+                "ALTER TABLE evaluations ADD COLUMN final_confidence REAL",
+            ),
+            (
+                "final_total_cost_usd",
+                "ALTER TABLE evaluations ADD COLUMN final_total_cost_usd REAL",
+            ),
+        ];
+        for (col, sql) in adaptive_cols {
+            if !existing_cols.contains(*col) {
+                self.conn
+                    .execute_batch(sql)
+                    .with_context(|| format!("failed to add evaluations.{col}"))?;
+            }
+        }
+
+        self.conn
+            .execute_batch(
+                "
+            CREATE TABLE IF NOT EXISTS pass_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evaluation_id INTEGER NOT NULL REFERENCES evaluations(id) ON DELETE CASCADE,
+                pass_index INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                score REAL,
+                cost_usd REAL,
+                timestamp TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pass_events_evaluation
+                ON pass_events(evaluation_id);
+
+            INSERT INTO schema_version (version) VALUES (3);
+            ",
+            )
+            .context("failed to run v3 migration")?;
         Ok(())
     }
 
@@ -216,18 +293,18 @@ mod tests {
     fn migration_is_idempotent() {
         let db = MetricsDb::open_in_memory().unwrap();
         let v = db.current_schema_version().unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
 
         // Running init again should not fail or duplicate version rows
         db.init().unwrap();
         let v_again = db.current_schema_version().unwrap();
-        assert_eq!(v_again, 2);
+        assert_eq!(v_again, 3);
     }
 
     #[test]
     fn schema_version_matches_current() {
         let db = MetricsDb::open_in_memory().unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 2);
+        assert_eq!(db.current_schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -243,7 +320,7 @@ mod tests {
 
         // Reopen
         let db = MetricsDb::open(&db_path).unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 2);
+        assert_eq!(db.current_schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -353,6 +430,199 @@ mod tests {
             rusqlite::params![eid],
         );
         assert!(err.is_err(), "status='bogus' should fail CHECK");
+    }
+
+    // ─── Phase 4 v3 migration tests ────────────────────────────────────
+
+    /// Fresh in-memory DB starts at v3 with all adaptive columns and the
+    /// `pass_events` table present.
+    #[test]
+    fn v3_schema_has_adaptive_columns_and_pass_events_table() {
+        let db = MetricsDb::open_in_memory().unwrap();
+
+        // Columns on `evaluations`
+        let cols: Vec<String> = db
+            .conn()
+            .prepare("PRAGMA table_info(evaluations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for required in [
+            "passes_used",
+            "halted_by",
+            "adaptive_algorithm",
+            "final_confidence",
+            "final_total_cost_usd",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "evaluations must have column {required}: got {cols:?}"
+            );
+        }
+
+        // `pass_events` table
+        let tables: Vec<String> = db
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"pass_events".to_string()));
+    }
+
+    /// Re-running `init()` on a v3 database is a no-op: schema_version stays
+    /// at 3, no duplicate columns are added, and `pass_events` still exists.
+    #[test]
+    fn migrate_v3_is_idempotent() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        assert_eq!(db.current_schema_version().unwrap(), 3);
+
+        // `init()` gates at `if current < N` so it's a proper no-op.
+        db.init().unwrap();
+        db.init().unwrap();
+        assert_eq!(db.current_schema_version().unwrap(), 3);
+
+        // The gated version rows are: 1, 2, 3 — one per migration, no dupes.
+        let rows: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "init should never duplicate version rows");
+
+        // Adaptive columns still exist exactly once (no ALTER ... duplicate error).
+        let passes_used_count: i64 = db
+            .conn()
+            .prepare("PRAGMA table_info(evaluations)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .filter(|c| c == "passes_used")
+            .count() as i64;
+        assert_eq!(passes_used_count, 1);
+    }
+
+    /// Opening a file-DB at v1 (only migrate_v1 applied manually) and then
+    /// running the full `init()` flow should migrate v1 → v2 → v3.
+    #[test]
+    fn migrate_from_v1_to_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v1.db");
+
+        // Open raw connection and run only v1 to create a stale DB.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            let stub = MetricsDb { conn };
+            stub.migrate_v1().unwrap();
+            assert_eq!(stub.current_schema_version().unwrap(), 1);
+        }
+
+        // Open via the public API — should run v2 and v3 migrations.
+        let db = MetricsDb::open(&db_path).unwrap();
+        assert_eq!(db.current_schema_version().unwrap(), 3);
+
+        // All v3 artifacts present.
+        let tables: Vec<String> = db
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(tables.contains(&"seam_findings".to_string()));
+        assert!(tables.contains(&"pass_events".to_string()));
+    }
+
+    /// Opening a file-DB at v2 and then running the full `init()` flow
+    /// should migrate v2 → v3 without touching v2 tables.
+    #[test]
+    fn migrate_from_v2_to_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v2.db");
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            let stub = MetricsDb { conn };
+            stub.migrate_v1().unwrap();
+            stub.migrate_v2().unwrap();
+            assert_eq!(stub.current_schema_version().unwrap(), 2);
+        }
+
+        let db = MetricsDb::open(&db_path).unwrap();
+        assert_eq!(db.current_schema_version().unwrap(), 3);
+
+        // v2 seam_findings must still be there and still accepting inserts.
+        db.conn()
+            .execute(
+                "INSERT INTO evaluations (plan_path, feature_name, tier, passed, \
+                 primary_provider, primary_model, timestamp) \
+                 VALUES ('p', 'f', 2, 1, 'x', 'y', 't')",
+                [],
+            )
+            .unwrap();
+        let eid = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO seam_findings (evaluation_id, layer, boundary, check_id, \
+                 category, status, created_at) \
+                 VALUES (?, 'x', 'x', 'x', 1, 'passed', 't')",
+                rusqlite::params![eid],
+            )
+            .unwrap();
+    }
+
+    /// Inserting a row into `pass_events` with an FK to a real `evaluations`
+    /// row and then deleting the evaluation cascades the pass_events row.
+    #[test]
+    fn pass_events_fk_cascade_on_delete() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO evaluations (plan_path, feature_name, tier, passed, \
+                 primary_provider, primary_model, timestamp) \
+                 VALUES ('p', 'f', 2, 1, 'x', 'y', 't')",
+                [],
+            )
+            .unwrap();
+        let eid = db.conn().last_insert_rowid();
+        db.conn()
+            .execute(
+                "INSERT INTO pass_events (evaluation_id, pass_index, model, score, \
+                 cost_usd, timestamp) VALUES (?, 1, 'claude-code', 9.0, 0.02, 't')",
+                rusqlite::params![eid],
+            )
+            .unwrap();
+        let before: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pass_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, 1);
+        db.conn()
+            .execute(
+                "DELETE FROM evaluations WHERE id = ?",
+                rusqlite::params![eid],
+            )
+            .unwrap();
+        let after: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pass_events", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(after, 0, "FK cascade should have deleted pass_events");
     }
 
     #[test]

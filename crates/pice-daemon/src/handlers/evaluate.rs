@@ -236,8 +236,63 @@ pub async fn run(
             workflow: &workflow,
             merged_seams: &merged_seams,
         };
-        let manifest =
-            crate::orchestrator::stack_loops::run_stack_loops(&stack_cfg, sink, req.json).await?;
+
+        // Phase 4: create the evaluation header BEFORE running stack loops.
+        // This gives the adaptive loop a valid `evaluation_id` to FK-attach
+        // `pass_events` to, persisted BEFORE each halt-decision check. The
+        // placeholder row's `passed = 0` and `summary = NULL` are rewritten
+        // by `finalize_evaluation` after the loop returns.
+        //
+        // `MetricsDb` is `!Sync` (prepared-statement cache uses `RefCell`),
+        // so the sink holds `Arc<Mutex<MetricsDb>>` to stay `Send` across
+        // the `run_stack_loops` await — see the sink's docstring in
+        // `metrics::store`.
+        use std::sync::{Arc, Mutex};
+        let normalized_path = metrics::normalize_plan_path(&plan.path, project_root);
+        let db_arc: Option<Arc<Mutex<metrics::db::MetricsDb>>> =
+            metrics::open_metrics_db(project_root)
+                .ok()
+                .flatten()
+                .map(|db| Arc::new(Mutex::new(db)));
+        let eval_id = match db_arc.as_ref() {
+            Some(db) => {
+                let guard = db.lock().expect("metrics DB mutex poisoned");
+                match metrics::store::insert_evaluation_header(
+                    &guard,
+                    &normalized_path,
+                    &contract.feature,
+                    contract.tier,
+                    &config.evaluation.primary.provider,
+                    &config.evaluation.primary.model,
+                    None,
+                    None,
+                ) {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        tracing::warn!("failed to insert evaluation header: {e}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let mut db_pass_sink: Option<metrics::store::DbBackedPassSink> =
+            match (db_arc.as_ref(), eval_id) {
+                (Some(db), Some(eid)) => Some(metrics::store::DbBackedPassSink {
+                    db: db.clone(),
+                    evaluation_id: eid,
+                }),
+                _ => None,
+            };
+        let mut null_sink = crate::orchestrator::NullPassSink;
+        let pass_sink: &mut dyn crate::orchestrator::PassMetricsSink = match db_pass_sink.as_mut() {
+            Some(s) => s,
+            None => &mut null_sink,
+        };
+        let manifest = crate::orchestrator::stack_loops::run_stack_loops(
+            &stack_cfg, sink, req.json, pass_sink,
+        )
+        .await?;
 
         // Seam-aware exit code: if any layer is Failed (including via a
         // seam finding), we exit 2. Overall status being InProgress from
@@ -255,87 +310,145 @@ pub async fn run(
             .filter(|c| c.status == CheckStatus::Failed)
             .count();
 
-        // Persist the evaluation + seam findings to the metrics DB. Without
-        // this write, the new `seam_findings` table, FK cascade, and CHECK
-        // constraints are exercised only by tests, never by production —
-        // that was one of the critical silent-bypass findings in the
-        // adversarial review. Failures here are logged but non-fatal
-        // (per CLAUDE.md — metrics writes must never crash the CLI).
-        let normalized_path = metrics::normalize_plan_path(&plan.path, project_root);
-        if let Ok(Some(db)) = metrics::open_metrics_db(project_root) {
-            // Stack-loops Phase 1 has no per-criterion scores to emit yet —
-            // record the evaluation header so seam findings can FK-attach.
+        // Persist the evaluation summary + seam findings to the metrics DB.
+        // The header was inserted pre-loop; finalize and attach children now.
+        // Failures here are logged but non-fatal (per CLAUDE.md — metrics
+        // writes must never crash the CLI).
+        //
+        // The sink has already been dropped back to `None` implicitly by
+        // going out of scope at the end of `run_stack_loops`; we re-lock
+        // `db_arc` here for the summary + seam writes. No contention.
+        if let (Some(db_arc), Some(eval_id)) = (db_arc.as_ref(), eval_id) {
+            let db = db_arc.lock().expect("metrics DB mutex poisoned");
             let stack_passed = !any_failed_layer && failed_seam_checks == 0;
-            match metrics::store::record_evaluation(
+
+            // Finalize `passed` + `summary`.
+            if let Err(e) = metrics::store::finalize_evaluation(
                 &db,
-                &normalized_path,
-                &contract.feature,
-                contract.tier,
+                eval_id,
                 stack_passed,
-                &config.evaluation.primary.provider,
-                &config.evaluation.primary.model,
-                None,
-                None,
-                Some("stack-loops Phase 1 — contract grading pending; seam findings below"),
-                &[],
+                Some("stack-loops — adaptive evaluation; see pass_events and seam_findings"),
             ) {
-                Ok(eval_id) => {
-                    // Phase 3 round-4 adversarial review fix: when both
-                    // sides of a boundary are active, run_seams_for_layer
-                    // attributes the SAME (boundary, check_id) result to
-                    // BOTH layers' `seam_checks`. The per-layer manifest
-                    // copy is intentional (each layer's view is a complete
-                    // picture). But persisting both as separate rows would
-                    // double-count category analytics. Dedupe here on
-                    // (boundary, check_id) and attribute the canonical row
-                    // to the first layer encountered in `manifest.layers`
-                    // iteration order (layers.toml declaration order, which
-                    // is deterministic across runs).
-                    let mut seen: std::collections::HashSet<(String, String)> =
-                        std::collections::HashSet::new();
-                    for layer in &manifest.layers {
-                        for sc in &layer.seam_checks {
-                            let status_wire = match sc.status {
-                                CheckStatus::Passed => "passed",
-                                CheckStatus::Warning => "warning",
-                                CheckStatus::Failed => "failed",
-                                // Skipped seam findings don't map to a DB
-                                // status — the CHECK constraint allows only
-                                // passed/warning/failed. Drop the row.
-                                CheckStatus::Skipped => continue,
-                            };
-                            // Skip rows the CHECK constraint would reject
-                            // (unregistered-check findings carry no category).
-                            let Some(category) = sc.category else {
-                                continue;
-                            };
-                            // Bilateral dedupe: one DB row per
-                            // (eval_id, boundary, check_id).
-                            let key = (sc.boundary.clone(), sc.name.clone());
-                            if !seen.insert(key) {
-                                continue;
-                            }
-                            let row = metrics::store::SeamFindingRow {
-                                layer: &layer.name,
-                                boundary: &sc.boundary,
-                                check_id: &sc.name,
-                                category,
-                                status: status_wire,
-                                details: sc.details.as_deref(),
-                            };
-                            if let Err(e) = metrics::store::insert_seam_finding(&db, eval_id, &row)
-                            {
-                                tracing::warn!(
-                                    layer = %layer.name,
-                                    check = %sc.name,
-                                    "failed to insert seam finding: {e}"
-                                );
-                            }
+                tracing::warn!("failed to finalize evaluation: {e}");
+            }
+
+            // Aggregate adaptive summary columns across layers. The pass
+            // count is total across layers (matches the `pass_events` row
+            // count per `evaluation_id`, required for cost reconciliation).
+            // `total_cost_usd` sums per-layer costs so it equals
+            // `SUM(pass_events.cost_usd)` within 1e-9 — the Phase 4 contract
+            // criterion #10 cost-reconciliation invariant.
+            let passes_used: u32 = manifest.layers.iter().map(|l| l.passes.len() as u32).sum();
+            let final_total_cost_usd: Option<f64> = {
+                let sum: f64 = manifest
+                    .layers
+                    .iter()
+                    .filter_map(|l| l.total_cost_usd)
+                    .sum();
+                if sum > 0.0 {
+                    Some(sum)
+                } else {
+                    None
+                }
+            };
+            // `halted_by`: prefer a failed layer's reason for triage; fall
+            // back to the first non-pending layer that actually ran.
+            let halted_by_wire: Option<String> = manifest
+                .layers
+                .iter()
+                .find(|l| l.status == LayerStatus::Failed)
+                .and_then(|l| l.halted_by.clone())
+                .or_else(|| {
+                    manifest
+                        .layers
+                        .iter()
+                        .find(|l| {
+                            l.status != LayerStatus::Pending && l.status != LayerStatus::Skipped
+                        })
+                        .and_then(|l| l.halted_by.clone())
+                });
+            // `final_confidence`: max across layers (optimistic; the per-layer
+            // manifest carries the authoritative per-layer value anyway).
+            let final_confidence: Option<f64> = manifest
+                .layers
+                .iter()
+                .filter_map(|l| l.final_confidence)
+                .fold(None, |acc, c| match acc {
+                    Some(a) if a >= c => Some(a),
+                    _ => Some(c),
+                });
+            // Project-wide algorithm wire form.
+            let algo_wire = match workflow.phases.evaluate.adaptive_algorithm {
+                pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt => "bayesian_sprt",
+                pice_core::workflow::schema::AdaptiveAlgo::Adts => "adts",
+                pice_core::workflow::schema::AdaptiveAlgo::Vec => "vec",
+                pice_core::workflow::schema::AdaptiveAlgo::None => "none",
+            };
+            if let Err(e) = metrics::store::update_evaluation_adaptive_summary(
+                &db,
+                eval_id,
+                passes_used,
+                halted_by_wire.as_deref(),
+                Some(algo_wire),
+                final_confidence,
+                final_total_cost_usd,
+            ) {
+                tracing::warn!("failed to update evaluation adaptive summary: {e}");
+            }
+
+            // Seam findings attach via FK to `evaluation_id`.
+            {
+                // Phase 3 round-4 adversarial review fix: when both
+                // sides of a boundary are active, run_seams_for_layer
+                // attributes the SAME (boundary, check_id) result to
+                // BOTH layers' `seam_checks`. The per-layer manifest
+                // copy is intentional (each layer's view is a complete
+                // picture). But persisting both as separate rows would
+                // double-count category analytics. Dedupe here on
+                // (boundary, check_id) and attribute the canonical row
+                // to the first layer encountered in `manifest.layers`
+                // iteration order (layers.toml declaration order, which
+                // is deterministic across runs).
+                let mut seen: std::collections::HashSet<(String, String)> =
+                    std::collections::HashSet::new();
+                for layer in &manifest.layers {
+                    for sc in &layer.seam_checks {
+                        let status_wire = match sc.status {
+                            CheckStatus::Passed => "passed",
+                            CheckStatus::Warning => "warning",
+                            CheckStatus::Failed => "failed",
+                            // Skipped seam findings don't map to a DB
+                            // status — the CHECK constraint allows only
+                            // passed/warning/failed. Drop the row.
+                            CheckStatus::Skipped => continue,
+                        };
+                        // Skip rows the CHECK constraint would reject
+                        // (unregistered-check findings carry no category).
+                        let Some(category) = sc.category else {
+                            continue;
+                        };
+                        // Bilateral dedupe: one DB row per
+                        // (eval_id, boundary, check_id).
+                        let key = (sc.boundary.clone(), sc.name.clone());
+                        if !seen.insert(key) {
+                            continue;
+                        }
+                        let row = metrics::store::SeamFindingRow {
+                            layer: &layer.name,
+                            boundary: &sc.boundary,
+                            check_id: &sc.name,
+                            category,
+                            status: status_wire,
+                            details: sc.details.as_deref(),
+                        };
+                        if let Err(e) = metrics::store::insert_seam_finding(&db, eval_id, &row) {
+                            tracing::warn!(
+                                layer = %layer.name,
+                                check = %sc.name,
+                                "failed to insert seam finding: {e}"
+                            );
                         }
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("failed to record stack-loops evaluation header: {e}");
                 }
             }
         }

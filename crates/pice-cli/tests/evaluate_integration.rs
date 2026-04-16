@@ -70,6 +70,48 @@ seams:
     fs::write(root.join(".pice/workflow.yaml"), yaml).unwrap();
 }
 
+/// Write a `.pice/config.toml` that routes both primary and adversarial
+/// providers to the built-in `stub` provider. The stub emits deterministic
+/// scores (default `score=8, passed=true`) so tests don't need a real API
+/// key and the adaptive pass loop sees a passing evaluation.
+///
+/// Phase 4 wired up real provider invocation inside `run_stack_loops`;
+/// tests that don't configure this helper will hit the production
+/// `claude-code` provider and either grade the fixture for real (slow,
+/// requires `ANTHROPIC_API_KEY`) or fail graceful-degrade with unpredictable
+/// exit codes. Prefer stubbing over relying on resolver-miss fallback.
+fn write_stub_config(root: &Path) {
+    let toml = r#"
+[provider]
+name = "stub"
+
+[evaluation.primary]
+provider = "stub"
+model = "stub-model"
+
+[evaluation.adversarial]
+provider = "stub"
+model = "stub-model"
+effort = ""
+enabled = false
+
+[evaluation.tiers]
+tier1_models = []
+tier2_models = []
+tier3_models = []
+tier3_agent_team = false
+
+[telemetry]
+enabled = false
+endpoint = ""
+
+[metrics]
+db_path = ".pice/metrics.db"
+"#;
+    fs::create_dir_all(root.join(".pice")).unwrap();
+    fs::write(root.join(".pice/config.toml"), toml).unwrap();
+}
+
 fn write_minimal_plan(root: &Path) -> std::path::PathBuf {
     let plan_dir = root.join(".claude/plans");
     fs::create_dir_all(&plan_dir).unwrap();
@@ -96,6 +138,10 @@ fn write_minimal_plan(root: &Path) -> std::path::PathBuf {
 fn evaluate_json_failing_seam_exits_two_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
     git_init(dir.path());
+    // Phase 4: stub provider keeps the exit code driven by the seam
+    // failure (category 1), not by whatever a real provider would grade
+    // the fixture.
+    write_stub_config(dir.path());
 
     // layers.toml with two seam-connected layers
     let layers = r#"
@@ -175,6 +221,9 @@ paths = ["Dockerfile"]
 fn evaluate_json_clean_fixture_exits_zero_on_stdout() {
     let dir = tempfile::tempdir().unwrap();
     git_init(dir.path());
+    // Phase 4: route providers to the deterministic stub so the adaptive
+    // loop gets a passing eval regardless of host env / API keys.
+    write_stub_config(dir.path());
 
     let layers = r#"
 [layers]
@@ -206,6 +255,11 @@ paths = ["Dockerfile"]
 
     let output = pice_cmd()
         .current_dir(dir.path())
+        // Phase 4: drive the stub to a passing score (9.5) so SPRT accepts
+        // before `max_passes`. Without this env var the stub scores 8 per
+        // pass — under `min_confidence=0.90` the observation threshold is
+        // 9.0 and SPRT eventually rejects.
+        .env("PICE_STUB_SCORES", "9.5,0.001;9.5,0.001;9.5,0.001")
         .args(["evaluate", plan.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
