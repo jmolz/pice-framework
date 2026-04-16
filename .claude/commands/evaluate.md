@@ -78,6 +78,41 @@ If the script fails (e.g., Codex not configured), note the error and continue wi
 
 The Codex review challenges the *approach* — was this the right design? What assumptions does it depend on? Where could it fail under real-world conditions? This is complementary to the Claude evaluator's formal contract grading.
 
+#### Rate-Limit Fallback (ChatGPT Team → OpenAI API key)
+
+The Codex CLI authenticates via the user's ChatGPT Team session by default. When that session hits its rate limit, fall back to a direct OpenAI Responses API call — do **not** run `codex login --api-key`, as that would overwrite the ChatGPT Team session (making recovery manual once the rate limit lifts).
+
+**Fallback key location**: `~/.claude/.openai-fallback-key` — single line containing an OpenAI API key, `chmod 600`. If absent, skip fallback and report the rate-limit error verbatim.
+
+**Rate-limit detection** (in collected Codex output, case-insensitive): any of `rate limit`, `rate_limit_exceeded`, `429`, `too many requests`, `usage cap`, `quota exceeded`.
+
+**Fallback invocation** (only on detection, only if the key file exists):
+
+```bash
+OPENAI_FALLBACK_KEY=$(cat "$HOME/.claude/.openai-fallback-key")
+EFFORT="high"   # Tier 2 → "high"; Tier 3 → "xhigh" (Responses API supports xhigh for gpt-5.4)
+cat > /tmp/codex-fallback-request.json <<'JSON'
+{
+  "model": "gpt-5.4",
+  "reasoning": { "effort": "__EFFORT__" },
+  "input": "__PROMPT__"
+}
+JSON
+# Replace __EFFORT__ and __PROMPT__ with the actual values (jq or sed; escape JSON properly).
+curl -sS https://api.openai.com/v1/responses \
+  -H "Authorization: Bearer $OPENAI_FALLBACK_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/codex-fallback-request.json
+```
+
+Reserve sufficient output budget (OpenAI recommends ≥25k tokens for reasoning + output on gpt-5.4 at `xhigh`). Optionally pass `"max_output_tokens": 32000` and handle `status: "incomplete"` with `incomplete_details.reason === "max_output_tokens"` by retrying with a larger budget. Extract the visible answer from `response.output[].content[].text` (or `response.output_text`).
+
+The `__PROMPT__` must include: the same focus text passed to `codex-companion adversarial-review`, the contract criteria JSON, the full diff, and CLAUDE.md — i.e., the same context Codex would have received. Construct the prompt string explicitly rather than relying on Codex's internal prompt templates (which are not accessible outside the CLI).
+
+Treat the extracted text as the adversarial review output. Label it clearly in the final report as `Codex GPT-5.4 (OpenAI API fallback — ChatGPT Team rate-limited)`.
+
+Once the ChatGPT Team rate limit lifts, no action is required: the primary Codex path resumes on the next invocation, and the fallback triggers only on failure.
+
 ### Step 3b: Run Claude Evaluator Pass(es)
 
 For each Claude evaluation pass (1 for Tier 1, 1 for Tier 2, 3 for Tier 3 agent team), spawn a **fresh sub-agent** with the following prompt. The sub-agent must use the most capable available model.
@@ -180,6 +215,12 @@ The new evaluator does NOT see the implementation conversation — only prior ev
 If a Codex adversarial review was launched in Step 3a, collect its results now. The background Bash task should have completed (or will complete shortly) — wait for the completion notification if it hasn't arrived yet, then read the full output.
 
 If the background task is still running after all Claude evaluation passes are complete, wait up to 5 minutes. If it times out or errored, note this in the final report and proceed with Claude-only results.
+
+**Before proceeding**, scan the collected Codex output for rate-limit markers (see Step 3a → Rate-Limit Fallback). If any are present:
+
+1. If `~/.claude/.openai-fallback-key` exists → run the fallback curl invocation from Step 3a and substitute the fallback output for the Codex output.
+2. If the key file is missing → report to the user:
+   `Codex adversarial review was rate-limited. Paste your OpenAI API key into ~/.claude/.openai-fallback-key (chmod 600) to enable fallback, then re-run /evaluate. Proceeding with Claude-only evaluation for now.`
 
 The Codex review output challenges design decisions and assumptions — it does NOT score against the contract. Treat its findings as a separate evaluation dimension.
 
