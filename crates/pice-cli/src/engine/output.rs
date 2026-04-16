@@ -309,9 +309,18 @@ mod tests {
             total_cost_usd: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
-        assert!(!json.contains("halted_by"), "expected halted_by omitted: {json}");
-        assert!(!json.contains("final_confidence"), "expected final_confidence omitted: {json}");
-        assert!(!json.contains("total_cost_usd"), "expected total_cost_usd omitted: {json}");
+        assert!(
+            !json.contains("halted_by"),
+            "expected halted_by omitted: {json}"
+        );
+        assert!(
+            !json.contains("final_confidence"),
+            "expected final_confidence omitted: {json}"
+        );
+        assert!(
+            !json.contains("total_cost_usd"),
+            "expected total_cost_usd omitted: {json}"
+        );
     }
 
     #[test]

@@ -166,10 +166,12 @@ pub async fn run(
 /// Returns `None` when the manifest does not exist, fails to read, or fails
 /// to parse — `pice status` must remain best-effort regardless of manifest
 /// state.
-fn load_layer_snapshot(plan_path: &std::path::Path, project_root: &std::path::Path) -> Option<Value> {
+fn load_layer_snapshot(
+    plan_path: &std::path::Path,
+    project_root: &std::path::Path,
+) -> Option<Value> {
     let feature_id = plan_path.file_stem().and_then(|s| s.to_str())?;
-    let manifest_path =
-        VerificationManifest::manifest_path_for(feature_id, project_root).ok()?;
+    let manifest_path = VerificationManifest::manifest_path_for(feature_id, project_root).ok()?;
     if !manifest_path.exists() {
         return None;
     }
@@ -365,8 +367,17 @@ mod tests {
         }
     }
 
+    /// Process-global mutex serializing tests that set `HOME`. The variable
+    /// is process-wide, so unsynchronized tests would race on it (and on
+    /// `~/.pice/state/` resolution).
+    fn home_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     #[test]
     fn load_layer_snapshot_returns_none_when_manifest_missing() {
+        let _g = home_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         let project_root = tmp.path();
@@ -377,6 +388,7 @@ mod tests {
 
     #[test]
     fn load_layer_snapshot_surfaces_adaptive_fields_in_json() {
+        let _g = home_lock().lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         std::env::set_var("HOME", tmp.path());
         let project_root = tmp.path();
@@ -422,7 +434,10 @@ mod tests {
         render_adaptive_layer_block(&mut out, &layers);
 
         // Header and layer row both present.
-        assert!(out.contains("Adaptive (per-layer)"), "missing box header: {out}");
+        assert!(
+            out.contains("Adaptive (per-layer)"),
+            "missing box header: {out}"
+        );
         assert!(out.contains("backend"), "missing layer name: {out}");
         assert!(out.contains("p=3"), "missing pass count: {out}");
         // "sprt_confidence_reached" gets truncated to fit the 14-char column.
@@ -444,6 +459,9 @@ mod tests {
 
         let mut out = String::new();
         render_adaptive_layer_block(&mut out, &layers);
-        assert!(out.is_empty(), "expected empty render for legacy-only layers; got: {out}");
+        assert!(
+            out.is_empty(),
+            "expected empty render for legacy-only layers; got: {out}"
+        );
     }
 }
