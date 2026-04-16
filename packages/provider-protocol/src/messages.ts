@@ -106,6 +106,8 @@ export interface EvaluateCreateParams {
    * the daemon tolerates absence and defaults to no seam verification.
    */
   seamChecks?: SeamCheckSpec[];
+  /** 0-indexed pass number within an adaptive evaluation loop. Advisory. */
+  passIndex?: number;
 }
 
 /**
@@ -156,6 +158,10 @@ export interface SeamCheckResult {
 
 export interface EvaluateCreateResult {
   sessionId: string;
+  /** Estimated cost in USD for this pass. Provider-reported. */
+  costUsd?: number;
+  /** Provider's own confidence estimate (0.0–1.0) for this pass. */
+  confidence?: number;
 }
 
 export interface EvaluateScoreParams {

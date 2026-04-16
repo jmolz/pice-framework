@@ -468,6 +468,79 @@ fn effective_tier_for(workflow: &WorkflowConfig, layer_name: &str) -> u8 {
         .unwrap_or(workflow.defaults.tier)
 }
 
+/// Resolve the effective `min_confidence` for a layer.
+/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
+#[allow(dead_code)]
+fn effective_min_confidence_for(workflow: &WorkflowConfig, layer_name: &str) -> f64 {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.min_confidence)
+        .unwrap_or(workflow.defaults.min_confidence)
+}
+
+/// Resolve the effective `max_passes` for a layer.
+/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
+#[allow(dead_code)]
+fn effective_max_passes_for(workflow: &WorkflowConfig, layer_name: &str) -> u32 {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.max_passes)
+        .unwrap_or(workflow.defaults.max_passes)
+}
+
+/// Resolve the effective `budget_usd` for a layer.
+/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
+#[allow(dead_code)]
+fn effective_budget_usd_for(workflow: &WorkflowConfig, layer_name: &str) -> f64 {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.budget_usd)
+        .unwrap_or(workflow.defaults.budget_usd)
+}
+
+/// Resolve the effective adaptive config for a layer: algorithm, SPRT, ADTS, VEC.
+///
+/// The per-layer override can only choose a different `AdaptiveAlgo`; the
+/// sub-configs (`SprtConfig`, `AdtsConfig`, `VecConfig`) are set project-wide
+/// on `EvaluatePhase` and are not overridable per-layer. This keeps the
+/// per-layer surface small (single enum choice) while the project owner
+/// controls the tuning knobs globally.
+/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
+#[allow(dead_code)]
+fn effective_adaptive_config_for(
+    workflow: &WorkflowConfig,
+) -> (
+    pice_core::workflow::schema::AdaptiveAlgo,
+    pice_core::adaptive::SprtConfig,
+    pice_core::adaptive::AdtsConfig,
+    pice_core::adaptive::VecConfig,
+) {
+    (
+        workflow.phases.evaluate.adaptive_algorithm,
+        workflow.phases.evaluate.sprt,
+        workflow.phases.evaluate.adts,
+        workflow.phases.evaluate.vec,
+    )
+}
+
+/// Resolve the effective `AdaptiveAlgo` for a specific layer. Layer override
+/// wins; else falls back to the project-wide `evaluate.adaptive_algorithm`.
+/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
+#[allow(dead_code)]
+fn effective_adaptive_algo_for(
+    workflow: &WorkflowConfig,
+    layer_name: &str,
+) -> pice_core::workflow::schema::AdaptiveAlgo {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.adaptive_algorithm)
+        .unwrap_or(workflow.phases.evaluate.adaptive_algorithm)
+}
+
 /// Load a layer-specific contract file, falling back to a generic message.
 fn load_layer_contract(
     project_root: &Path,
@@ -909,6 +982,113 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "config_mismatch" && c.status == CheckStatus::Failed),
             "seam_checks should include the Failed config_mismatch entry"
+        );
+    }
+
+    // ─── Effective-resolution helper tests ──────────────────────────────
+
+    #[test]
+    fn effective_min_confidence_falls_back_to_defaults() {
+        let wf = test_workflow();
+        let eff = effective_min_confidence_for(&wf, "nonexistent");
+        assert!((eff - wf.defaults.min_confidence).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_min_confidence_uses_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                min_confidence: Some(0.99),
+                ..Default::default()
+            },
+        );
+        assert!((effective_min_confidence_for(&wf, "backend") - 0.99).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_max_passes_falls_back_to_defaults() {
+        let wf = test_workflow();
+        assert_eq!(
+            effective_max_passes_for(&wf, "nonexistent"),
+            wf.defaults.max_passes
+        );
+    }
+
+    #[test]
+    fn effective_max_passes_uses_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                max_passes: Some(10),
+                ..Default::default()
+            },
+        );
+        assert_eq!(effective_max_passes_for(&wf, "backend"), 10);
+    }
+
+    #[test]
+    fn effective_budget_usd_falls_back_to_defaults() {
+        let wf = test_workflow();
+        assert!(
+            (effective_budget_usd_for(&wf, "nonexistent") - wf.defaults.budget_usd).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn effective_budget_usd_uses_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                budget_usd: Some(0.05),
+                ..Default::default()
+            },
+        );
+        assert!((effective_budget_usd_for(&wf, "backend") - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_adaptive_config_returns_project_values() {
+        let wf = test_workflow();
+        let (algo, sprt, adts, vec_cfg) = effective_adaptive_config_for(&wf);
+        assert_eq!(
+            algo,
+            pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
+        );
+        assert_eq!(sprt, pice_core::adaptive::SprtConfig::default());
+        assert_eq!(adts, pice_core::adaptive::AdtsConfig::default());
+        assert_eq!(vec_cfg, pice_core::adaptive::VecConfig::default());
+    }
+
+    #[test]
+    fn effective_adaptive_algo_falls_back_to_evaluate_phase() {
+        let wf = test_workflow();
+        assert_eq!(
+            effective_adaptive_algo_for(&wf, "nonexistent"),
+            pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
+        );
+    }
+
+    #[test]
+    fn effective_adaptive_algo_uses_layer_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                adaptive_algorithm: Some(pice_core::workflow::schema::AdaptiveAlgo::None),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            effective_adaptive_algo_for(&wf, "backend"),
+            pice_core::workflow::schema::AdaptiveAlgo::None
+        );
+        assert_eq!(
+            effective_adaptive_algo_for(&wf, "frontend"),
+            pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
         );
     }
 }

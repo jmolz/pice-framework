@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::adaptive::types::{AdtsConfig, SprtConfig, VecConfig};
+
 /// Top-level `.pice/workflow.yaml` configuration.
 ///
 /// `deny_unknown_fields` on every workflow struct catches (a) misspelled
@@ -126,6 +128,12 @@ impl Default for RetryConfig {
 }
 
 /// `phases.evaluate` — dual-model scoring phase.
+///
+/// The `sprt`, `adts`, and `vec` sub-configs hold the per-algorithm tuning
+/// parameters. They use overlay merge (NOT floor merge) at the framework→
+/// project→user boundaries — algorithm tuning is not a security guardrail
+/// the way `min_confidence` and `budget_usd` are. See `workflow::merge`
+/// and `.claude/rules/workflow-yaml.md` for the policy distinction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct EvaluatePhase {
@@ -138,6 +146,12 @@ pub struct EvaluatePhase {
     #[serde(default)]
     pub adaptive_algorithm: AdaptiveAlgo,
     #[serde(default)]
+    pub sprt: SprtConfig,
+    #[serde(default)]
+    pub adts: AdtsConfig,
+    #[serde(default)]
+    pub vec: VecConfig,
+    #[serde(default)]
     pub model_override: BTreeMap<String, String>,
 }
 
@@ -148,6 +162,9 @@ impl Default for EvaluatePhase {
             parallel: true,
             seam_checks: true,
             adaptive_algorithm: AdaptiveAlgo::default(),
+            sprt: SprtConfig::default(),
+            adts: AdtsConfig::default(),
+            vec: VecConfig::default(),
             model_override: BTreeMap::new(),
         }
     }
@@ -165,6 +182,11 @@ pub enum AdaptiveAlgo {
 }
 
 /// Per-layer override. All fields are optional — absent fields inherit from defaults.
+///
+/// `adaptive_algorithm` allows a layer to override the project-wide algorithm
+/// choice — e.g., picking `none` for an `experimental` layer that only wants
+/// the budget guardrail. This field is overlay-merged (no floor) since
+/// algorithm choice is orchestration tuning, not a security boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LayerOverride {
@@ -180,6 +202,8 @@ pub struct LayerOverride {
     pub require_review: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_algorithm: Option<AdaptiveAlgo>,
 }
 
 /// Review gate configuration.
@@ -226,4 +250,80 @@ pub enum OnTimeout {
     Reject,
     Approve,
     Skip,
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `EvaluatePhase` rejects misspelled keys (`sprtt` vs `sprt`). Without
+    /// `deny_unknown_fields` the typo would silently no-op and the user's
+    /// adaptive tuning would have no effect — the foot-gun every `pice-core`
+    /// schema closes per `.claude/rules/rust-core.md`.
+    #[test]
+    fn evaluate_phase_deny_unknown_fields() {
+        let yaml = "sprtt: {}\n";
+        let err = serde_yaml::from_str::<EvaluatePhase>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("sprtt"),
+            "error message must name the bad field: {err}"
+        );
+    }
+
+    #[test]
+    fn sprt_config_denies_unknown_fields() {
+        let yaml = "accept_thresholdd: 19.0\n";
+        let err = serde_yaml::from_str::<SprtConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("accept_thresholdd"),
+            "error must name the bad field: {err}"
+        );
+    }
+
+    #[test]
+    fn adts_config_denies_unknown_fields() {
+        let yaml = "divergence_thresholdz: 2.0\n";
+        let err = serde_yaml::from_str::<AdtsConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("divergence_thresholdz"),
+            "error must name the bad field: {err}"
+        );
+    }
+
+    #[test]
+    fn vec_config_denies_unknown_fields() {
+        let yaml = "entropy_floorz: 0.01\n";
+        let err = serde_yaml::from_str::<VecConfig>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("entropy_floorz"),
+            "error must name the bad field: {err}"
+        );
+    }
+
+    /// `LayerOverride.adaptive_algorithm` is optional and parses the
+    /// `snake_case` enum tag. Confirms the new field is wired up to the
+    /// shared `AdaptiveAlgo` enum (not duplicated locally).
+    #[test]
+    fn layer_override_parses_adaptive_algorithm() {
+        let yaml = "adaptive_algorithm: vec\n";
+        let parsed: LayerOverride = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(parsed.adaptive_algorithm, Some(AdaptiveAlgo::Vec));
+
+        let yaml_none = "adaptive_algorithm: none\n";
+        let parsed_none: LayerOverride = serde_yaml::from_str(yaml_none).unwrap();
+        assert_eq!(parsed_none.adaptive_algorithm, Some(AdaptiveAlgo::None));
+    }
+
+    /// Defaults applied to omitted sub-configs match the algorithm modules'
+    /// own defaults — guards against silent drift if someone tweaks
+    /// `SprtConfig::default()` without re-running schema tests.
+    #[test]
+    fn evaluate_phase_default_sub_configs_match_module_defaults() {
+        let phase = EvaluatePhase::default();
+        assert_eq!(phase.sprt, SprtConfig::default());
+        assert_eq!(phase.adts, AdtsConfig::default());
+        assert_eq!(phase.vec, VecConfig::default());
+    }
 }

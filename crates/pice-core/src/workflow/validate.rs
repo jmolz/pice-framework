@@ -144,7 +144,79 @@ pub fn validate_schema_only(cfg: &WorkflowConfig) -> ValidationReport {
         }
     }
 
+    validate_adaptive_into(cfg, &mut report);
+
     report
+}
+
+/// Check adaptive sub-config ranges on the resolved evaluate phase.
+///
+/// Called inside `validate_schema_only` so both `pice validate` and the
+/// daemon's pre-execution validation catch misconfigured algorithm tuning.
+fn validate_adaptive_into(cfg: &WorkflowConfig, report: &mut ValidationReport) {
+    let eval = &cfg.phases.evaluate;
+
+    // SPRT: accept > reject, both positive
+    if eval.sprt.accept_threshold <= eval.sprt.reject_threshold {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.sprt".into(),
+            message: format!(
+                "accept_threshold ({}) must be > reject_threshold ({})",
+                eval.sprt.accept_threshold, eval.sprt.reject_threshold
+            ),
+            line: None,
+            column: None,
+        });
+    }
+    if eval.sprt.prior_alpha <= 0.0 || eval.sprt.prior_beta <= 0.0 {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.sprt".into(),
+            message: format!(
+                "prior_alpha ({}) and prior_beta ({}) must both be > 0",
+                eval.sprt.prior_alpha, eval.sprt.prior_beta
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    // ADTS: divergence in [0, 10]
+    if !(0.0..=10.0).contains(&eval.adts.divergence_threshold) {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.adts.divergence_threshold".into(),
+            message: format!(
+                "divergence_threshold must be in [0, 10]; got {}",
+                eval.adts.divergence_threshold
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    // VEC: entropy_floor > 0
+    if eval.vec.entropy_floor <= 0.0 {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.vec.entropy_floor".into(),
+            message: format!("entropy_floor must be > 0; got {}", eval.vec.entropy_floor),
+            line: None,
+            column: None,
+        });
+    }
+
+    // Per-layer override: max_passes and budget_usd (not already covered above
+    // because max_passes=0 on a layer was not previously checked in the loop)
+    for (layer, o) in &cfg.layer_overrides {
+        if let Some(mp) = o.max_passes {
+            if mp == 0 {
+                report.errors.push(ValidationError {
+                    field: format!("layer_overrides.{layer}.max_passes"),
+                    message: "max_passes must be ≥ 1".into(),
+                    line: None,
+                    column: None,
+                });
+            }
+        }
+    }
 }
 
 // ─── Trigger checks ─────────────────────────────────────────────────────────
@@ -982,6 +1054,94 @@ mod tests {
         cfg.seams = Some(seams);
         let report = validate_seams(&cfg, &sample_layers(), &sample_registry());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
+    }
+
+    // ─── Adaptive validation tests ────────────────────────────────────
+
+    #[test]
+    fn adaptive_defaults_pass_validation() {
+        let cfg = embedded_defaults();
+        let report = validate_schema_only(&cfg);
+        assert!(report.is_ok(), "defaults must pass: {:?}", report.errors);
+    }
+
+    #[test]
+    fn sprt_accept_le_reject_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.sprt.accept_threshold = 0.5;
+        cfg.phases.evaluate.sprt.reject_threshold = 0.5;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("sprt") && e.message.contains("accept_threshold")));
+    }
+
+    #[test]
+    fn sprt_prior_alpha_zero_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.sprt.prior_alpha = 0.0;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("sprt") && e.message.contains("prior_alpha")));
+    }
+
+    #[test]
+    fn adts_divergence_out_of_range_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.adts.divergence_threshold = 11.0;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("adts") && e.message.contains("divergence_threshold")));
+    }
+
+    #[test]
+    fn vec_entropy_floor_zero_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.vec.entropy_floor = 0.0;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("vec") && e.message.contains("entropy_floor")));
+    }
+
+    #[test]
+    fn layer_override_max_passes_zero_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                max_passes: Some(0),
+                ..Default::default()
+            },
+        );
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("backend") && e.message.contains("max_passes")));
+    }
+
+    #[test]
+    fn adaptive_collects_all_errors() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.sprt.accept_threshold = 0.01;
+        cfg.phases.evaluate.sprt.reject_threshold = 1.0;
+        cfg.phases.evaluate.sprt.prior_alpha = -1.0;
+        cfg.phases.evaluate.adts.divergence_threshold = -0.5;
+        cfg.phases.evaluate.vec.entropy_floor = -0.01;
+        let report = validate_schema_only(&cfg);
+        assert!(
+            report.errors.len() >= 4,
+            "expected multiple adaptive errors collected, got {}: {:?}",
+            report.errors.len(),
+            report.errors
+        );
     }
 
     #[test]

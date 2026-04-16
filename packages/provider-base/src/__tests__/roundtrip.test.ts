@@ -15,6 +15,7 @@ import type {
   ResponseCompleteParams,
   ResponseToolUseParams,
   EvaluateCreateParams,
+  EvaluateCreateResult,
   SeamCheckSpec,
   SeamCheckResult,
   SeamCheckStatus,
@@ -465,6 +466,59 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     expect(METHOD_NOT_FOUND).toBe(-32601);
     expect(PROVIDER_NOT_INITIALIZED).toBe(-32000);
     expect(SESSION_NOT_FOUND).toBe(-32001);
+  });
+
+  // ── Phase 4 adaptive protocol roundtrips ──────────────────────────
+
+  it('EvaluateCreateParams with passIndex roundtrips', () => {
+    const params: EvaluateCreateParams = {
+      contract: { criteria: [] },
+      diff: '+line',
+      claudeMd: '# R',
+      passIndex: 3,
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"passIndex":3');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.passIndex).toBe(3);
+  });
+
+  it('EvaluateCreateParams without passIndex omits field', () => {
+    const params: EvaluateCreateParams = {
+      contract: {},
+      diff: '',
+      claudeMd: '',
+    };
+    const json = JSON.stringify(params);
+    expect(json).not.toContain('passIndex');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.passIndex).toBeUndefined();
+  });
+
+  it('EvaluateCreateResult with costUsd and confidence roundtrips', () => {
+    const result: EvaluateCreateResult = {
+      sessionId: 'eval-42',
+      costUsd: 0.025,
+      confidence: 0.93,
+    };
+    const json = JSON.stringify(result);
+    expect(json).toContain('"costUsd"');
+    expect(json).toContain('"confidence"');
+    const parsed: EvaluateCreateResult = JSON.parse(json);
+    expect(parsed.costUsd).toBe(0.025);
+    expect(parsed.confidence).toBe(0.93);
+  });
+
+  it('EvaluateCreateResult without costUsd/confidence omits fields', () => {
+    const result: EvaluateCreateResult = {
+      sessionId: 'eval-43',
+    };
+    const json = JSON.stringify(result);
+    expect(json).not.toContain('costUsd');
+    expect(json).not.toContain('confidence');
+    const parsed: EvaluateCreateResult = JSON.parse(json);
+    expect(parsed.costUsd).toBeUndefined();
+    expect(parsed.confidence).toBeUndefined();
   });
 
   it('full request/response wire format matches Rust', () => {

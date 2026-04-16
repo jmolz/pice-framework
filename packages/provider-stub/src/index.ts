@@ -1,5 +1,6 @@
-import type { ProviderCapabilities } from '@pice/provider-protocol';
+import type { ProviderCapabilities, EvaluateCreateParams } from '@pice/provider-protocol';
 import { BaseProvider, StdioTransport } from '@pice/provider-base';
+import { parseStubScores, getStubEntry, type StubScoreEntry } from './deterministic.js';
 
 let nextSessionId = 1;
 
@@ -13,6 +14,13 @@ let nextSessionId = 1;
  */
 export class StubProvider extends BaseProvider {
   private evalContracts = new Map<string, unknown>();
+  private stubScores: StubScoreEntry[];
+
+  constructor(version: string) {
+    super(version);
+    const raw = process.env['PICE_STUB_SCORES'];
+    this.stubScores = raw ? parseStubScores(raw) : [];
+  }
 
   getCapabilities(): ProviderCapabilities {
     return {
@@ -57,17 +65,23 @@ export class StubProvider extends BaseProvider {
     transport.registerMethod('evaluate/create', async (params: unknown) => {
       this.requireInitialized();
       const sessionId = `stub-eval-${nextSessionId++}`;
-      // Store the contract so evaluate/score can return matching criterion names
-      const { contract } = params as { contract?: { criteria?: Array<{ name: string; threshold: number }> } };
-      this.evalContracts.set(sessionId, contract);
-      return { sessionId };
+      const p = params as EvaluateCreateParams;
+      this.evalContracts.set(sessionId, p.contract);
+
+      const passIndex = p.passIndex ?? 0;
+      const entry = getStubEntry(this.stubScores, passIndex);
+
+      return {
+        sessionId,
+        ...(entry ? { costUsd: entry.cost, confidence: entry.score / 10.0 } : {}),
+      };
     });
 
     transport.registerMethod('evaluate/score', async (params: unknown) => {
       this.requireInitialized();
       const { sessionId } = params as { sessionId: string };
 
-      // Build scores matching the contract criteria names (if available)
+      const defaultScore = 8;
       const contract = this.evalContracts.get(sessionId) as
         | { criteria?: Array<{ name: string; threshold: number }> }
         | undefined;
@@ -75,12 +89,12 @@ export class StubProvider extends BaseProvider {
       const scores = criteria.length > 0
         ? criteria.map((c: { name: string; threshold: number }) => ({
             name: c.name,
-            score: 8,
+            score: defaultScore,
             threshold: c.threshold,
-            passed: true,
+            passed: defaultScore >= c.threshold,
             findings: 'Stub evaluation — criterion passes by default',
           }))
-        : [{ name: 'stub-criterion', score: 8, threshold: 7, passed: true, findings: 'Stub evaluation' }];
+        : [{ name: 'stub-criterion', score: defaultScore, threshold: 7, passed: true, findings: 'Stub evaluation' }];
 
       transport.sendNotification('evaluate/result', {
         sessionId,

@@ -330,6 +330,10 @@ pub struct EvaluateCreateParams {
         rename = "seamChecks"
     )]
     pub seam_checks: Option<Vec<SeamCheckSpec>>,
+    /// 0-indexed pass number within an adaptive evaluation loop. Absent
+    /// for single-pass (v0.1) evaluations. Advisory — providers may ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "passIndex")]
+    pub pass_index: Option<u32>,
 }
 
 /// Wire-form seam check specification, mirrored from `pice-core::seam::types`
@@ -346,10 +350,19 @@ pub struct SeamCheckSpec {
 }
 
 /// Result of the `evaluate/create` method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvaluateCreateResult {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+    /// Estimated cost in USD for this pass. Provider-reported; absent when
+    /// the provider has no cost metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "costUsd")]
+    pub cost_usd: Option<f64>,
+    /// Provider's own confidence estimate for this pass (0.0–1.0). Used by
+    /// the adaptive loop as a secondary signal; the primary confidence
+    /// comes from the Bayesian posterior in `pice-core::adaptive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 /// Parameters for the `evaluate/score` method.
@@ -672,6 +685,7 @@ mod tests {
             model: None,
             effort: None,
             seam_checks: None,
+            pass_index: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"claudeMd\""));
@@ -680,6 +694,10 @@ mod tests {
         assert!(
             !json.contains("seamChecks"),
             "None seam_checks should be skipped: {json}"
+        );
+        assert!(
+            !json.contains("passIndex"),
+            "None pass_index should be skipped: {json}"
         );
         let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.diff, "+added line");
@@ -694,6 +712,7 @@ mod tests {
             model: Some("gpt-5.4".to_string()),
             effort: Some("high".to_string()),
             seam_checks: None,
+            pass_index: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"model\""));
@@ -727,6 +746,7 @@ mod tests {
                     }),
                 },
             ]),
+            pass_index: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("seamChecks"));
@@ -740,6 +760,78 @@ mod tests {
         let bad = r#"{"id":"x","typo":1}"#;
         let res: Result<SeamCheckSpec, _> = serde_json::from_str(bad);
         assert!(res.is_err(), "unknown field should be rejected");
+    }
+
+    // ─── Phase 4 adaptive protocol roundtrips ──────────────────────────
+
+    #[test]
+    fn evaluate_create_params_with_pass_index_roundtrips() {
+        let params = EvaluateCreateParams {
+            contract: json!({"criteria": []}),
+            diff: "+line".into(),
+            claude_md: "# R".into(),
+            model: None,
+            effort: None,
+            seam_checks: None,
+            pass_index: Some(3),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            json.contains("\"passIndex\":3"),
+            "camelCase wire key: {json}"
+        );
+        let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pass_index, Some(3));
+    }
+
+    #[test]
+    fn evaluate_create_params_without_pass_index_omits_field_in_json() {
+        let params = EvaluateCreateParams {
+            contract: json!({}),
+            diff: String::new(),
+            claude_md: String::new(),
+            model: None,
+            effort: None,
+            seam_checks: None,
+            pass_index: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            !json.contains("passIndex"),
+            "None pass_index must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn evaluate_create_result_with_cost_and_confidence_roundtrips() {
+        let result = EvaluateCreateResult {
+            session_id: "eval-42".into(),
+            cost_usd: Some(0.025),
+            confidence: Some(0.93),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"costUsd\""), "camelCase wire key: {json}");
+        assert!(
+            json.contains("\"confidence\""),
+            "confidence present: {json}"
+        );
+        let parsed: EvaluateCreateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, result);
+    }
+
+    #[test]
+    fn evaluate_create_result_without_cost_omits_optional_fields() {
+        let result = EvaluateCreateResult {
+            session_id: "eval-43".into(),
+            cost_usd: None,
+            confidence: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("costUsd"), "None must be omitted: {json}");
+        assert!(!json.contains("confidence"), "None must be omitted: {json}");
+        let parsed: EvaluateCreateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cost_usd, None);
+        assert_eq!(parsed.confidence, None);
     }
 
     #[test]
