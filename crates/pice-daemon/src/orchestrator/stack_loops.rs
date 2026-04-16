@@ -13,7 +13,8 @@ use anyhow::{Context, Result};
 use pice_core::config::PiceConfig;
 use pice_core::layers::filter::{filter_diff_by_globs, scan_files_by_globs};
 use pice_core::layers::manifest::{
-    CheckStatus, LayerResult, LayerStatus, ManifestStatus, PassResult, VerificationManifest,
+    CheckStatus, LayerResult, LayerStatus, ManifestStatus, PassResult, SeamCheckResult,
+    VerificationManifest,
 };
 use pice_core::layers::{active_layers, LayersConfig};
 use pice_core::prompt::helpers::{get_git_diff, read_claude_md};
@@ -150,6 +151,15 @@ pub async fn run_stack_loops(
             }
         }
     }
+
+    // Invariant: every path in layer_paths must be repo-relative (no
+    // absolute prefixes). Both sources — changed-file diff extraction and
+    // scan_files_by_globs — produce relative paths, but a future caller
+    // could accidentally push an absolute. Debug-assert to catch early.
+    debug_assert!(
+        layer_paths.values().flatten().all(|p| p.is_relative()),
+        "layer_paths must contain only repo-relative paths"
+    );
 
     // Active-layer set as HashSet for runner.
     let active_set: HashSet<String> = active.iter().cloned().collect();
@@ -382,6 +392,48 @@ pub async fn run_stack_loops(
             if let Some(ref path) = manifest_path {
                 if let Err(e) = manifest.save(path) {
                     warn!("failed to checkpoint manifest: {e}");
+                }
+            }
+        }
+    }
+
+    // Post-process: propagate seam findings to inactive layers. When one
+    // side of a boundary is active and the other is skipped, the active
+    // side's `run_seams_for_layer` produces findings but the skipped side's
+    // manifest entry has empty `seam_checks`. A user reading the manifest
+    // for the inactive layer should see the boundary's findings (they affect
+    // both sides). This preserves the "complete per-layer view" invariant
+    // documented in stack-loops.md.
+    {
+        // Build a map of boundary → seam_checks from all layers that ran.
+        let mut boundary_findings: BTreeMap<String, Vec<SeamCheckResult>> = BTreeMap::new();
+        for layer in &manifest.layers {
+            for sc in &layer.seam_checks {
+                boundary_findings
+                    .entry(sc.boundary.clone())
+                    .or_default()
+                    .push(sc.clone());
+            }
+        }
+        // For each layer in the manifest, if it participates in a boundary
+        // but has no seam_checks for that boundary, copy them in.
+        for layer in &mut manifest.layers {
+            let layer_name = &layer.name;
+            for (raw_boundary, findings) in &boundary_findings {
+                let Ok(b) = LayerBoundary::parse(raw_boundary) else {
+                    continue;
+                };
+                if !b.touches(layer_name) {
+                    continue;
+                }
+                // Only propagate findings this layer doesn't already have.
+                for sc in findings {
+                    let already_has = layer.seam_checks.iter().any(|existing| {
+                        existing.boundary == sc.boundary && existing.name == sc.name
+                    });
+                    if !already_has {
+                        layer.seam_checks.push(sc.clone());
+                    }
                 }
             }
         }
