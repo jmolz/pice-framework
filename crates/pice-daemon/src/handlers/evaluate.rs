@@ -354,14 +354,22 @@ pub async fn run(
             // `SUM(pass_events.cost_usd)` within 1e-9 — the Phase 4 contract
             // criterion #10 cost-reconciliation invariant.
             let passes_used: u32 = manifest.layers.iter().map(|l| l.passes.len() as u32).sum();
+            // Phase 4 Pass-4 fix for Codex High: previously `sum > 0.0` gated
+            // emission, which collapsed `0.0` sums to None — breaking the
+            // cost-reconciliation invariant that `SUM(pass_events.cost_usd) ==
+            // evaluations.final_total_cost_usd` (layers can report Some(0.0)
+            // for zero-cost providers; we must preserve that as Some(0.0)
+            // upward, not None).
             let final_total_cost_usd: Option<f64> = {
-                let sum: f64 = manifest
-                    .layers
-                    .iter()
-                    .filter_map(|l| l.total_cost_usd)
-                    .sum();
-                if sum > 0.0 {
-                    Some(sum)
+                let any_reported = manifest.layers.iter().any(|l| l.total_cost_usd.is_some());
+                if any_reported {
+                    Some(
+                        manifest
+                            .layers
+                            .iter()
+                            .filter_map(|l| l.total_cost_usd)
+                            .sum(),
+                    )
                 } else {
                     None
                 }

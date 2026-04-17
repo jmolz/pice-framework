@@ -188,6 +188,18 @@ pub async fn run_adaptive_passes(
 
     let mut halted_by: Option<HaltReason> = None;
     let mut adts_halt_str: Option<String> = None;
+    // Phase 4 Pass-4 fix for Codex High: when a per-pass provider RPC fails
+    // mid-loop, the prior code propagated the error via `?`, discarding all
+    // accumulated state — including the passes/pass_events that had already
+    // been persisted for earlier passes. `runtime_failed_layer_result` then
+    // emitted a placeholder pass with no cost, so manifest totals stopped
+    // matching the sink rows that were actually written (Crit #16 breakage).
+    //
+    // Capture the error here instead. The loop breaks, preserves accumulated
+    // `passes`, `accumulated_cost`, and `escalation_events`, and the outer
+    // `halted_by_str` construction prioritizes this reason so
+    // `build_adaptive_layer_result` routes the layer to `Failed`.
+    let mut halted_by_runtime_error: Option<String> = None;
     let mut final_confidence: Option<f64> = None;
 
     for pass_index in 1..=ctx.max_passes {
@@ -218,7 +230,7 @@ pub async fn run_adaptive_passes(
         // matches the stub's `PICE_STUB_SCORES` array indexing (0-based).
         // Manifest `PassResult.index` stays 1-indexed (user-facing audit trail).
         let wire_pass_index = pass_index.saturating_sub(1);
-        let primary_out = primary
+        let primary_out = match primary
             .evaluate_one_pass(
                 ctx.contract.clone(),
                 ctx.diff.clone(),
@@ -229,7 +241,15 @@ pub async fn run_adaptive_passes(
                 next_fresh_context,
                 next_effort_override.clone(),
             )
-            .await?;
+            .await
+        {
+            Ok(out) => out,
+            Err(e) => {
+                // Pass-4 fix: capture and halt with partial state preserved.
+                halted_by_runtime_error = Some(format!("runtime_error:{e}"));
+                break;
+            }
+        };
         let primary_score = scalar_score(&primary_out);
         let primary_cost = primary_out.cost_usd;
         let primary_model_name = primary.provider_name().to_string();
@@ -316,7 +336,7 @@ pub async fn run_adaptive_passes(
                     .adversarial_model
                     .clone()
                     .unwrap_or_else(|| ctx.primary_model.clone());
-                let adv_out = adv
+                let adv_out = match adv
                     .evaluate_one_pass(
                         ctx.contract.clone(),
                         ctx.diff.clone(),
@@ -327,7 +347,20 @@ pub async fn run_adaptive_passes(
                         next_fresh_context,
                         next_effort_override.clone(),
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(out) => out,
+                    Err(e) => {
+                        // Pass-4 fix: the primary's PassResult + pass_events
+                        // row for this pass are ALREADY written above; halt
+                        // here with a runtime_error reason so reconciliation
+                        // stays intact (manifest and DB both have pass N
+                        // primary, no adversarial — accurate reflection of
+                        // what ran).
+                        halted_by_runtime_error = Some(format!("runtime_error:{e}"));
+                        break;
+                    }
+                };
                 let adv_score = scalar_score(&adv_out);
                 adversarial_score = adv_score;
                 let adv_cost = adv_out.cost_usd;
@@ -443,10 +476,17 @@ pub async fn run_adaptive_passes(
 
     // If we exited the loop without a halt reason, the natural explanation
     // is `max_passes` — we ran the full budget and no early halt fired.
-    let halted_by_str = match (halted_by, adts_halt_str) {
-        (_, Some(s)) => Some(s),
-        (Some(reason), None) => Some(reason.as_str().to_string()),
-        (None, None) => {
+    //
+    // Phase 4 Pass-4 fix: a runtime error captured mid-loop wins over every
+    // other halt reason. This is NOT a natural-convergence halt, so we must
+    // not label it `max_passes` or `sprt_*` or `vec_entropy`; downstream
+    // routing in `build_adaptive_layer_result` depends on the string starting
+    // with `"runtime_error:"` to route the layer to `Failed`.
+    let halted_by_str = match (halted_by_runtime_error, halted_by, adts_halt_str) {
+        (Some(s), _, _) => Some(s),
+        (None, _, Some(s)) => Some(s),
+        (None, Some(reason), None) => Some(reason.as_str().to_string()),
+        (None, None, None) => {
             if final_confidence.is_none() {
                 final_confidence = Some(posterior_mean_capped(&observations));
             }
@@ -454,10 +494,17 @@ pub async fn run_adaptive_passes(
         }
     };
 
-    let total_cost_usd = if accumulated_cost > 0.0 {
-        Some(accumulated_cost)
-    } else {
+    // Phase 4 Pass-4 fix for Codex High: previously `accumulated_cost == 0.0`
+    // collapsed to `None`, even when passes DID run with zero-cost providers.
+    // That broke the cost-reconciliation invariant:
+    // `SUM(passes[].cost_usd) == total_cost_usd` — the sum would be 0.0 while
+    // the total was null. Gate instead on "did any pass actually run".
+    // If zero passes ran (e.g. cold-start seed blocked pass 1), None is still
+    // the right answer because the manifest truly has no cost observations.
+    let total_cost_usd = if passes.is_empty() {
         None
+    } else {
+        Some(accumulated_cost)
     };
 
     let escalation_events = if ctx.algo == AdaptiveAlgo::Adts && !escalation_events.is_empty() {

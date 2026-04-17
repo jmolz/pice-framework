@@ -59,6 +59,17 @@ export class StubProvider extends BaseProvider {
    * `::NotStarted`. Used only by `runtime_error_fails_layer_not_pending`.
    */
   private evaluateError: string | undefined;
+  /**
+   * Phase 4 Pass-4 Codex High regression harness: when set, the stub throws
+   * the configured `evaluateError` only from pass `>=` this value (1-indexed,
+   * matching `PassResult.index`). Lets tests exercise the mid-loop error
+   * path where passes 1..N-1 succeed and pass N fails, so the adaptive loop
+   * must preserve already-recorded passes + pass_events instead of
+   * discarding them via the earlier `runtime_failed_layer_result` placeholder
+   * path. Consumed only by
+   * `mid_loop_runtime_error_preserves_prior_passes_and_costs`.
+   */
+  private evaluateErrorFromPass: number | undefined;
 
   constructor(version: string) {
     super(version);
@@ -68,6 +79,12 @@ export class StubProvider extends BaseProvider {
     this.adversarialScores = advRaw ? parseStubScores(advRaw) : [];
     this.requestLogPath = process.env['PICE_STUB_REQUEST_LOG'] || undefined;
     this.evaluateError = process.env['PICE_STUB_EVALUATE_ERROR'] || undefined;
+    // PICE_STUB_INIT_ERROR is read inline in registerHandlers — it must
+    // short-circuit BEFORE `this.initialized` is set by the base's default
+    // handler. The StubProvider constructor body runs AFTER super(), so a
+    // field set here wouldn't be visible when registerHandlers runs.
+    const fromRaw = process.env['PICE_STUB_EVALUATE_ERROR_FROM_PASS'];
+    this.evaluateErrorFromPass = fromRaw ? Number.parseInt(fromRaw, 10) : undefined;
   }
 
   getCapabilities(): ProviderCapabilities {
@@ -80,6 +97,24 @@ export class StubProvider extends BaseProvider {
   }
 
   protected registerHandlers(transport: StdioTransport): void {
+    // Pass-4 Codex Critical regression harness: re-register `initialize` to
+    // throw BEFORE the base marks the provider as initialized. The base's
+    // registrar ran first in the BaseProvider constructor; transport's
+    // registerMethod overwrites via a Map.set(). Production providers never
+    // set PICE_STUB_INIT_ERROR, so this path stays inert.
+    //
+    // `registerHandlers` runs from `super(version)` BEFORE StubProvider's own
+    // constructor body assigns `this.initError`, so the field is always
+    // undefined here. Read the env var directly to avoid the JS class-init
+    // ordering trap.
+    const initErrorEnv = process.env['PICE_STUB_INIT_ERROR'];
+    if (initErrorEnv) {
+      const msg = initErrorEnv;
+      transport.registerMethod('initialize', async (_params: unknown) => {
+        throw Object.assign(new Error(msg), { code: -32000 });
+      });
+    }
+
     transport.registerMethod('session/create', async (_params: unknown) => {
       this.requireInitialized();
       const sessionId = `stub-session-${nextSessionId++}`;
@@ -113,18 +148,32 @@ export class StubProvider extends BaseProvider {
     transport.registerMethod('evaluate/create', async (params: unknown) => {
       this.requireInitialized();
 
+      const p = params as EvaluateCreateParams;
+
       // Pass-3 regression harness: simulate a runtime RPC failure *after*
       // initialize/session succeeded. The daemon's `run_adaptive_passes`
       // propagates this to `try_run_layer_adaptive` which must route it to
       // `LayerAdaptiveResult::RuntimeError` → `LayerStatus::Failed` (exit 2),
       // NOT `NotStarted` (exit 0). Kept opt-in; production providers never
       // read this env var.
+      //
+      // Pass-4 extension: when `PICE_STUB_EVALUATE_ERROR_FROM_PASS` is set,
+      // the error only fires once `passIndex+1 >= from` (the wire form is
+      // 0-indexed; manifest indexing is 1-indexed). This lets tests cover
+      // the mid-loop partial-passes case: passes 1..N-1 complete, pass N
+      // throws — exercising the adaptive loop's new "preserve prior passes"
+      // halt path.
       if (this.evaluateError) {
-        throw Object.assign(new Error(this.evaluateError), { code: -32000 });
+        const wireIndex = p.passIndex ?? 0;
+        const manifestIndex = wireIndex + 1;
+        const threshold = this.evaluateErrorFromPass;
+        const shouldThrow = threshold === undefined || manifestIndex >= threshold;
+        if (shouldThrow) {
+          throw Object.assign(new Error(this.evaluateError), { code: -32000 });
+        }
       }
 
       const sessionId = `stub-eval-${nextSessionId++}`;
-      const p = params as EvaluateCreateParams;
 
       // Role selection for ADTS: if the model string contains "adversarial"
       // (case-insensitive) AND PICE_STUB_ADVERSARIAL_SCORES is set, use that

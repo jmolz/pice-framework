@@ -31,7 +31,7 @@ use pice_core::layers::{LayerDef, LayersConfig, LayersTable};
 use pice_core::workflow::schema::AdaptiveAlgo;
 use pice_core::workflow::WorkflowConfig;
 use pice_daemon::orchestrator::stack_loops::{run_stack_loops, StackLoopsConfig};
-use pice_daemon::orchestrator::{NullPassSink, NullSink};
+use pice_daemon::orchestrator::{NullPassSink, NullSink, RecordingPassSink};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
@@ -116,6 +116,62 @@ impl StubEvaluateErrorGuard {
 impl Drop for StubEvaluateErrorGuard {
     fn drop(&mut self) {
         std::env::remove_var("PICE_STUB_EVALUATE_ERROR");
+    }
+}
+
+/// Phase 4 Pass-4 regression helper — Codex Critical #1 (start-error
+/// classification). Sets `PICE_STUB_INIT_ERROR` so the stub's re-registered
+/// `initialize` handler throws a JSON-RPC error. The provider spawns cleanly
+/// (node starts, script loads, BaseProvider runs), but the initialize RPC
+/// fails — which is the exact shape the Pass-4 fix must classify as a
+/// RuntimeError → LayerStatus::Failed, NOT a NotStarted → Pending. The
+/// resolve-probe in `try_run_layer_adaptive` SUCCEEDS (stub is registered),
+/// so the error flows through the startup-failure arm, not the
+/// unresolvable-provider arm.
+struct StubInitErrorGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StubInitErrorGuard {
+    fn new(message: &str) -> Self {
+        let guard = stub_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PICE_STUB_INIT_ERROR", message);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for StubInitErrorGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("PICE_STUB_INIT_ERROR");
+    }
+}
+
+/// Phase 4 Pass-4 regression helper — Codex High (partial-run cost
+/// reconciliation). Bundles `PICE_STUB_SCORES` + `PICE_STUB_EVALUATE_ERROR`
+/// + `PICE_STUB_EVALUATE_ERROR_FROM_PASS` so the stub completes passes
+/// `1..from-1` normally, then throws on pass `from`. Exercises the adaptive
+/// loop's "preserve prior passes on mid-loop error" halt path — the passes
+/// already written to the sink must stay in the manifest and total_cost_usd
+/// must match Σ(pass_events.cost_usd).
+struct StubMidLoopErrorGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StubMidLoopErrorGuard {
+    fn new(scores: &str, message: &str, from_pass: u32) -> Self {
+        let guard = stub_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PICE_STUB_SCORES", scores);
+        std::env::set_var("PICE_STUB_EVALUATE_ERROR", message);
+        std::env::set_var("PICE_STUB_EVALUATE_ERROR_FROM_PASS", from_pass.to_string());
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for StubMidLoopErrorGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("PICE_STUB_SCORES");
+        std::env::remove_var("PICE_STUB_EVALUATE_ERROR");
+        std::env::remove_var("PICE_STUB_EVALUATE_ERROR_FROM_PASS");
     }
 }
 
@@ -1158,26 +1214,28 @@ async fn pass_events_sink_mirrors_debited_cost_on_fallback() {
 
 // ─── Pass-3 regression: runtime errors fail the layer, not Pending ─────────
 
-/// Phase 4 Pass-3 regression for Codex Critical #2.
+/// Phase 4 Pass-3 regression for Codex Critical #2, extended by the Pass-4
+/// fix for Codex High (mid-loop cost reconciliation). Earlier code mapped
+/// ANY `Err` from `run_adaptive_passes` — including runtime RPC failures,
+/// provider timeouts, and provider crashes mid-loop — to `None`, then to the
+/// phase-1-pending placeholder. The manifest's overall status stayed "no
+/// failed layers" → daemon exits 0. A CI pipeline gating on `pice evaluate`
+/// would PASS through a broken evaluation, silently masking a real bug.
 ///
-/// Earlier code mapped ANY `Err` from `run_adaptive_passes` — including
-/// runtime RPC failures, provider timeouts, and provider crashes mid-loop —
-/// to `None`, and then to the phase-1-pending placeholder. The manifest
-/// overall status stayed "no failed layers", which routed the daemon to
-/// exit 0. A CI pipeline gating on `pice evaluate` would PASS through a
-/// broken evaluation, silently masking a real correctness problem.
+/// With the Pass-4 fix, the adaptive loop catches per-pass provider errors
+/// INTERNALLY instead of `?`-propagating them out, so passes recorded to
+/// the sink before the error survive in the manifest. The `halted_by`
+/// string is `runtime_error:{message}` and is prioritized over every other
+/// halt reason (max_passes, sprt_*, vec_entropy). `build_adaptive_layer_result`
+/// routes that string to `LayerStatus::Failed`, so the layer still fails
+/// closed — but the manifest and pass_events stay consistent.
 ///
-/// With the Pass-3 fix, the return is split: `NotStarted` still routes to
-/// `phase1_pending_layer_result` (test fixtures, missing providers), but
-/// `RuntimeError` now builds a `LayerStatus::Failed` result via
-/// `runtime_failed_layer_result`. The `halted_by` string is
-/// `runtime_error:{message}` so operators see why the layer failed.
-///
-/// This test wires the stub to throw a JSON-RPC error on `evaluate/create`
-/// via `PICE_STUB_EVALUATE_ERROR`, which exercises the exact code path:
-/// the provider spawns successfully, the daemon initializes the session,
-/// and then the first evaluation call errors. The layer must end up
-/// `Failed`, NOT `Pending`.
+/// This test wires the stub to throw on EVERY `evaluate/create` call via
+/// `PICE_STUB_EVALUATE_ERROR` (no from-pass gating), so pass 1 fails
+/// immediately. Since no passes completed before the error, the manifest
+/// has ZERO passes — which is exactly what the sink observed. The
+/// complementary `mid_loop_runtime_error_preserves_prior_passes_and_costs`
+/// test covers the non-empty-passes case.
 #[tokio::test]
 async fn runtime_error_fails_layer_not_pending() {
     let dir = tempfile::tempdir().unwrap();
@@ -1234,12 +1292,290 @@ async fn runtime_error_fails_layer_not_pending() {
         "halted_by should carry the provider's error message; got {halted:?}",
     );
 
-    // The placeholder pass row uses a distinct model name so operators
-    // can filter runtime-error layers apart from phase-1-pending ones.
+    // Pass-4 change: the loop now captures per-pass errors INTERNALLY and
+    // preserves already-recorded passes. On pass 1 nothing was recorded yet
+    // when the stub threw, so the manifest has zero passes — matching what
+    // the sink actually observed. Operators distinguish runtime-error layers
+    // from phase-1-pending ones via the `halted_by` string (asserted above),
+    // not via a synthetic placeholder pass.
+    assert_eq!(
+        backend.passes.len(),
+        0,
+        "pass 1 error must leave zero completed passes (was {})",
+        backend.passes.len(),
+    );
+    assert_eq!(
+        backend.total_cost_usd, None,
+        "zero completed passes ⇒ total_cost_usd is None",
+    );
+}
+
+// ─── Pass-4 regression: init failure fails the layer, preserves placeholder ──
+
+/// Phase 4 Pass-4 regression for Codex Critical #1 — start-error
+/// classification. Before the Pass-4 fix, `try_run_layer_adaptive` mapped
+/// ANY error from `ProviderOrchestrator::start` to `NotStarted` → Pending →
+/// exit 0. But `start` is resolve + spawn + initialize: a provider that is
+/// resolvable but fails to spawn or whose initialize RPC throws should
+/// fail-close the layer, not silently degrade to Pending. Only TRULY
+/// unresolvable providers (test fixtures, missing registry entries) should
+/// still route to Pending.
+///
+/// This test exercises the init-RPC-fails case via `PICE_STUB_INIT_ERROR`:
+/// the stub binary spawns normally, runs the BaseProvider constructor, and
+/// then its re-registered `initialize` handler throws. The Pass-4 fix's
+/// resolve-probe in `try_run_layer_adaptive` succeeds (stub is registered),
+/// so the subsequent `start()` failure routes through the RuntimeError arm
+/// → `runtime_failed_layer_result` → `LayerStatus::Failed`. The placeholder
+/// pass (model="runtime-error") is emitted here because zero passes ran —
+/// the evaluate loop never executed.
+#[tokio::test]
+async fn provider_init_failure_fails_layer_not_pending() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = setup_minimal_repo(dir.path());
+    let layers = single_layer_config();
+    let pice_config = stub_pice_config(false);
+    let workflow = workflow_with_adaptive(AdaptiveAlgo::BayesianSprt, 0.90, 3, 1.0, None);
+    let seams = BTreeMap::new();
+    let cfg = make_cfg(
+        &layers,
+        &plan_path,
+        dir.path(),
+        &pice_config,
+        &workflow,
+        &seams,
+    );
+
+    let _stub = StubInitErrorGuard::new("simulated init crash");
+
+    let mut sink = NullPassSink;
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        .await
+        .unwrap();
+
+    let backend = manifest
+        .layers
+        .iter()
+        .find(|l| l.name == "backend")
+        .unwrap();
+
+    // Core contract: resolvable-but-init-fails MUST route to Failed, not
+    // Pending. Before the Pass-4 fix this silently degraded to
+    // `phase-1-pending-tier-N` (exit 0), letting CI green-light a broken
+    // provider.
+    assert_eq!(
+        backend.status,
+        LayerStatus::Failed,
+        "init failure must fail the layer (not Pending); halted_by={:?}",
+        backend.halted_by,
+    );
+    let halted = backend.halted_by.clone().unwrap_or_default();
+    assert!(
+        halted.starts_with("runtime_error:"),
+        "expected halted_by to start with runtime_error:, got {halted:?}",
+    );
+    assert!(
+        halted.contains("simulated init crash"),
+        "halted_by should carry the provider's init error; got {halted:?}",
+    );
+
+    // Zero passes actually ran (the loop never executed), so
+    // `runtime_failed_layer_result` emits the placeholder pass for manifest
+    // well-formedness.
     assert_eq!(backend.passes.len(), 1);
     assert_eq!(backend.passes[0].model, "runtime-error");
     assert_eq!(backend.passes[0].score, None);
     assert_eq!(backend.passes[0].cost_usd, None);
+}
+
+// ─── Pass-4 regression: mid-loop error preserves prior passes + costs ────────
+
+/// Phase 4 Pass-4 regression for Codex High — cost reconciliation on
+/// partial runs. Before the fix, a provider error on pass N wiped out the
+/// manifest's record of passes 1..N-1 (they were replaced by
+/// `runtime_failed_layer_result`'s single placeholder) while the sink
+/// still held N-1 rows. The invariant
+/// `SUM(pass_events.cost_usd) == evaluations.final_total_cost_usd` then
+/// broke — DB sums were > 0, manifest totals said None.
+///
+/// With the Pass-4 fix, the adaptive loop captures per-pass errors without
+/// unwinding state. Passes 1..N-1 stay in the manifest with their scores +
+/// costs; the halt string is `runtime_error:{msg}` (routed to Failed), and
+/// `total_cost_usd` equals `Σ(passes[].cost_usd)` equals `Σ(sink.cost_usd)`.
+#[tokio::test]
+async fn mid_loop_runtime_error_preserves_prior_passes_and_costs() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = setup_minimal_repo(dir.path());
+    let layers = single_layer_config();
+    let pice_config = stub_pice_config(false);
+    // Budget large enough to reach pass 3; SPRT config that won't accept
+    // on the first two passes (score 7 is below 0.9 posterior threshold).
+    let workflow = workflow_with_adaptive(AdaptiveAlgo::BayesianSprt, 0.95, 5, 1.0, None);
+    let seams = BTreeMap::new();
+    let cfg = make_cfg(
+        &layers,
+        &plan_path,
+        dir.path(),
+        &pice_config,
+        &workflow,
+        &seams,
+    );
+
+    // Pass 1 and 2: score 7.0 at $0.02 each; the stub returns these cleanly.
+    // Pass 3 onward: stub throws `network timeout` (from-pass = 3).
+    let _stub = StubMidLoopErrorGuard::new(
+        "7.0,0.02;7.0,0.02;7.0,0.02;7.0,0.02;7.0,0.02",
+        "network timeout",
+        3,
+    );
+
+    let mut sink = RecordingPassSink::default();
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        .await
+        .unwrap();
+
+    let backend = manifest
+        .layers
+        .iter()
+        .find(|l| l.name == "backend")
+        .unwrap();
+
+    // Layer fails closed with the runtime-error halt reason.
+    assert_eq!(
+        backend.status,
+        LayerStatus::Failed,
+        "mid-loop provider error must fail the layer; halted_by={:?}",
+        backend.halted_by,
+    );
+    let halted = backend.halted_by.clone().unwrap_or_default();
+    assert!(
+        halted.starts_with("runtime_error:"),
+        "expected halted_by to start with runtime_error:, got {halted:?}",
+    );
+    assert!(
+        halted.contains("network timeout"),
+        "halted_by should carry the provider error; got {halted:?}",
+    );
+
+    // Core contract: passes completed BEFORE the error survive in the manifest.
+    // Passes 1 and 2 succeeded with cost 0.02 each; pass 3 threw and is NOT
+    // in the manifest (no PassResult was pushed — the error was captured
+    // before the record).
+    assert_eq!(
+        backend.passes.len(),
+        2,
+        "manifest must preserve passes 1 + 2; got {:?}",
+        backend.passes,
+    );
+    assert_eq!(backend.passes[0].index, 1);
+    assert_eq!(backend.passes[0].cost_usd, Some(0.02));
+    assert_eq!(backend.passes[1].index, 2);
+    assert_eq!(backend.passes[1].cost_usd, Some(0.02));
+
+    // Reconciliation: manifest `total_cost_usd` equals the per-pass sum
+    // equals Σ(sink.cost_usd). This is the invariant the pre-fix code broke.
+    let expected_total = 0.04_f64;
+    let total = backend.total_cost_usd.unwrap_or(-1.0);
+    assert!(
+        (total - expected_total).abs() < 1e-9,
+        "total_cost_usd = {total}, expected {expected_total}",
+    );
+    let sink_total: f64 = sink.rows.iter().map(|r| r.cost_usd.unwrap_or(0.0)).sum();
+    assert!(
+        (sink_total - expected_total).abs() < 1e-9,
+        "Σ(sink) = {sink_total}, expected {expected_total}",
+    );
+    assert_eq!(
+        sink.rows.len(),
+        2,
+        "sink must hold exactly the two completed passes",
+    );
+}
+
+// ─── Pass-4 regression: zero-cost totals ship as Some(0.0), not None ─────────
+
+/// Phase 4 Pass-4 regression for Codex High — zero-cost total collapse.
+/// Before the fix, `adaptive_loop.rs` emitted `total_cost_usd = None` when
+/// `accumulated_cost == 0.0`, and `handlers/evaluate.rs` emitted
+/// `final_total_cost_usd = None` when the sum over layers was 0.0. But
+/// per-pass rows STILL recorded `cost_usd = 0.0` when the provider reported
+/// a valid zero cost. The reconciliation invariant broke: sink rows summed
+/// to 0.0, manifest total was null — `(SUM(cost_usd) - final_total_cost_usd)`
+/// returned NULL for the evaluation, so the HAVING clause in the contract's
+/// validation query reported no violation but the invariant was broken.
+///
+/// With the Pass-4 fix, the gate is `passes.is_empty()` (adaptive_loop) and
+/// `any(|l| l.total_cost_usd.is_some())` (evaluate handler). When passes
+/// ran with zero cost, `total_cost_usd = Some(0.0)` all the way up.
+#[tokio::test]
+async fn zero_cost_provider_preserves_some_zero_total() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = setup_minimal_repo(dir.path());
+    let layers = single_layer_config();
+    let pice_config = stub_pice_config(false);
+    // Low min_confidence + 3 passes at score 3.0 → SPRT rejects; cost 0.0
+    // for all passes.
+    let workflow = workflow_with_adaptive(AdaptiveAlgo::BayesianSprt, 0.90, 3, 1.0, None);
+    let seams = BTreeMap::new();
+    let cfg = make_cfg(
+        &layers,
+        &plan_path,
+        dir.path(),
+        &pice_config,
+        &workflow,
+        &seams,
+    );
+
+    let _stub = StubScoresGuard::new("3.0,0.0;3.0,0.0;3.0,0.0");
+
+    let mut sink = RecordingPassSink::default();
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        .await
+        .unwrap();
+
+    let backend = manifest
+        .layers
+        .iter()
+        .find(|l| l.name == "backend")
+        .unwrap();
+
+    // At least one pass ran; its cost was 0.0.
+    assert!(
+        !backend.passes.is_empty(),
+        "zero-cost test requires at least one pass; got empty passes",
+    );
+    for pass in &backend.passes {
+        assert_eq!(
+            pass.cost_usd,
+            Some(0.0),
+            "every pass must record cost_usd = Some(0.0); got {:?}",
+            pass.cost_usd,
+        );
+    }
+
+    // Core contract: `total_cost_usd = Some(0.0)`, NOT `None`. This is the
+    // primary Pass-4 fix — passes ran, cost was observed (even if zero), so
+    // the total must be reported truthfully.
+    assert_eq!(
+        backend.total_cost_usd,
+        Some(0.0),
+        "zero-cost passes must keep total_cost_usd = Some(0.0), not None",
+    );
+
+    // Sink reconciliation: Σ(sink.cost_usd) == total_cost_usd, both 0.0.
+    let sink_total: f64 = sink.rows.iter().map(|r| r.cost_usd.unwrap_or(-1.0)).sum();
+    assert!(
+        (sink_total - 0.0).abs() < 1e-9,
+        "Σ(sink.cost_usd) must equal 0.0 for zero-cost passes; got {sink_total}",
+    );
+    for row in &sink.rows {
+        assert_eq!(
+            row.cost_usd,
+            Some(0.0),
+            "sink rows must mirror per-pass Some(0.0); got {:?}",
+            row.cost_usd,
+        );
+    }
 }
 
 /// Complementary to `runtime_error_fails_layer_not_pending`: verify that

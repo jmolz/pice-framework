@@ -535,12 +535,38 @@ async fn try_run_layer_adaptive(
         "contract_toml": contract_toml,
     });
 
+    // Phase 4 Pass-4 fix for Codex Critical: `ProviderOrchestrator::start` is
+    // resolve + spawn + initialize. Previously ANY error from that composite
+    // routed to `NotStarted` → `phase-1-pending` (exit 0). That silently
+    // swallowed real startup failures (provider binary present but crashes on
+    // spawn, init RPC times out, initialize returns a protocol error) —
+    // exactly the failure mode the Pass-3 fail-close work was trying to stop.
+    //
+    // The intended carve-out is narrower: "provider cannot be RESOLVED" → the
+    // workflow names a provider the config/registry doesn't know about, so
+    // there is nothing we could have run. Anything past resolution that
+    // breaks is a runtime failure and must fail-close the layer.
+    //
+    // Probe `registry::resolve` first. Success here means we have a command
+    // and argv; a subsequent `start()` error is spawn or initialize, which
+    // is a real startup failure → `RuntimeError` → `LayerStatus::Failed`.
+    if pice_core::provider::registry::resolve(cfg.primary_provider, cfg.pice_config).is_none() {
+        warn!(
+            layer = %layer_name,
+            provider = %cfg.primary_provider,
+            "primary provider unresolvable, falling back to phase-1-pending",
+        );
+        return LayerAdaptiveResult::NotStarted;
+    }
+
     let mut primary = match ProviderOrchestrator::start(cfg.primary_provider, cfg.pice_config).await
     {
         Ok(p) => p,
         Err(e) => {
-            warn!(layer = %layer_name, "failed to start primary provider, falling back to phase-1-pending: {e}");
-            return LayerAdaptiveResult::NotStarted;
+            let msg = format!("primary provider startup failed: {e:#}");
+            warn!(layer = %layer_name, "{msg}");
+            // Resolvable but failed to start — fail the layer closed.
+            return LayerAdaptiveResult::RuntimeError(msg);
         }
     };
 
@@ -549,6 +575,22 @@ async fn try_run_layer_adaptive(
         == pice_core::workflow::schema::AdaptiveAlgo::Adts
         && cfg.pice_config.evaluation.adversarial.enabled
     {
+        // Same resolve-then-start classification for the adversarial path.
+        if pice_core::provider::registry::resolve(
+            &cfg.pice_config.evaluation.adversarial.provider,
+            cfg.pice_config,
+        )
+        .is_none()
+        {
+            warn!(
+                layer = %layer_name,
+                provider = %cfg.pice_config.evaluation.adversarial.provider,
+                "adversarial provider unresolvable, falling back to phase-1-pending",
+            );
+            // ADTS without adversarial is degenerate — shut down primary and fall back.
+            let _ = primary.shutdown().await;
+            return LayerAdaptiveResult::NotStarted;
+        }
         match ProviderOrchestrator::start(
             &cfg.pice_config.evaluation.adversarial.provider,
             cfg.pice_config,
@@ -557,10 +599,11 @@ async fn try_run_layer_adaptive(
         {
             Ok(a) => Some(a),
             Err(e) => {
-                warn!(layer = %layer_name, "failed to start adversarial provider for ADTS: {e}");
-                // ADTS without adversarial is degenerate — shut down primary and fall back.
+                let msg = format!("adversarial provider startup failed: {e:#}");
+                warn!(layer = %layer_name, "{msg}");
+                // Shut down primary then fail-close the layer.
                 let _ = primary.shutdown().await;
-                return LayerAdaptiveResult::NotStarted;
+                return LayerAdaptiveResult::RuntimeError(msg);
             }
         }
     } else {
@@ -633,6 +676,14 @@ fn build_adaptive_layer_result(
         (LayerStatus::Failed, Some(format!("seam:{failed_id}")))
     } else {
         match outcome.halted_by.as_deref() {
+            // Phase 4 Pass-4 fix for Codex High: mid-loop provider errors
+            // flow through `run_adaptive_passes` as a preserved outcome with
+            // `halted_by = "runtime_error:..."`. Route them to `Failed` so
+            // the evaluation exits non-zero, while the passes/cost already
+            // written to the sink remain intact for reconciliation.
+            Some(reason) if reason.starts_with("runtime_error:") => {
+                (LayerStatus::Failed, outcome.halted_by.clone())
+            }
             Some("sprt_confidence_reached") => (LayerStatus::Passed, outcome.halted_by.clone()),
             // Phase 4 post-adversarial-review fix: `vec_entropy` halts when
             // posterior entropy stops changing — that happens for failure
