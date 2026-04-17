@@ -719,9 +719,9 @@ See E2E Validation Steps above. Also verify:
   "pass_threshold": 10,
   "criteria": [
     {
-      "name": "Confidence ceiling invariant — no reported confidence exceeds 0.966 under any input, including 100+ consecutive successes",
+      "name": "Confidence ceiling invariant — no reported confidence exceeds 0.966 under any input, including 100+ consecutive successes. Pass-5 Evaluator C Criterion 1 fix: every production cap site now routes through the single `pice_core::adaptive::cap_confidence(raw) -> f64` helper (one definition of the cap, not four), and the daemon's `posterior_mean_capped` is re-exported from pice-core rather than duplicated",
       "threshold": 10,
-      "validation": "cargo test -p pice-core adaptive::sprt::ceiling_guard_holds_at_hundred_passes -- --exact AND cargo test -p pice-core adaptive::vec::vec_confidence_capped_at_ceiling -- --exact; additionally grep the whole module for any hard-coded confidence > 0.966 constant and assert none exist"
+      "validation": "cargo test -p pice-core --lib adaptive::sprt::tests::sprt_ceiling_guard_holds_at_hundred_passes adaptive::vec::tests::vec_confidence_capped_at_ceiling adaptive::calibration_tests::ceiling_never_breached_at_hundred_passes adaptive::calibration_tests::ceiling_holds_at_one_thousand_passes -- --exact; additionally: `grep -rE '0\\.9[67][0-9]|0\\.97' crates/pice-core/src crates/pice-daemon/src` returns only references to the `CONFIDENCE_CEILING = 0.966` constant or `ceiling` test comparators — no hard-coded alternative ceiling literals"
     },
     {
       "name": "SPRT halt-reason correctness — accept, reject, and max-passes paths each produce the documented halted_by string and correct layer status",

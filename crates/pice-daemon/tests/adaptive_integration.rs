@@ -174,12 +174,12 @@ impl Drop for StubStaleResultGuard {
 }
 
 /// Phase 4 Pass-4 regression helper — Codex High (partial-run cost
-/// reconciliation). Bundles `PICE_STUB_SCORES` + `PICE_STUB_EVALUATE_ERROR`
-/// + `PICE_STUB_EVALUATE_ERROR_FROM_PASS` so the stub completes passes
-/// `1..from-1` normally, then throws on pass `from`. Exercises the adaptive
-/// loop's "preserve prior passes on mid-loop error" halt path — the passes
-/// already written to the sink must stay in the manifest and total_cost_usd
-/// must match Σ(pass_events.cost_usd).
+/// reconciliation). Bundles three env vars (`PICE_STUB_SCORES`,
+/// `PICE_STUB_EVALUATE_ERROR`, `PICE_STUB_EVALUATE_ERROR_FROM_PASS`) so the
+/// stub completes passes `1..from-1` normally, then throws on pass `from`.
+/// Exercises the adaptive loop's "preserve prior passes on mid-loop error"
+/// halt path — the passes already written to the sink must stay in the
+/// manifest and total_cost_usd must match Σ(pass_events.cost_usd).
 struct StubMidLoopErrorGuard {
     _guard: std::sync::MutexGuard<'static, ()>,
 }
