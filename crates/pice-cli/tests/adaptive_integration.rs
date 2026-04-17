@@ -239,6 +239,21 @@ fn cli_evaluate_sprt_reject_exits_two_with_typed_status() {
         String::from_utf8_lossy(&output.stderr),
         String::from_utf8_lossy(&output.stdout),
     );
+    // Pass-4 Claude Evaluator regression (Criterion 12): under `--json`, the
+    // JSON failure payload MUST land on stdout, not stderr. `pice evaluate
+    // --json > report.json && deploy` pipelines depend on stdout being the
+    // canonical JSON channel. Tracing output on stderr is expected per
+    // CLAUDE.md (`tracing` writes to stderr by design), so we assert the
+    // JSON payload is NOT present on stderr — not that stderr is byte-empty.
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr_text.contains("\"status\":"),
+        "JSON response must not leak to stderr under --json; got stderr: {stderr_text}",
+    );
+    assert!(
+        !stderr_text.trim_start().starts_with('{'),
+        "stderr must not start with a JSON object under --json; got stderr: {stderr_text}",
+    );
     // Exit-2 ExitJson must NOT use a literal status string. Per
     // `.claude/rules/daemon.md`, the wire form must come from
     // `ExitJsonStatus::EvaluationFailed.as_str()` — verify here so a
