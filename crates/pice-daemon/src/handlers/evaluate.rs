@@ -337,22 +337,22 @@ pub async fn run(
                 .all(|l| l.status == LayerStatus::Passed || l.status == LayerStatus::Skipped);
             let stack_passed = all_layers_passed && !any_failed_layer && failed_seam_checks == 0;
 
-            // Finalize `passed` + `summary`.
-            if let Err(e) = metrics::store::finalize_evaluation(
-                &db,
-                eval_id,
-                stack_passed,
-                Some("stack-loops — adaptive evaluation; see pass_events and seam_findings"),
-            ) {
-                tracing::warn!("failed to finalize evaluation: {e}");
-            }
-
+            // Phase 4 Pass-5 Claude Evaluator B Critical #4: the two UPDATEs
+            // (finalize + adaptive summary) used to run as separate statements.
+            // A SIGKILL between them left `final_total_cost_usd = NULL` on a
+            // row whose `pass_events` had already been written, and the
+            // Criterion 16 reconciliation SQL silently excluded the row
+            // because `ABS(NULL - SUM) > 1e-9` evaluates to NULL. We now fuse
+            // them into one atomic UPDATE via
+            // `finalize_evaluation_with_adaptive_summary`, closing the window
+            // entirely.
+            //
             // Aggregate adaptive summary columns across layers. The pass
             // count is total across layers (matches the `pass_events` row
             // count per `evaluation_id`, required for cost reconciliation).
             // `total_cost_usd` sums per-layer costs so it equals
             // `SUM(pass_events.cost_usd)` within 1e-9 — the Phase 4 contract
-            // criterion #10 cost-reconciliation invariant.
+            // criterion #16 cost-reconciliation invariant.
             let passes_used: u32 = manifest.layers.iter().map(|l| l.passes.len() as u32).sum();
             // Phase 4 Pass-4 fix for Codex High: previously `sum > 0.0` gated
             // emission, which collapsed `0.0` sums to None — breaking the
@@ -407,16 +407,18 @@ pub async fn run(
                 pice_core::workflow::schema::AdaptiveAlgo::Vec => "vec",
                 pice_core::workflow::schema::AdaptiveAlgo::None => "none",
             };
-            if let Err(e) = metrics::store::update_evaluation_adaptive_summary(
+            if let Err(e) = metrics::store::finalize_evaluation_with_adaptive_summary(
                 &db,
                 eval_id,
+                stack_passed,
+                Some("stack-loops — adaptive evaluation; see pass_events and seam_findings"),
                 passes_used,
                 halted_by_wire.as_deref(),
                 Some(algo_wire),
                 final_confidence,
                 final_total_cost_usd,
             ) {
-                tracing::warn!("failed to update evaluation adaptive summary: {e}");
+                tracing::warn!("failed to finalize evaluation with adaptive summary: {e}");
             }
 
             // Seam findings attach via FK to `evaluation_id`.

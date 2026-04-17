@@ -285,12 +285,84 @@ pub fn insert_pass_event(
     Ok(db.conn().last_insert_rowid())
 }
 
+/// Atomically finalize an evaluation row AND populate all adaptive summary
+/// columns in a single UPDATE. Phase 4 Pass-5 Claude Evaluator B Critical
+/// fix (money-disappearance under partial-state halt).
+///
+/// Before this function existed, the handler called [`finalize_evaluation`]
+/// (sets `passed` + `summary`) and then [`update_evaluation_adaptive_summary`]
+/// (sets `passes_used` + `halted_by` + `adaptive_algorithm` +
+/// `final_confidence` + `final_total_cost_usd`) as two separate UPDATEs. A
+/// SIGKILL between them left the row with `passed` + `summary` populated
+/// but `final_total_cost_usd = NULL` — defeating the Criterion 16 cost-
+/// reconciliation invariant:
+///
+///     SELECT evaluation_id,
+///            (SUM(cost_usd) - (SELECT final_total_cost_usd
+///                              FROM evaluations
+///                              WHERE id = evaluation_id)) AS diff
+///     FROM pass_events
+///     GROUP BY evaluation_id
+///     HAVING ABS(diff) > 1e-9
+///
+/// With a NULL `final_total_cost_usd`, `ABS(NULL - SUM) > 1e-9` evaluates
+/// to NULL (not TRUE), so the row is silently dropped from the HAVING
+/// output and the "money disappeared" invariant escapes detection. See the
+/// test `partial_state_halt_is_detectable_via_coalesce_sql` for the
+/// defense-in-depth check at the SQL layer.
+///
+/// The two legacy functions remain for callers that only need to update
+/// one facet (e.g. tests, future bulk-update paths); production handlers
+/// should prefer this combined variant.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_evaluation_with_adaptive_summary(
+    db: &MetricsDb,
+    evaluation_id: i64,
+    passed: bool,
+    summary: Option<&str>,
+    passes_used: u32,
+    halted_by: Option<&str>,
+    adaptive_algorithm: Option<&str>,
+    final_confidence: Option<f64>,
+    final_total_cost_usd: Option<f64>,
+) -> Result<()> {
+    db.conn()
+        .execute(
+            "UPDATE evaluations SET \
+                passed = ?1, \
+                summary = ?2, \
+                passes_used = ?3, \
+                halted_by = ?4, \
+                adaptive_algorithm = ?5, \
+                final_confidence = ?6, \
+                final_total_cost_usd = ?7 \
+             WHERE id = ?8",
+            rusqlite::params![
+                passed as i32,
+                summary,
+                passes_used,
+                halted_by,
+                adaptive_algorithm,
+                final_confidence,
+                final_total_cost_usd,
+                evaluation_id,
+            ],
+        )
+        .context("failed to finalize evaluation with adaptive summary")?;
+    Ok(())
+}
+
 /// Populate the adaptive summary columns on an existing `evaluations` row.
 /// Called at the end of the adaptive loop once the per-layer outcome is
 /// known. `adaptive_algorithm` is the snake_case wire form of the enum
 /// variant (e.g. `"bayesian_sprt"`, `"none"`); `halted_by` is the
 /// [`pice_core::adaptive::HaltReason`] wire form or a seam-prefixed string
 /// (e.g. `"seam:config_mismatch"`).
+///
+/// Production handlers should prefer
+/// [`finalize_evaluation_with_adaptive_summary`] which fuses this UPDATE
+/// with [`finalize_evaluation`] into a single atomic write, closing the
+/// SIGKILL-between-writes window documented on that function.
 #[allow(clippy::too_many_arguments)]
 pub fn update_evaluation_adaptive_summary(
     db: &MetricsDb,
@@ -830,6 +902,173 @@ mod tests {
         assert_eq!(algo, "bayesian_sprt");
         assert!((conf - 0.951).abs() < 1e-12);
         assert!((cost - 0.089).abs() < 1e-12);
+    }
+
+    // Phase 4 Pass-5 Claude Evaluator B Critical #4 — the atomic-finalize
+    // variant must populate every summary column in one UPDATE. This is the
+    // defense against the SIGKILL-mid-handler failure mode that previously
+    // silently passed the reconciliation SQL.
+    #[test]
+    fn finalize_with_adaptive_summary_writes_all_columns_atomically() {
+        let db = test_db();
+        let scores = vec![CriterionScore {
+            name: "t".to_string(),
+            score: 8,
+            threshold: 7,
+            passed: true,
+            findings: None,
+        }];
+        let eval_id = record_evaluation(
+            &db, "p.md", "f", 2, false, "x", "y", None, None, None, &scores,
+        )
+        .unwrap();
+
+        finalize_evaluation_with_adaptive_summary(
+            &db,
+            eval_id,
+            true,
+            Some("stack-loops"),
+            3,
+            Some("sprt_confidence_reached"),
+            Some("bayesian_sprt"),
+            Some(0.94),
+            Some(0.06),
+        )
+        .unwrap();
+
+        type FullRow = (i64, Option<String>, u32, String, String, f64, f64);
+        let row: FullRow = db
+            .conn()
+            .query_row(
+                "SELECT passed, summary, passes_used, halted_by, adaptive_algorithm, \
+                 final_confidence, final_total_cost_usd FROM evaluations WHERE id = ?",
+                rusqlite::params![eval_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, 1);
+        assert_eq!(row.1.as_deref(), Some("stack-loops"));
+        assert_eq!(row.2, 3);
+        assert_eq!(row.3, "sprt_confidence_reached");
+        assert_eq!(row.4, "bayesian_sprt");
+        assert!((row.5 - 0.94).abs() < 1e-12);
+        assert!((row.6 - 0.06).abs() < 1e-12);
+    }
+
+    // Phase 4 Pass-5 Claude Evaluator B Critical #4 SQL defense-in-depth:
+    // the contract's reconciliation query (Criterion 16) must detect a
+    // partial-state halt (pass_events present but final_total_cost_usd = NULL).
+    // The original SQL used `ABS(SUM - final_total_cost_usd) > 1e-9` which
+    // silently drops NULL rows. With `COALESCE(final_total_cost_usd, -1.0)`,
+    // a NULL slot yields a large diff → row surfaces in the HAVING output.
+    #[test]
+    fn partial_state_halt_is_detectable_via_coalesce_sql() {
+        let db = test_db();
+        let scores = vec![CriterionScore {
+            name: "t".to_string(),
+            score: 8,
+            threshold: 7,
+            passed: true,
+            findings: None,
+        }];
+        // Record an evaluation header without final_total_cost_usd, then
+        // insert pass_events with real costs. This simulates the SIGKILL-
+        // mid-handler state where the combined UPDATE never ran.
+        let eval_id = record_evaluation(
+            &db, "p.md", "f", 2, false, "x", "y", None, None, None, &scores,
+        )
+        .unwrap();
+        for (i, cost) in [0.02f64, 0.03, 0.04].iter().enumerate() {
+            insert_pass_event(
+                &db,
+                eval_id,
+                &PassEventRow {
+                    pass_index: (i + 1) as u32,
+                    model: "stub",
+                    score: Some(8.0),
+                    cost_usd: Some(*cost),
+                },
+            )
+            .unwrap();
+        }
+
+        // Naive reconciliation SQL (the original contract formulation):
+        // HAVING ABS(SUM - final_total_cost_usd) > 1e-9 silently drops NULL.
+        let naive_rows: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT evaluation_id,
+                       (SUM(cost_usd) - (SELECT final_total_cost_usd FROM evaluations WHERE id = evaluation_id)) AS diff
+                FROM pass_events
+                GROUP BY evaluation_id
+                HAVING ABS(diff) > 1e-9
+             )",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            naive_rows, 0,
+            "naive SQL silently misses partial-state halts (baseline)"
+        );
+
+        // COALESCE-hardened SQL surfaces the partial-state row. Picking a
+        // sentinel that cannot equal any real cost (costs are >= 0) makes
+        // the diff blow up past any sane tolerance.
+        let coalesce_rows: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT evaluation_id,
+                       (SUM(cost_usd) - COALESCE((SELECT final_total_cost_usd FROM evaluations WHERE id = evaluation_id), -1.0)) AS diff
+                FROM pass_events
+                GROUP BY evaluation_id
+                HAVING ABS(diff) > 1e-9
+             )",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            coalesce_rows, 1,
+            "COALESCE-hardened SQL must surface the partial-state halt"
+        );
+
+        // Now run the atomic finalize — the partial state resolves, and both
+        // naive AND coalesce SQL should see zero unreconciled rows.
+        finalize_evaluation_with_adaptive_summary(
+            &db,
+            eval_id,
+            true,
+            Some("stack-loops"),
+            3,
+            Some("sprt_confidence_reached"),
+            Some("bayesian_sprt"),
+            Some(0.94),
+            Some(0.09),
+        )
+        .unwrap();
+
+        let after_rows: i64 = db.conn().query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT evaluation_id,
+                       (SUM(cost_usd) - COALESCE((SELECT final_total_cost_usd FROM evaluations WHERE id = evaluation_id), -1.0)) AS diff
+                FROM pass_events
+                GROUP BY evaluation_id
+                HAVING ABS(diff) > 1e-9
+             )",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(
+            after_rows, 0,
+            "atomic finalize must reconcile SUM(pass_events.cost_usd) with final_total_cost_usd"
+        );
     }
 
     #[test]
