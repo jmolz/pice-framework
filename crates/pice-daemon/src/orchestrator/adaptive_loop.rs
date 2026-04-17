@@ -429,7 +429,20 @@ pub async fn run_adaptive_passes(
                     escalation_events.push(EscalationEvent::Level1FreshContext {
                         at_pass: pass_index,
                     });
-                    continue; // skip post-pass halt; force next pass
+                    // Phase 4 Pass-5 Codex Critical #1 fix: DO NOT `continue`
+                    // past the universal post-pass guardrails. An ADTS
+                    // scheduling verdict must not mask a budget overrun or
+                    // max_passes exhaustion accumulated during the pass that
+                    // JUST ran. `decide_halt` for `AdaptiveAlgo::Adts` only
+                    // enforces budget + max_passes (algorithm-specific branch
+                    // returns `halt=false`), so falling through is safe:
+                    // legitimate escalation scheduling survives for the next
+                    // iteration's pre-pass check unless the accumulated cost
+                    // already exhausted the budget — in which case we halt
+                    // with `budget` (correct fail-closed behavior), not the
+                    // natural-exit `max_passes` fallback. The `next_*` flags
+                    // stay set so the next iteration picks them up. Regression
+                    // test: `adts_budget_halt_wins_over_escalation_on_final_iteration`.
                 }
                 AdtsVerdict::ScheduleExtraPassElevatedEffort => {
                     // Level 2: elevate compute for the NEXT pass only via
@@ -442,7 +455,11 @@ pub async fn run_adaptive_passes(
                     escalation_events.push(EscalationEvent::Level2ElevatedEffort {
                         at_pass: pass_index,
                     });
-                    continue;
+                    // Phase 4 Pass-5 Codex Critical #1 fix: same reasoning as
+                    // the Level-1 branch above — fall through to the universal
+                    // post-pass `decide_halt` so budget/max_passes wins over
+                    // ADTS escalation scheduling when the accumulated cost
+                    // exhausted the budget during THIS pass.
                 }
                 AdtsVerdict::EscalationExhausted => {
                     escalation_events.push(EscalationEvent::Level3Exhausted {

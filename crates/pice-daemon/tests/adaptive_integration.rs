@@ -1637,3 +1637,99 @@ async fn unresolvable_provider_remains_phase1_pending_not_failed() {
     assert_eq!(backend.passes.len(), 1);
     assert_eq!(backend.passes[0].model, "phase-1-pending");
 }
+
+// ─── Pass-5 Codex Critical #1 regression: ADTS escalation must not mask budget
+//     halts on the final iteration ─────────────────────────────────────────────
+//
+// Before the fix, the ADTS `ScheduleExtraPassFreshContext` /
+// `ScheduleExtraPassElevatedEffort` arms used `continue;` to skip the post-pass
+// universal guardrails (`decide_halt`). When the budget was exhausted by the
+// pass that JUST ran and ADTS scheduled an escalation, the `continue` masked
+// the budget overrun; the loop then exited naturally via max_passes and the
+// fallback reported `halted_by = "max_passes"` instead of `"budget"`.
+//
+// This reproducer pins the exact Codex scenario:
+//   max_passes = 1, budget_usd = 0.01, primary+adversarial cost 0.02 each
+//   (accumulated = 0.04 after pass 1), divergent scores (9 vs 3 → ADTS
+//   schedules Level-1 escalation). Expected: halted_by = "budget",
+//   layer status = Pending (budget is fail-closed; user may re-run with
+//   higher budget). NOT "max_passes". NOT "adts_escalation_exhausted".
+
+#[tokio::test]
+async fn adts_budget_halt_wins_over_escalation_on_final_iteration() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = setup_minimal_repo(dir.path());
+    let layers = single_layer_config();
+    let pice_config = stub_pice_config_adts();
+    let adts = AdtsConfig {
+        divergence_threshold: 2.0,
+        max_divergence_escalations: 2,
+    };
+    // max_passes=1 is the edge case: there is no "next iteration" whose
+    // pre-pass budget check would otherwise catch the overrun. Only the
+    // post-pass guardrails on THIS iteration can fail-close on budget.
+    let workflow = workflow_with_adaptive(AdaptiveAlgo::Adts, 0.90, 1, 0.01, Some(adts));
+    let seams = BTreeMap::new();
+    let cfg = make_cfg(
+        &layers,
+        &plan_path,
+        dir.path(),
+        &pice_config,
+        &workflow,
+        &seams,
+    );
+
+    // Divergent scores (9 vs 3) so ADTS fires Level-1 at the end of pass 1.
+    // Primary+adversarial each cost 0.02 → accumulated 0.04, well over the
+    // 0.01 budget. The cold-start seed at pre-pass check is
+    // budget/max_passes = 0.01 / 1 = 0.01, so the pre-pass check lets pass 1
+    // proceed (0.01 + 0.01 = 0.02 > 0.01 is false — seed check is strictly
+    // greater-than). The overrun only becomes detectable POST-pass.
+    let log_path = dir.path().join("stub-adts-budget.log");
+    let _stub = StubAdtsGuard::new("9.0,0.02", "3.0,0.02", Some(&log_path));
+
+    let mut sink = NullPassSink;
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        .await
+        .unwrap();
+    let backend = manifest
+        .layers
+        .iter()
+        .find(|l| l.name == "backend")
+        .unwrap();
+
+    assert_eq!(
+        backend.halted_by.as_deref(),
+        Some("budget"),
+        "expected budget halt, not ADTS escalation or max_passes masking; got {:?}",
+        backend.halted_by,
+    );
+    // Budget is a fail-closed guardrail, not a success or failure verdict.
+    assert_eq!(backend.status, LayerStatus::Pending);
+    // ADTS runs primary + adversarial per iteration and records both as
+    // PassResult rows. With max_passes=1 the loop ran one iteration, so the
+    // manifest has two rows (one primary, one adversarial).
+    assert_eq!(backend.passes.len(), 2);
+    // Level-1 was still recorded as scheduled (ADTS observed the divergence
+    // before the guardrail fired), but the escalation will not run because
+    // the loop halted. ADTS fires once per iteration; with a single iteration
+    // we expect exactly one Level-1 event.
+    let events = backend
+        .escalation_events
+        .as_ref()
+        .expect("ADTS populates escalation_events even on budget halt");
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly one escalation event; got {:?}",
+        events,
+    );
+    assert!(
+        matches!(
+            events[0],
+            pice_core::adaptive::EscalationEvent::Level1FreshContext { .. }
+        ),
+        "events[0] must be Level1FreshContext; got {:?}",
+        events[0],
+    );
+}
