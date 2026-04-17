@@ -86,32 +86,12 @@ impl ProviderOrchestrator {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<EvaluateResultParams> {
-        // Set up oneshot channel to capture evaluate/result notification
-        let (tx, rx) = tokio::sync::oneshot::channel::<EvaluateResultParams>();
-        let tx = std::sync::Mutex::new(Some(tx));
-
-        self.on_notification(Box::new(move |method, params| {
-            if method == "evaluate/result" {
-                if let Some(params) = params {
-                    match serde_json::from_value::<EvaluateResultParams>(params) {
-                        Ok(result) => {
-                            if let Ok(mut guard) = tx.lock() {
-                                if let Some(tx) = guard.take() {
-                                    tx.send(result).ok();
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "warning: received evaluate/result but failed to deserialize: {e}"
-                            );
-                        }
-                    }
-                }
-            }
-        }));
-
-        // Create evaluation session
+        // Create evaluation session FIRST so we can filter notifications by
+        // session_id. Phase 4 Pass-5 Codex Critical #2: registering the
+        // handler before `evaluate/create` returns means the handler has no
+        // way to tell which session a notification belongs to, so a late or
+        // duplicate `evaluate/result` from a prior evaluation on the same
+        // provider process would corrupt THIS evaluation's oneshot.
         let create_params = serde_json::to_value(EvaluateCreateParams {
             contract,
             diff,
@@ -129,6 +109,41 @@ impl ProviderOrchestrator {
             .and_then(|s| s.as_str())
             .context("evaluate/create did not return sessionId")?
             .to_string();
+
+        // Now wire the notification handler, filtering by session_id captured
+        // above. `evaluate/result` is emitted by the provider in response to
+        // `evaluate/score` below; between `evaluate/create` returning and the
+        // handler being installed, the provider has not been asked to score
+        // yet, so no legitimate `evaluate/result` for THIS session can fire
+        // inside that window.
+        let (tx, rx) = tokio::sync::oneshot::channel::<EvaluateResultParams>();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let expected_session_id = session_id.clone();
+        self.on_notification(Box::new(move |method, params| {
+            if method != "evaluate/result" {
+                return;
+            }
+            let Some(params) = params else { return };
+            let result = match serde_json::from_value::<EvaluateResultParams>(params) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("warning: received evaluate/result but failed to deserialize: {e}");
+                    return;
+                }
+            };
+            if result.session_id != expected_session_id {
+                // Stale/late notification from a prior session on this
+                // provider process — drop it. Without this guard a duplicate
+                // or delayed `evaluate/result` from pass N-1 would satisfy
+                // pass N's oneshot with wrong scores/findings.
+                return;
+            }
+            if let Ok(mut guard) = tx.lock() {
+                if let Some(tx) = guard.take() {
+                    tx.send(result).ok();
+                }
+            }
+        }));
 
         // Use a single shared deadline for the entire scoring + notification sequence.
         // The provider performs the model call inside evaluate/score and sends
@@ -178,23 +193,15 @@ impl ProviderOrchestrator {
         fresh_context: Option<bool>,
         effort_override: Option<String>,
     ) -> Result<PerPassOutcome> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<EvaluateResultParams>();
-        let tx = std::sync::Mutex::new(Some(tx));
-
-        self.on_notification(Box::new(move |method, params| {
-            if method == "evaluate/result" {
-                if let Some(params) = params {
-                    if let Ok(result) = serde_json::from_value::<EvaluateResultParams>(params) {
-                        if let Ok(mut guard) = tx.lock() {
-                            if let Some(tx) = guard.take() {
-                                tx.send(result).ok();
-                            }
-                        }
-                    }
-                }
-            }
-        }));
-
+        // Phase 4 Pass-5 Codex Critical #2: create FIRST, then register
+        // handler with session_id captured by value. In a multi-pass run the
+        // same provider process handles sequential sessions, so a late or
+        // duplicate `evaluate/result` notification from pass N-1 could
+        // otherwise satisfy pass N's oneshot — corrupting scores, SPRT/VEC
+        // observations, and halt reason for the wrong pass. The provider
+        // emits `evaluate/result` in response to `evaluate/score` (below);
+        // between the create RPC returning and the handler being installed
+        // no legitimate `evaluate/result` for THIS session can arrive.
         let create_params = serde_json::to_value(EvaluateCreateParams {
             contract,
             diff,
@@ -209,6 +216,28 @@ impl ProviderOrchestrator {
         let raw = self.request("evaluate/create", Some(create_params)).await?;
         let create_res: EvaluateCreateResult = serde_json::from_value(raw)
             .context("evaluate/create response was not a valid EvaluateCreateResult")?;
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<EvaluateResultParams>();
+        let tx = std::sync::Mutex::new(Some(tx));
+        let expected_session_id = create_res.session_id.clone();
+        self.on_notification(Box::new(move |method, params| {
+            if method != "evaluate/result" {
+                return;
+            }
+            let Some(params) = params else { return };
+            let Ok(result) = serde_json::from_value::<EvaluateResultParams>(params) else {
+                return;
+            };
+            if result.session_id != expected_session_id {
+                // Stale/late notification from a prior pass — ignore.
+                return;
+            }
+            if let Ok(mut guard) = tx.lock() {
+                if let Some(tx) = guard.take() {
+                    tx.send(result).ok();
+                }
+            }
+        }));
 
         let deadline = tokio::time::Instant::now() + EVAL_NOTIFICATION_TIMEOUT;
         let score_params = serde_json::to_value(EvaluateScoreParams {

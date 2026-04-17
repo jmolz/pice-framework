@@ -146,6 +146,33 @@ impl Drop for StubInitErrorGuard {
     }
 }
 
+/// Phase 4 Pass-5 regression helper — Codex Critical #2 (session correlation).
+/// Sets `PICE_STUB_INJECT_STALE_EVAL_RESULT` so the stub emits a stale
+/// `evaluate/result` notification with a deliberately wrong sessionId BEFORE
+/// the real notification inside `evaluate/score`. A correct session-correlation
+/// filter in the Rust orchestrator ignores the stale one. A naive "take first
+/// matching method" handler would capture the stale notification and corrupt
+/// the pass outcome — exactly the bug Codex flagged.
+struct StubStaleResultGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StubStaleResultGuard {
+    fn new(scores: &str, stale_session_id: &str) -> Self {
+        let guard = stub_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PICE_STUB_SCORES", scores);
+        std::env::set_var("PICE_STUB_INJECT_STALE_EVAL_RESULT", stale_session_id);
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for StubStaleResultGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("PICE_STUB_SCORES");
+        std::env::remove_var("PICE_STUB_INJECT_STALE_EVAL_RESULT");
+    }
+}
+
 /// Phase 4 Pass-4 regression helper — Codex High (partial-run cost
 /// reconciliation). Bundles `PICE_STUB_SCORES` + `PICE_STUB_EVALUATE_ERROR`
 /// + `PICE_STUB_EVALUATE_ERROR_FROM_PASS` so the stub completes passes
@@ -1732,4 +1759,86 @@ async fn adts_budget_halt_wins_over_escalation_on_final_iteration() {
         "events[0] must be Level1FreshContext; got {:?}",
         events[0],
     );
+}
+
+// ─── Pass-5 Codex Critical #2 regression: evaluate/result notifications must
+//     be correlated by session_id to prevent cross-pass contamination ───────
+//
+// Before the fix, `ProviderOrchestrator::evaluate_one_pass` registered the
+// `evaluate/result` notification handler BEFORE `evaluate/create` returned
+// the session_id, and the handler accepted the first matching notification
+// regardless of session. In a multi-pass run where the same provider process
+// handles sequential sessions, a late or duplicate notification from pass
+// N-1 could satisfy pass N's oneshot with stale scores/findings.
+//
+// This reproducer uses the stub's `PICE_STUB_INJECT_STALE_EVAL_RESULT` harness
+// to emit a stale notification (wrong sessionId) BEFORE the real one. The
+// stale notification reports `passed: false`; the real notification reports
+// `passed: true` (score 9 >= threshold 7). A correct session-correlation
+// filter returns the real result. A naive handler captures the stale one and
+// the layer fails when it should pass.
+
+#[tokio::test]
+async fn evaluate_result_filters_stale_notifications_by_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = setup_minimal_repo(dir.path());
+    let layers = single_layer_config();
+    let pice_config = stub_pice_config(false);
+    // SPRT mode, single pass needed — any clean accept/reject path works.
+    let workflow = workflow_with_adaptive(AdaptiveAlgo::BayesianSprt, 0.70, 3, 10.0, None);
+    let seams = BTreeMap::new();
+    let cfg = make_cfg(
+        &layers,
+        &plan_path,
+        dir.path(),
+        &pice_config,
+        &workflow,
+        &seams,
+    );
+
+    // Stub returns score 9 (passed) with cost 0.02. The injected stale
+    // notification has `passed: false`. If the Rust handler takes the first
+    // notification it sees regardless of sessionId (the bug), the layer
+    // records the stale `passed: false` and halts SPRT-rejected. The fix
+    // filters by sessionId so the stale notification is dropped and the
+    // real `passed: true` observation wins.
+    let _stub = StubStaleResultGuard::new(
+        "9.0,0.02;9.0,0.02;9.0,0.02",
+        "wrong-session-xyz-that-does-not-exist",
+    );
+
+    let mut sink = NullPassSink;
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        .await
+        .unwrap();
+    let backend = manifest
+        .layers
+        .iter()
+        .find(|l| l.name == "backend")
+        .unwrap();
+
+    // The real notifications win → SPRT sees success observations → accepts.
+    // If stale notifications had leaked through, we'd see `sprt_rejected`
+    // and `LayerStatus::Failed` instead.
+    let halted = backend.halted_by.clone().unwrap_or_default();
+    assert!(
+        halted == "sprt_confidence_reached" || halted == "max_passes",
+        "expected SPRT accept or max_passes (both imply real success notifications \
+         won); got {halted:?} which indicates stale notifications leaked through",
+    );
+    assert_ne!(
+        backend.status,
+        LayerStatus::Failed,
+        "layer must not be Failed — Failed would mean stale `passed:false` leaked in",
+    );
+    // Every recorded pass must have score 9 (from real notifications), not 0
+    // (from stale). Passes[].score is the normalized criterion score.
+    for p in &backend.passes {
+        assert!(
+            p.score >= Some(7.0),
+            "pass {} has score {:?}; expected ≥7 from real stub notification",
+            p.index,
+            p.score,
+        );
+    }
 }

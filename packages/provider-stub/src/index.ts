@@ -70,6 +70,17 @@ export class StubProvider extends BaseProvider {
    * `mid_loop_runtime_error_preserves_prior_passes_and_costs`.
    */
   private evaluateErrorFromPass: number | undefined;
+  /**
+   * Phase 4 Pass-5 Codex Critical #2 regression harness: when set, the stub
+   * emits an extra `evaluate/result` notification with THIS value as the
+   * sessionId (a deliberately wrong one) BEFORE emitting the real result in
+   * `evaluate/score`. A correct session-correlation filter on the Rust side
+   * ignores the stale one and waits for the notification whose sessionId
+   * matches the value returned by `evaluate/create`. A naive "take first
+   * matching method" handler captures the stale notification and corrupts
+   * the pass outcome — exactly the Critical #2 failure mode.
+   */
+  private staleResultSessionId: string | undefined;
 
   constructor(version: string) {
     super(version);
@@ -85,6 +96,8 @@ export class StubProvider extends BaseProvider {
     // field set here wouldn't be visible when registerHandlers runs.
     const fromRaw = process.env['PICE_STUB_EVALUATE_ERROR_FROM_PASS'];
     this.evaluateErrorFromPass = fromRaw ? Number.parseInt(fromRaw, 10) : undefined;
+    this.staleResultSessionId =
+      process.env['PICE_STUB_INJECT_STALE_EVAL_RESULT'] || undefined;
   }
 
   getCapabilities(): ProviderCapabilities {
@@ -257,6 +270,26 @@ export class StubProvider extends BaseProvider {
             passed: passScore >= 7,
             findings: 'Stub evaluation',
           }];
+
+      // Phase 4 Pass-5 Codex Critical #2 regression harness: emit a stale
+      // notification FIRST with a deliberately wrong sessionId. A correct
+      // session-correlation filter must ignore this and wait for the real
+      // notification below. Only active when `PICE_STUB_INJECT_STALE_EVAL_RESULT`
+      // is set.
+      if (this.staleResultSessionId) {
+        transport.sendNotification('evaluate/result', {
+          sessionId: this.staleResultSessionId,
+          scores: [{
+            name: 'stale-stub-criterion',
+            score: 0,
+            threshold: 10,
+            passed: false,
+            findings: 'STALE — should be filtered by session-correlation',
+          }],
+          passed: false,
+          summary: 'STALE — should be filtered by session-correlation',
+        });
+      }
 
       transport.sendNotification('evaluate/result', {
         sessionId,
