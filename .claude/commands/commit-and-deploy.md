@@ -4,6 +4,28 @@ description: Standard workflow for building, testing, committing, pushing, and r
 
 # Commit and Deploy Workflow
 
+## Authorization (read first)
+
+**Invoking `/commit-and-deploy` IS the user's pre-authorization for the entire flow described below**, including:
+
+- Auto-staging and committing every uncommitted change in the worktree
+- Merging the active feature branch into `main`
+- Pushing `main` (and any new tag) to `origin`
+- Creating a GitHub Release
+- Triggering the release CI pipeline (cross-platform binary builds + NPM publish for code releases)
+
+**Do NOT pause for confirmation** at merge, push, tag, or release steps — those are pre-approved by the slash command itself. You SHOULD pause and surface the situation only when one of these red flags fires:
+
+- **Validation failed** (any test, lint, format, or build failure) → fix the underlying issue or report the failure; never paper over.
+- **Merge conflict requires destructive choice** (e.g., favoring main would discard feature commits, or vice versa) → present the conflict and the two resolutions.
+- **Working tree contains files that look unrelated to the feature** (uncommitted edits to crates the feature shouldn't touch, untracked secrets-shaped files, etc.) → list them and ask whether to include or stash.
+- **A force-push or tag rewrite would be needed** (e.g., the next-tag computation collides with an existing remote tag) → never force-push without confirmation.
+- **The diff vs `main` is unusually large** (>10k LoC or >25 commits) AND no plan in `.claude/plans/` describes the scope → call it out and continue, but include the scope summary in the release notes so it is visible to the user post-deploy. **Continue, do not block.**
+
+A merge into `main`, a push, a tag, and a release are part of the normal `/commit-and-deploy` flow. Friction at those steps defeats the purpose of the command.
+
+---
+
 ## Pre-Commit Validation
 
 Run these checks in order. Fix failures before proceeding.
@@ -31,7 +53,7 @@ cargo build --release
 pnpm build
 ```
 
-**Expected baseline:** 271 Rust tests (1 ignored), 49 TypeScript tests, 0 lint errors, 0 warnings, clean release build.
+**Expected baseline:** 811 Rust tests (1 ignored), 78 TypeScript tests, 0 lint errors, 0 warnings, clean release build. The 1 ignored test is the doc-test in `crates/pice-daemon/src/handlers/mod.rs` (line 5). When the baseline shifts, update both this file AND `CLAUDE.md` in the same release.
 
 ## Determine Context (Worktree or Main)
 
@@ -108,11 +130,9 @@ CI runs automatically via GitHub Actions (`.github/workflows/ci.yml`).
 
 ## Release (REQUIRED for every push)
 
-Every push to main gets a GitHub Release. The type depends on what changed.
+Every push to main gets a GitHub Release. The type and version are determined deterministically — **no asking**.
 
-### Determine release type
-
-Check what was changed since the last release:
+### Determine release type and version (deterministic)
 
 ```bash
 LAST_TAG=$(git describe --tags --abbrev=0)
@@ -120,24 +140,20 @@ echo "Last release: $LAST_TAG"
 git diff --name-only $LAST_TAG..HEAD
 ```
 
-**Code change** = any file in `crates/`, `packages/`, `templates/`, `npm/`, `Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` was modified.
+Apply the following rules in order — first match wins:
 
-**Docs/chore change** = only files in `docs/`, `README.md`, `CONTRIBUTING.md`, `.claude/`, `.github/`, or other non-code paths were modified.
+| Condition (checked vs `$LAST_TAG..HEAD`) | Tier | Bump |
+|---|---|---|
+| Any commit message starts with `feat!`, `fix!`, contains `BREAKING CHANGE:`, or removes/renames a public API in `crates/pice-protocol`, `crates/pice-core`, or `packages/provider-protocol` | **major** | `vX.0.0` |
+| Any new file under `crates/pice-core/src/`, `crates/pice-daemon/src/orchestrator/`, `crates/pice-daemon/src/handlers/`, `packages/`, OR any commit message starts with `feat(` | **minor** | `v0.X.0` |
+| Any modification to `crates/`, `packages/`, `templates/`, `npm/`, `Cargo.toml`, `Cargo.lock`, `package.json`, `pnpm-lock.yaml` (without matching the rules above) | **patch (code)** | `v0.X.Y` (full release) |
+| Only files under `docs/`, `README.md`, `CONTRIBUTING.md`, `.claude/`, `.github/`, or other non-code paths changed | **chore** | `v0.X.Y` (lightweight release) |
 
-### Bump version number
-
-Increment the patch version from the last tag:
-
-```bash
-# Example: v0.1.6 → v0.1.7
-NEXT_TAG="v0.1.7"  # Adjust based on last tag
-```
-
-For code changes that add features, bump minor instead (`v0.2.0`). For breaking changes, bump major.
+The version-bump heuristic is mechanical. If the diff scope hits "minor", the next tag is the next minor — do NOT downgrade to patch because "the change feels small." Phase milestones (Phase 4 = adaptive evaluation, Phase 5 = predictive) are minor releases by definition.
 
 ### Code changes → full release (triggers binary builds + NPM publish)
 
-1. Update version in `Cargo.toml` (`workspace.package.version`), all `npm/*/package.json` files, and `packages/*/package.json` files
+1. Update version in `Cargo.toml` (`workspace.package.version`), all `npm/*/package.json` files, and `packages/*/package.json` files. Confirm with `grep -r '"version"' npm/ packages/ Cargo.toml` after.
 2. Commit the version bump: `git commit -am "chore: bump version to $NEXT_TAG"`
 3. Tag and push:
 
@@ -156,10 +172,10 @@ gh run list --workflow=release.yml --limit 1
 
 ### Docs/chore changes → lightweight release (no binaries)
 
-No version bump needed. Create a lightweight GitHub Release directly:
+No version bump in source files needed. Create a lightweight GitHub Release directly:
 
 ```bash
-NEXT_TAG="v0.1.7"  # Next patch after last tag
+NEXT_TAG="v0.X.Y"  # Computed from the table above
 git tag $NEXT_TAG
 git push origin $NEXT_TAG
 gh release create $NEXT_TAG \
