@@ -27,6 +27,7 @@ use pice_core::adaptive::{
     decide_halt, run_adts, AdtsConfig, AdtsVerdict, CostStats, EscalationEvent, HaltReason,
     PairedScore, PassObservation, SprtConfig, VecConfig,
 };
+use pice_core::cli::ExitJsonStatus;
 use pice_core::layers::manifest::PassResult;
 use pice_core::workflow::schema::AdaptiveAlgo;
 use serde_json::Value;
@@ -340,16 +341,18 @@ pub async fn run_adaptive_passes(
         //
         // Compute the debited cost WITHOUT mutating cost_stats or
         // accumulated_cost yet — see the write-ahead ordering note below.
-        let fallback_seed = ctx.budget_usd / ctx.max_passes as f64;
-        // Phase 4.1 Pass-11 Codex CRITICAL #1: when the provider does NOT
-        // declare `costTelemetry`, persist NULL (not synthetic `Some(0.0)`)
-        // so dashboards show "unknown" rather than misleading `$0.0000`.
-        // The capability declaration is the source of truth: if the
-        // provider says it cannot measure cost reliably, we IGNORE any
-        // numeric `costUsd` it reports — the reported value is
-        // unverifiable noise, and persisting it would re-create the
-        // false-telemetry hole this fix closes. Tracked separately for
-        // the per-layer total-collapse decision below.
+        // Phase 4.1 Pass-11 Codex CRITICAL #1 (Pass-11.1 W1 close-up): the
+        // capability declaration is the source of truth. When the provider
+        // says it cannot measure cost reliably we IGNORE any numeric
+        // `costUsd` it reports. When it claims telemetry but reports
+        // None/NaN/∞ AND budget enforcement is OFF, we ALSO persist NULL
+        // — the previous `fallback_seed = budget_usd / max_passes` path
+        // collapsed to `Some(0.0)` for budget=0, re-introducing the
+        // false-`$0.0000`-telemetry hole this fix closes for the
+        // telemetry-on-but-buggy-provider corner. Three valid outcomes:
+        //   1. Real cost AND telemetry on            → record it, count as observed
+        //   2. Invalid/missing cost AND budget > 0   → fail-closed runtime error
+        //   3. Anything else                         → NULL (honest "unknown")
         let (primary_debited_cost, primary_observed_cost): (Option<f64>, f64) = match primary_cost {
             Some(c)
                 if CostStats::validate_nonnegative(c).is_ok() && ctx.cost_telemetry_available =>
@@ -364,8 +367,7 @@ pub async fn run_adaptive_passes(
                 ));
                 break;
             }
-            _ if !ctx.cost_telemetry_available => (None, 0.0),
-            _ => (Some(fallback_seed), fallback_seed),
+            _ => (None, 0.0),
         };
 
         // ── Persist FIRST, then mutate in-memory state ──────────────
@@ -404,13 +406,21 @@ pub async fn run_adaptive_passes(
         {
             // Phase 4.1 Pass-11 Codex HIGH #2: metrics persistence failures
             // are operational (audit trail / SQLite), NOT contract failures.
-            // The `metrics_persist_failed:` prefix (distinct from
+            // The `METRICS_PERSIST_FAILED_PREFIX` (distinct from
             // `runtime_error:`) routes the layer to `Pending` in
             // `build_adaptive_layer_result` and triggers
             // `metrics_persist_failed_response` (exit 1) in the handler,
             // not `evaluation-failed` (exit 2). CI operators see "audit
             // trail broken, retry" rather than "code failed evaluation".
-            halted_by_runtime_error = Some(format!("metrics_persist_failed:{e}"));
+            // Pass-11.1 W2 fix: prefix sourced from
+            // `ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX` so a future
+            // rename updates ONE site and all consumers (this site,
+            // `build_adaptive_layer_result`, the handler's
+            // `is_metrics_persist_failed` check) pick it up automatically.
+            halted_by_runtime_error = Some(format!(
+                "{}{e}",
+                ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX
+            ));
             break;
         }
 
@@ -486,14 +496,20 @@ pub async fn run_adaptive_passes(
                 // are equally subject to the capability gate — a bad value
                 // here would under-debit the budget. See the primary-path
                 // comment above for the full rationale.
-                // Same telemetry-aware fallback as the primary path —
+                // Same three-outcome simplification as the primary path —
                 // see Pass-11 Codex CRITICAL #1 comment above.
-                // NOTE: the adversarial path uses the PRIMARY's
+                //
+                // TODO(adts-v2): the adversarial path borrows the PRIMARY's
                 // `cost_telemetry_available` flag because the capability
-                // gate at `stack_loops.rs:584` keys on the primary
-                // provider's declaration. ADTS adversarial providers
-                // share the same shipping defaults posture and the same
-                // budget enforcement, so the same NULL semantic applies.
+                // gate at `stack_loops.rs:584` keys exclusively on the
+                // primary provider. If a future ADTS variant supports a
+                // costTelemetry-divergent adversarial (primary=on,
+                // adversarial=off) — say, cheap local model paired with a
+                // cloud reviewer — this assumption silently produces wrong
+                // cost accounting (the adversarial's reported cost gets
+                // trusted/rejected based on the wrong provider's
+                // declaration). Replace with `cost_telemetry_per_provider:
+                // HashMap<&str, bool>` keyed by provider role when v2 lands.
                 let (adv_debited_cost, adv_observed_cost): (Option<f64>, f64) = match adv_cost {
                     Some(c)
                         if CostStats::validate_nonnegative(c).is_ok()
@@ -509,8 +525,7 @@ pub async fn run_adaptive_passes(
                         ));
                         break;
                     }
-                    _ if !ctx.cost_telemetry_available => (None, 0.0),
-                    _ => (Some(fallback_seed), fallback_seed),
+                    _ => (None, 0.0),
                 };
 
                 // Pass-7 Codex High #3: persist to the sink BEFORE pushing
@@ -526,8 +541,12 @@ pub async fn run_adaptive_passes(
                     .context("failed to persist adversarial pass_event")
                 {
                     // Same Pass-11 HIGH #2 routing as the primary path —
-                    // operational, not contract failure.
-                    halted_by_runtime_error = Some(format!("metrics_persist_failed:{e}"));
+                    // operational, not contract failure. Pass-11.1 W2:
+                    // prefix sourced from `ExitJsonStatus` constant.
+                    halted_by_runtime_error = Some(format!(
+                        "{}{e}",
+                        ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX
+                    ));
                     break;
                 }
 
@@ -668,14 +687,17 @@ pub async fn run_adaptive_passes(
     // If zero passes ran (e.g. cold-start seed blocked pass 1), None is still
     // the right answer because the manifest truly has no cost observations.
     //
-    // Phase 4.1 Pass-11 Codex CRITICAL #1: ALSO collapse to `None` when
-    // the provider lacks `costTelemetry` AND zero passes observed a real
-    // cost (the loop ran with NULL `cost_usd` on every pass_event).
-    // Reporting `Some(0.0)` here would put false `$0.0000` totals on
-    // dashboards even though actual spend is unknown. SUM(NULL,NULL,...)
-    // in SQLite returns NULL, so reconciliation stays consistent.
-    let telemetry_unmeasured = !ctx.cost_telemetry_available && !any_real_cost_observed;
-    let total_cost_usd = if passes.is_empty() || telemetry_unmeasured {
+    // Phase 4.1 Pass-11 Codex CRITICAL #1 + Pass-11.1 W1: also collapse
+    // to `None` when zero passes observed a real cost — regardless of
+    // whether the provider DECLARED telemetry. A telemetry-off provider
+    // produces no real observations by construction; a telemetry-on
+    // provider that misbehaves (returns None/NaN/∞ on every pass under
+    // budget=0) ALSO produces no real observations and should surface
+    // as missing data, not as synthetic `$0.0000`. The single boolean
+    // `any_real_cost_observed` captures both cases without duplicating
+    // the truth-source. SUM(NULL,NULL,...) in SQLite returns NULL, so
+    // reconciliation stays consistent under either path.
+    let total_cost_usd = if passes.is_empty() || !any_real_cost_observed {
         None
     } else {
         Some(accumulated_cost)

@@ -129,6 +129,17 @@ pub enum ExitJsonStatus {
 }
 
 impl ExitJsonStatus {
+    /// Wire prefix carried in the per-layer `LayerResult.halted_by` string
+    /// when a mid-loop `pass_events` insert fails inside the adaptive
+    /// orchestrator. Routing in `build_adaptive_layer_result` and the
+    /// `evaluate` handler both check this prefix to map the halt to
+    /// `LayerStatus::Pending` (operational, not contract failure) and to
+    /// surface via `ExitJsonStatus::MetricsPersistFailed` (exit 1, not
+    /// `EvaluationFailed` exit 2). Centralized here so a future rename
+    /// updates ONE site and both consumers pick it up automatically —
+    /// closes Pass-11.1 W2 (duplicated routing logic).
+    pub const METRICS_PERSIST_FAILED_PREFIX: &'static str = "metrics_persist_failed:";
+
     /// Returns the serialized wire string. Used by tests so the assertion
     /// runs against the same enum the handler emits — no risk of typo drift
     /// between handler call site and test fixture.
@@ -143,6 +154,15 @@ impl ExitJsonStatus {
             Self::EvaluationFailed => "evaluation-failed",
             Self::MetricsPersistFailed => "metrics-persist-failed",
         }
+    }
+
+    /// True if `halted_by` represents a mid-loop metrics persistence
+    /// failure. Both the layer-status mapper in `pice-daemon` AND the
+    /// `evaluate` handler call this helper — never re-implement the prefix
+    /// check inline (Pass-11.1 W2: drift between two `starts_with` call
+    /// sites would silently misroute the exit code).
+    pub fn is_metrics_persist_failed(halted_by: &str) -> bool {
+        halted_by.starts_with(Self::METRICS_PERSIST_FAILED_PREFIX)
     }
 }
 
@@ -586,6 +606,34 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// Pass-11.1 W2 fix: lock the `metrics_persist_failed:` prefix
+    /// constant against the helper. Both `build_adaptive_layer_result` in
+    /// the daemon AND the `evaluate` handler call
+    /// `ExitJsonStatus::is_metrics_persist_failed(...)`; if the constant
+    /// changes without the helper following, both sites silently
+    /// misroute. This test fails on drift.
+    #[test]
+    fn metrics_persist_failed_prefix_helper_agrees_with_constant() {
+        let happy = format!(
+            "{}{}",
+            ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX,
+            "simulated SQLite I/O error on call 2"
+        );
+        assert!(ExitJsonStatus::is_metrics_persist_failed(&happy));
+        // Must be unambiguous against the existing `runtime_error:` namespace
+        // — Pass-11 chose a non-overlapping prefix on purpose.
+        assert!(!ExitJsonStatus::is_metrics_persist_failed(
+            "runtime_error:metrics_persist_failed:legacy"
+        ));
+        assert!(!ExitJsonStatus::is_metrics_persist_failed(""));
+        assert!(!ExitJsonStatus::is_metrics_persist_failed("sprt_rejected"));
+        // Empty body after the prefix is still a valid match — error
+        // strings can be empty in pathological cases.
+        assert!(ExitJsonStatus::is_metrics_persist_failed(
+            ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX
+        ));
     }
 
     /// Phase 3 round-5 adversarial review fix: lock `ExitJsonStatus::as_str()`

@@ -633,6 +633,101 @@ async fn adaptive_zero_budget_bypasses_cost_telemetry_gate() {
     );
 }
 
+// ─── Pass 11.1 S3 — telemetry-off ground truth at the sink layer ──────────
+
+/// Pass-11.1 review S3 close-up: the CLI test asserts the wire shape
+/// (`layer.total_cost_usd: null` in the JSON response). This sister test
+/// asserts the SAME truth one layer down: every call to
+/// `PassMetricsSink::record_pass` carries `cost_usd = None` when the
+/// provider lacks costTelemetry capability — even though the stub IS
+/// returning numeric cost values via `PICE_STUB_SCORES`. The sink is the
+/// chokepoint that writes to `pass_events` (`metrics::store::insert_pass_event`
+/// passes `Option<f64>` straight to rusqlite, which maps `None` →
+/// SQLite NULL natively), so verifying the sink rows == verifying SQLite
+/// without spinning up a real DB.
+///
+/// The capability declaration is the source of truth: when the provider
+/// says it cannot measure cost reliably, the loop ignores any numeric
+/// `costUsd` it reports — anything else would re-create the false
+/// `$0.0000` telemetry hole Pass-11 CRITICAL #1 closed.
+#[tokio::test]
+async fn telemetry_off_writes_null_cost_to_sink_for_every_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan_path = setup_minimal_repo(dir.path());
+    let layers = single_layer_config();
+    let pice_config = stub_pice_config(false);
+    // budget_usd = 0 → capability gate inert → loop runs.
+    // High scores so SPRT accepts cleanly without ambiguity.
+    let workflow = workflow_with_adaptive(AdaptiveAlgo::BayesianSprt, 0.90, 5, 0.0, None);
+    let seams = BTreeMap::new();
+    let cfg = make_cfg(
+        &layers,
+        &plan_path,
+        dir.path(),
+        &pice_config,
+        &workflow,
+        &seams,
+    );
+
+    // Stub declares `costTelemetry: false` AND emits cost values (0.005)
+    // via PICE_STUB_SCORES. Per Pass-11.1 W1: the cost values MUST be
+    // ignored because the capability declaration is the source of truth.
+    let _stub = StubNoCostTelemetryGuard::new("9.5,0.005;9.5,0.005;9.5,0.005;9.5,0.005;9.5,0.005");
+
+    let mut sink = RecordingPassSink::default();
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        .await
+        .unwrap();
+
+    let backend = manifest
+        .layers
+        .iter()
+        .find(|l| l.name == "backend")
+        .expect("backend layer missing");
+
+    // At least one pass must have recorded — otherwise we're testing the
+    // wrong path (e.g. a degenerate config that halted before pass 1).
+    assert!(
+        !sink.rows.is_empty(),
+        "sink must capture at least one pass row to test the NULL-cost contract; \
+         got zero rows. backend halted_by={:?}",
+        backend.halted_by,
+    );
+
+    // GROUND-TRUTH ASSERTION: every sink row carries cost_usd = None.
+    // In `metrics::store::insert_pass_event` this becomes a SQL NULL via
+    // rusqlite::params! — the same NULL the cost-reconciliation COALESCE
+    // SQL relies on.
+    for (i, row) in sink.rows.iter().enumerate() {
+        assert!(
+            row.cost_usd.is_none(),
+            "sink row {i} (pass_index {pi}, model {m}) MUST carry cost_usd=None \
+             when provider lacks costTelemetry — got {cu:?}. Re-introduces the \
+             false-`$0.0000`-telemetry hole Pass-11 CRITICAL #1 closed.",
+            pi = row.pass_index,
+            m = row.model,
+            cu = row.cost_usd,
+        );
+    }
+
+    // Manifest-side parity: per-pass cost_usd and the layer total must
+    // ALSO be None — the manifest is what dashboards read.
+    assert!(
+        backend.total_cost_usd.is_none(),
+        "manifest layer.total_cost_usd MUST be None when telemetry is off; \
+         got {:?}. Reporting Some(0.0) here is the regression Codex flagged.",
+        backend.total_cost_usd,
+    );
+    for pass in &backend.passes {
+        assert!(
+            pass.cost_usd.is_none(),
+            "manifest pass[{}].cost_usd MUST be None when telemetry is off; got {:?}",
+            pass.index,
+            pass.cost_usd,
+        );
+    }
+}
+
 // ─── Test 4: Cold-start seed blocks overspend on pass one ──────────────────
 
 #[tokio::test]
@@ -1396,28 +1491,32 @@ async fn cost_reconciliation_within_tolerance() {
 
 // ─── Pass-3 regression: fallback_seed cost syncs into manifest & sink ──────
 
-/// Phase 4 Pass-3 regression for Codex High #3, updated for Pass-8 Codex H1.
+/// Phase 4 Pass-3 regression for Codex High #3, updated for Pass-8 Codex H1
+/// and re-targeted for Pass-11.1 W1.
 ///
-/// When the provider reports an invalid cost (negative / NaN / ∞) AND
-/// `budget_usd == 0` (no financial enforcement), the loop falls back to the
-/// cold-start seed (which is also 0 under zero budget) and keeps running.
-/// The reconciliation invariant must hold on the fallback path too:
-/// `SUM(passes[].cost_usd) == total_cost_usd` and `SUM(sink rows) == total`.
+/// CONTRACT EVOLUTION:
+/// - Pass-3 (legacy): when the provider reports an invalid cost AND
+///   `budget_usd == 0`, the loop fell back to the cold-start seed
+///   (`budget_usd / max_passes`, which is also 0 under zero budget) and
+///   recorded synthetic `Some(0.0)` to preserve `SUM(passes) == total`.
+/// - Pass-11.1 W1: synthetic `Some(0.0)` is exactly the false-`$0.0000`
+///   telemetry hole that Pass-11 CRITICAL #1 closed. The new contract:
+///   when no pass observed a real cost (every cost was None/NaN/∞ AND
+///   budget enforcement is off), persist `cost_usd = None` per pass and
+///   `total_cost_usd = None` for the layer. Reconciliation still holds
+///   because SQLite `SUM(NULL,NULL,...) = NULL` and the COALESCE-based
+///   reconciliation SQL handles NULL totals.
 ///
-/// Under `budget_usd > 0`, invalid cost now fails closed (Pass-8 Codex H1 —
+/// Under `budget_usd > 0`, invalid cost still fails closed (Pass-8 Codex H1 —
 /// see `negative_cost_under_budget_halts_with_invalid_cost_error` below).
-/// This test exercises the legacy fallback-under-no-enforcement path so the
-/// "debited value is the single source of truth" invariant from Pass-3
-/// stays green for non-budgeted runs.
+/// This test exercises the no-enforcement path so the W1 NULL-on-bad-data
+/// contract is locked in.
 #[tokio::test]
 async fn cost_reconciliation_holds_when_provider_cost_invalid() {
     let dir = tempfile::tempdir().unwrap();
     let plan_path = setup_minimal_repo(dir.path());
     let layers = single_layer_config();
     let pice_config = stub_pice_config(false);
-    // budget_usd = 0 → no financial enforcement, fallback branch active.
-    // Pass-8 Codex H1: budget > 0 would now hard-fail on invalid cost;
-    // the reconciliation contract only applies to the fallback path.
     let budget_usd = 0.0_f64;
     let max_passes = 5_u32;
     let workflow = workflow_with_adaptive(
@@ -1438,8 +1537,8 @@ async fn cost_reconciliation_holds_when_provider_cost_invalid() {
     );
 
     // Every pass reports a negative cost. `CostStats::validate_nonnegative`
-    // rejects it; the fallback debits `fallback_seed = budget_usd / max_passes
-    // = 0.0 / 5 = 0.0` per pass (budget == 0 → seed == 0).
+    // rejects it; with W1 the loop now persists `None` (not synthetic seed)
+    // because no real cost was observed.
     let _stub = StubScoresGuard::new("9.5,-0.01;9.5,-0.01;9.5,-0.01;9.5,-0.01;9.5,-0.01");
 
     let mut sink = NullPassSink;
@@ -1452,45 +1551,46 @@ async fn cost_reconciliation_holds_when_provider_cost_invalid() {
         .find(|l| l.name == "backend")
         .unwrap();
 
-    // Every pass MUST record the fallback seed (not the raw negative value).
-    let expected_seed = budget_usd / max_passes as f64;
+    // Pass-11.1 W1: every pass MUST carry `cost_usd = None` because the
+    // provider returned invalid costs on every observation. Synthesizing
+    // a `Some(0.0)` here would put false `$0.0000` on dashboards.
     assert!(
         !backend.passes.is_empty(),
         "expected at least one pass to have run",
     );
     for p in &backend.passes {
-        let got = p.cost_usd.unwrap_or(f64::NAN);
         assert!(
-            (got - expected_seed).abs() < 1e-9,
-            "pass {}: expected debited seed {expected_seed}, got {got}",
+            p.cost_usd.is_none(),
+            "pass {}: with W1 contract, invalid provider cost MUST surface as \
+             None (missing data) — got {:?}. Synthetic seed re-introduces the \
+             false-`$0.0000` telemetry regression.",
             p.index,
+            p.cost_usd,
         );
     }
 
-    // Manifest reconciliation: sum of per-pass debited costs must equal
-    // the layer's `total_cost_usd` (what goes to `evaluations.final_total_cost_usd`).
-    let sum_passes: f64 = backend
-        .passes
-        .iter()
-        .map(|p| p.cost_usd.unwrap_or(0.0))
-        .sum();
-    let total = backend.total_cost_usd.unwrap_or(0.0);
+    // Reconciliation under W1: layer total_cost_usd MUST be None when no
+    // real cost was observed. Downstream SQL: SUM(NULL,...) = NULL,
+    // COALESCE(NULL, -1.0) = -1.0, ABS(NULL - -1.0) = NULL, HAVING excludes
+    // the row — no false reconciliation drift.
     assert!(
-        (sum_passes - total).abs() < 1e-9,
-        "reconciliation with invalid provider cost: sum(passes.cost_usd)={sum_passes} vs total_cost_usd={total}",
+        backend.total_cost_usd.is_none(),
+        "W1 contract: total_cost_usd MUST be None when no pass observed a \
+         real cost; got {:?}",
+        backend.total_cost_usd,
     );
 }
 
-/// Phase 4 Pass-3 regression for Codex High #3 (sink-side mirror).
+/// Phase 4 Pass-3 regression for Codex High #3 (sink-side mirror), updated
+/// for Pass-11.1 W1.
 ///
-/// The manifest-side reconciliation is checked above. This test asserts
-/// the SAME invariant on the sink path that writes to `pass_events`: a
-/// `RecordingPassSink` captures exactly the values that the daemon would
-/// insert into SQLite, and their sum must equal the layer's
-/// `total_cost_usd`. Without the Pass-3 fix, the sink row for a
-/// fallback-triggering pass would carry the raw invalid cost while the
-/// total carried the seed — breaking `SUM(pass_events.cost_usd) =
-/// evaluations.final_total_cost_usd`.
+/// The manifest-side W1 contract is checked above. This test asserts the
+/// SAME truth on the sink path that writes to `pass_events`: a
+/// `RecordingPassSink` captures exactly the values the daemon would insert
+/// into SQLite, and every row MUST carry `cost_usd = None` when the
+/// provider reports invalid costs on every pass with budget=0. Under the
+/// legacy Pass-3 contract, sink rows carried the synthetic seed
+/// `Some(0.0)` — the false-`$0.0000` regression Pass-11 closed.
 #[tokio::test]
 async fn pass_events_sink_mirrors_debited_cost_on_fallback() {
     use pice_daemon::orchestrator::RecordingPassSink;
@@ -1499,9 +1599,6 @@ async fn pass_events_sink_mirrors_debited_cost_on_fallback() {
     let plan_path = setup_minimal_repo(dir.path());
     let layers = single_layer_config();
     let pice_config = stub_pice_config(false);
-    // Pass-8 Codex H1: budget_usd = 0 keeps the fallback-path sink-mirror
-    // contract alive. Under budget > 0, invalid cost now hard-fails (see
-    // `negative_cost_under_budget_halts_with_invalid_cost_error`).
     let budget_usd = 0.0_f64;
     let max_passes = 5_u32;
     let workflow = workflow_with_adaptive(
@@ -1533,33 +1630,32 @@ async fn pass_events_sink_mirrors_debited_cost_on_fallback() {
         .find(|l| l.name == "backend")
         .unwrap();
 
-    // Sink must have recorded every pass; each row MUST carry the
-    // debited seed (what `pass_events.cost_usd` would persist).
-    let expected_seed = budget_usd / max_passes as f64;
+    // Pass-11.1 W1: sink must have recorded every pass; each row MUST
+    // carry `cost_usd = None` (which becomes SQL NULL via rusqlite::params!).
     assert!(
         !sink.rows.is_empty(),
         "expected at least one sink row to have been recorded",
     );
     for row in &sink.rows {
-        let got = row.cost_usd.unwrap_or(f64::NAN);
         assert!(
-            (got - expected_seed).abs() < 1e-9,
-            "sink row (pass {}, model {}): expected debited seed {expected_seed}, got {got}",
+            row.cost_usd.is_none(),
+            "sink row (pass {}, model {}): with W1, invalid provider cost \
+             MUST persist as None — got {:?}",
             row.pass_index,
             row.model,
+            row.cost_usd,
         );
     }
 
-    // The ultimate cost-reconciliation contract: SUM(sink rows) equals the
-    // manifest's `total_cost_usd`. This is what downstream SQL queries
-    // (`SELECT SUM(cost_usd) FROM pass_events WHERE evaluation_id = ?`
-    // vs `SELECT final_total_cost_usd FROM evaluations WHERE id = ?`)
-    // would observe.
-    let sum_sink: f64 = sink.rows.iter().map(|r| r.cost_usd.unwrap_or(0.0)).sum();
-    let total = backend.total_cost_usd.unwrap_or(0.0);
+    // Reconciliation under W1: when no real cost was observed, both sides
+    // agree at "missing data": sink rows are all None (SQLite SUM = NULL)
+    // and the layer total_cost_usd is None. Downstream COALESCE-based
+    // reconciliation SQL handles NULL totals without false drift.
     assert!(
-        (sum_sink - total).abs() < 1e-9,
-        "sink reconciliation: sum(sink.cost_usd)={sum_sink} vs total_cost_usd={total}",
+        backend.total_cost_usd.is_none(),
+        "W1 contract: layer total_cost_usd MUST be None when no real cost \
+         was observed; got {:?}",
+        backend.total_cost_usd,
     );
 }
 

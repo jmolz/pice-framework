@@ -443,12 +443,17 @@ pub async fn run(
         // is operational (audit trail / SQLite broken) — NOT a contract
         // failure. Route it through `metrics_persist_failed_response` (exit 1)
         // before any contract-pass/fail accounting so CI sees "audit trail
-        // broken, retry" rather than "evaluation failed (exit 2)".
+        // broken, retry" rather than "evaluation failed (exit 2)". Pass-11.1
+        // W2: prefix-check sourced from
+        // `ExitJsonStatus::is_metrics_persist_failed` so this site, the
+        // adaptive loop's halt-string construction, and
+        // `build_adaptive_layer_result`'s status mapping all consult the
+        // same constant. Drift between any two would silently misroute.
         let mid_loop_metrics_errors: Vec<String> = manifest
             .layers
             .iter()
             .filter_map(|l| l.halted_by.as_deref())
-            .filter(|h| h.starts_with("metrics_persist_failed:"))
+            .filter(|h| ExitJsonStatus::is_metrics_persist_failed(h))
             .map(|h| h.to_string())
             .collect();
         if !mid_loop_metrics_errors.is_empty() {

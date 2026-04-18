@@ -728,8 +728,10 @@ fn build_adaptive_layer_result(
             // prefix would otherwise win for a hypothetical
             // "runtime_error:metrics_persist_failed:" string — but we
             // intentionally chose a non-overlapping prefix in adaptive_loop.rs
-            // so the routing is unambiguous.
-            Some(reason) if reason.starts_with("metrics_persist_failed:") => {
+            // so the routing is unambiguous. Pass-11.1 W2: prefix-check
+            // sourced from `ExitJsonStatus::is_metrics_persist_failed`
+            // (single source of truth, locked by unit test against drift).
+            Some(reason) if pice_core::cli::ExitJsonStatus::is_metrics_persist_failed(reason) => {
                 (LayerStatus::Pending, outcome.halted_by.clone())
             }
             // Phase 4 Pass-4 fix for Codex High: mid-loop provider errors
