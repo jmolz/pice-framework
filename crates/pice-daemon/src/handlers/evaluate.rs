@@ -438,6 +438,25 @@ pub async fn run(
         // seam finding), we exit 2. Overall status being InProgress from
         // Phase 1 (provider not wired) is NOT a failure — exit 0.
         use pice_core::layers::manifest::{CheckStatus, LayerStatus, ManifestStatus};
+        // Phase 4.1 Pass-11 Codex HIGH #2: a per-pass sink failure marks the
+        // layer Pending with `halted_by = "metrics_persist_failed:..."`. That
+        // is operational (audit trail / SQLite broken) — NOT a contract
+        // failure. Route it through `metrics_persist_failed_response` (exit 1)
+        // before any contract-pass/fail accounting so CI sees "audit trail
+        // broken, retry" rather than "evaluation failed (exit 2)".
+        let mid_loop_metrics_errors: Vec<String> = manifest
+            .layers
+            .iter()
+            .filter_map(|l| l.halted_by.as_deref())
+            .filter(|h| h.starts_with("metrics_persist_failed:"))
+            .map(|h| h.to_string())
+            .collect();
+        if !mid_loop_metrics_errors.is_empty() {
+            return Ok(metrics_persist_failed_response(
+                req.json,
+                mid_loop_metrics_errors,
+            ));
+        }
         let any_failed_layer = manifest
             .layers
             .iter()

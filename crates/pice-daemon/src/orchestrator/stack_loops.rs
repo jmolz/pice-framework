@@ -581,7 +581,8 @@ async fn try_run_layer_adaptive(
     // `adaptive_algorithm` because budget enforcement runs for every algo
     // (including `None`, per CLAUDE.md — "Budget is a financial safety
     // rail, not a strategy choice").
-    if budget_usd > 0.0 && !primary.capabilities().cost_telemetry {
+    let cost_telemetry_available = primary.capabilities().cost_telemetry;
+    if budget_usd > 0.0 && !cost_telemetry_available {
         let msg = format!(
             "provider '{}' does not declare costTelemetry, but workflow.yaml requests \
              budget_usd = {:.4} for layer '{}'. Adaptive budgets require real per-pass \
@@ -593,6 +594,23 @@ async fn try_run_layer_adaptive(
         warn!(layer = %layer_name, "{msg}");
         let _ = primary.shutdown().await;
         return LayerAdaptiveResult::RuntimeError(msg);
+    }
+    // Phase 4.1 Pass-11 Codex CRITICAL #1: when adaptive evaluation runs
+    // with `budget_usd = 0` AND the provider lacks costTelemetry (the
+    // shipped-default fresh-install path), neither the capability gate
+    // nor the budget rail is active. Warn loudly so operators know
+    // costs will be recorded as NULL (not synthetic `$0.0000`) and
+    // financial enforcement is opt-in.
+    if budget_usd == 0.0 && !cost_telemetry_available {
+        warn!(
+            layer = %layer_name,
+            provider = %cfg.primary_provider,
+            "adaptive evaluation running without cost telemetry capability AND without \
+             budget enforcement (budget_usd = 0). Per-pass cost_usd will be persisted as \
+             NULL; final_total_cost_usd will be NULL. Once your provider emits real \
+             costUsd on evaluate/create AND advertises costTelemetry=true, raise \
+             budget_usd > 0 to enable enforcement."
+        );
     }
 
     // Start the adversarial provider only when ADTS is selected.
@@ -653,6 +671,7 @@ async fn try_run_layer_adaptive(
         } else {
             Some(cfg.pice_config.evaluation.adversarial.effort.clone())
         },
+        cost_telemetry_available,
     };
 
     let result = run_adaptive_passes(&ctx, &mut primary, adversarial.as_mut(), pass_sink).await;
@@ -701,6 +720,18 @@ fn build_adaptive_layer_result(
         (LayerStatus::Failed, Some(format!("seam:{failed_id}")))
     } else {
         match outcome.halted_by.as_deref() {
+            // Phase 4.1 Pass-11 Codex HIGH #2: metrics-persist failures are
+            // operational, NOT contract failures. Route to `Pending` (not
+            // `Failed`) and let the handler surface them via
+            // `metrics_persist_failed_response()` (exit 1, not exit 2).
+            // The check MUST precede the `runtime_error:` arm because that
+            // prefix would otherwise win for a hypothetical
+            // "runtime_error:metrics_persist_failed:" string — but we
+            // intentionally chose a non-overlapping prefix in adaptive_loop.rs
+            // so the routing is unambiguous.
+            Some(reason) if reason.starts_with("metrics_persist_failed:") => {
+                (LayerStatus::Pending, outcome.halted_by.clone())
+            }
             // Phase 4 Pass-4 fix for Codex High: mid-loop provider errors
             // flow through `run_adaptive_passes` as a preserved outcome with
             // `halted_by = "runtime_error:..."`. Route them to `Failed` so

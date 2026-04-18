@@ -675,3 +675,116 @@ fn cli_evaluate_stock_defaults_workflow_does_not_trip_capability_gate() {
         "capability gate was tripped — stderr: {stderr_text}",
     );
 }
+
+// ─── Phase 4.1 Pass-11 Codex CRITICAL #1 — telemetry-off NULL totals ──────
+//
+// Pass-10 fix shipped `budget_usd: 0` to unblock fresh installs whose
+// providers don't declare `costTelemetry`. Pass-11 Codex CRITICAL #1
+// observed that the loop still synthesized `Some(0.0)` debits and
+// reported `final_total_cost_usd = 0.0` — false `$0.0000` telemetry on
+// the default path.
+//
+// The fix: when `cost_telemetry_available == false`, the loop persists
+// `cost_usd = NULL` per pass and collapses `total_cost_usd` to `None` if
+// no pass observed a real number. This test asserts that contract from
+// the CLI shape: with the shipped workflow + a costTelemetry=false
+// stub, the JSON response has `total_cost_usd: null` (not `0` or `0.0`).
+#[test]
+fn cli_evaluate_telemetry_off_collapses_total_cost_to_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = setup(dir.path());
+
+    let shipped_yaml = include_str!("../../../templates/pice/workflow.yaml")
+        .to_string()
+        .replace("model: sonnet", "model: stub-model");
+    fs::create_dir_all(dir.path().join(".pice")).unwrap();
+    fs::write(dir.path().join(".pice/workflow.yaml"), shipped_yaml).unwrap();
+
+    let output = pice_cmd()
+        .current_dir(dir.path())
+        .env(
+            "PICE_STUB_SCORES",
+            "9.5,0.001;9.5,0.001;9.5,0.001;9.5,0.001;9.5,0.001",
+        )
+        .env("PICE_STUB_COST_TELEMETRY_OFF", "1")
+        .args(["evaluate", plan.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stock-defaults run with telemetry-off provider must exit 0; \
+         stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout),
+    );
+
+    // Pass-11 CRITICAL #1: per-layer total_cost_usd MUST be null (not 0.0).
+    // Synthesizing zero would put false `$0.0000` totals on dashboards.
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must parse as JSON");
+    let layers = json["layers"]
+        .as_array()
+        .expect("response must carry layers[]");
+    assert!(
+        !layers.is_empty(),
+        "at least one layer must have evaluated; got: {json}",
+    );
+    for layer in layers {
+        let total = &layer["total_cost_usd"];
+        assert!(
+            total.is_null(),
+            "layer '{}' total_cost_usd MUST be null when provider lacks costTelemetry — \
+             got {total:?}. Synthesizing zero is the Pass-11 Codex CRITICAL #1 regression.",
+            layer["name"].as_str().unwrap_or("?"),
+        );
+        // Per-pass cost_usd entries must also be null (NULL in pass_events).
+        if let Some(passes) = layer["passes"].as_array() {
+            for pass in passes {
+                let pcost = &pass["cost_usd"];
+                assert!(
+                    pcost.is_null(),
+                    "layer '{}' pass {} cost_usd MUST be null with telemetry off — got {pcost:?}",
+                    layer["name"].as_str().unwrap_or("?"),
+                    pass["index"],
+                );
+            }
+        }
+    }
+
+    // The handler also emits a warning to stderr at layer start so operators
+    // notice that costs are unmeasured. The exact wording is not load-bearing
+    // for this test — assert the discriminant phrase is present.
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr_text.contains("without cost telemetry capability"),
+        "stderr must carry the telemetry-off warning so operators are not \
+         silently in the dark; got stderr:\n{stderr_text}",
+    );
+}
+
+// ─── Phase 4.1 Pass-11 Codex HIGH #2 — sink failure exits 1 not 2 ──────────
+//
+// Pass-10 implementation routed mid-loop sink (pass_events) failures
+// through `runtime_error:metrics_persist_failed:` → `LayerStatus::Failed`
+// → `EvaluationFailed` exit 2. That tells CI "the code failed
+// evaluation" when the actual problem is "the audit trail is broken."
+//
+// The fix: distinct `metrics_persist_failed:` halted_by prefix, layer
+// routes to `Pending` (not `Failed`), handler surfaces via
+// `metrics_persist_failed_response` (exit 1) before any contract
+// pass/fail accounting. Operators see "audit trail broken, retry"
+// rather than "evaluation failed, debug your code."
+//
+// This unit-style assertion lives in the daemon test for the actual
+// Pending-status + halted_by-prefix invariants
+// (`mid_loop_sink_failure_preserves_manifest_sink_parity`). The CLI-side
+// exit-code routing already has thorough coverage in
+// `cli_evaluate_corrupt_db_fails_closed_with_metrics_persist_failed` and
+// `cli_evaluate_legacy_branch_corrupt_db_fails_closed_with_metrics_persist_failed`
+// for the legacy + finalize paths. The mid-loop case is structurally
+// identical from the CLI's perspective once the daemon emits the typed
+// `MetricsPersistFailed` discriminant — covered by the daemon test
+// asserting the prefix and the handler test asserting the discriminant
+// is wired through. No additional CLI test needed.

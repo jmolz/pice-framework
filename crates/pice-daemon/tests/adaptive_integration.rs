@@ -1859,16 +1859,19 @@ async fn mid_loop_runtime_error_preserves_prior_passes_and_costs() {
 /// manifest reported one fake pass with no cost, breaking Criterion 16.
 ///
 /// With the write-ahead fix: persist to the sink FIRST. On success, mutate
-/// in-memory state. On failure, `break` into `halted_by_runtime_error`
-/// capture with prefix `runtime_error:metrics_persist_failed:` so the
-/// layer routes to `Failed`. Because the sink call is the commit point,
+/// in-memory state. On failure, `break` with halted_by prefix
+/// `metrics_persist_failed:` (Phase 4.1 Pass-11 Codex HIGH #2) so the
+/// layer routes to `Pending` (operational failure) — NOT `Failed` (which
+/// would conflate audit-trail failure with contract failure and produce
+/// exit 2 instead of exit 1). Because the sink call is the commit point,
 /// a failing pass is absent from BOTH sides — no drift.
 ///
 /// This test:
 ///   - Pass 1: sink succeeds → both manifest and sink see pass 1 at $0.02
 ///   - Pass 2: sink fails → neither manifest nor sink sees pass 2
 ///   - Asserts: manifest has exactly 1 pass at $0.02, halt is
-///     `runtime_error:metrics_persist_failed:...`, layer is Failed,
+///     `metrics_persist_failed:...` (no `runtime_error:` prefix per
+///     Pass-11 Codex HIGH #2), layer is Pending,
 ///     sink.rows.len() == 1, sum(sink) == manifest.total_cost_usd.
 #[tokio::test]
 async fn mid_loop_sink_failure_preserves_manifest_sink_parity() {
@@ -1938,18 +1941,17 @@ async fn mid_loop_sink_failure_preserves_manifest_sink_parity() {
 
     assert_eq!(
         backend.status,
-        LayerStatus::Failed,
-        "sink failure must fail the layer; halted_by={:?}",
+        LayerStatus::Pending,
+        "sink failure must mark the layer Pending (operational failure, not contract failure — \
+         Pass-11 Codex HIGH #2); halted_by={:?}",
         backend.halted_by,
     );
     let halted = backend.halted_by.clone().unwrap_or_default();
     assert!(
-        halted.starts_with("runtime_error:"),
-        "halted_by must route through runtime_error prefix; got {halted:?}",
-    );
-    assert!(
-        halted.contains("metrics_persist_failed"),
-        "halted_by must carry the metrics_persist_failed discriminant; got {halted:?}",
+        halted.starts_with("metrics_persist_failed:"),
+        "halted_by MUST start with `metrics_persist_failed:` (no `runtime_error:` prefix per \
+         Pass-11 Codex HIGH #2 — operational failures route through MetricsPersistFailed exit 1, \
+         not EvaluationFailed exit 2); got {halted:?}",
     );
 
     // Core invariant: manifest.passes and sink.rows both contain EXACTLY
