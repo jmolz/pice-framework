@@ -108,7 +108,7 @@ pnpm test
 
 | Test File | Feature | What It Validates |
 | --------- | ------- | ----------------- |
-| `pice-daemon/tests/adaptive_integration.rs` (~26 tests) | SPRT / ADTS / VEC end-to-end | All four halt reasons, ADTS three-level escalation audit trail, VEC entropy halt, budget halt before algorithm halt, context isolation (byte-identical prompt across passes), determinism, cost reconciliation, mid-loop sink failure parity (Pass-11 routes to `Pending` via `metrics_persist_failed:` prefix, exit 1 not 2) |
+| `pice-daemon/tests/adaptive_integration.rs` (~27 tests) | SPRT / ADTS / VEC end-to-end | All four halt reasons, ADTS three-level escalation audit trail, VEC entropy halt, budget halt before algorithm halt, context isolation (byte-identical prompt across passes), determinism, cost reconciliation, mid-loop sink failure parity (Pass-11 routes to `Pending` via `metrics_persist_failed:` prefix, exit 1 not 2), telemetry-off NULL-cost ground-truth at the sink layer (Pass-11.1 S3) |
 | `pice-daemon/tests/adaptive_concurrent.rs` (4 tests) | Per-manifest concurrency isolation | Same-feature lock serializes concurrent tasks, different-feature distinct locks, cross-process file lock blocks second acquirer (fs2 flock), disjoint pass_events on shared DB |
 | `pice-cli/tests/adaptive_integration.rs` (12 tests) | CLI exit-code routing + telemetry semantics | SPRT reject → exit 2 via typed `ExitJsonStatus::EvaluationFailed`; budget/max-passes → exit 0; corrupt-DB legacy + Stack Loops → `MetricsPersistFailed` exit 1; **stock-defaults workflow (capability-gate regression guard)**; **telemetry-off path collapses `total_cost_usd` to NULL with warning (Pass-11 CRITICAL #1 regression guard)** |
 | `provider-base/__tests__/roundtrip.test.ts` (43 tests) | TS-side protocol roundtrip | Every wire shape: session create/result, evaluate/create with passIndex/costUsd/freshContext/effortOverride/confidence camelCase, seam check result + finding, deny_unknown_fields on request params |
@@ -148,7 +148,7 @@ pnpm test
 
 ### Expected results
 
-All tests should pass. Baseline: **809 Rust tests (1 ignored — `dispatch_plan_errors_without_provider` is timing-flaky), 78 TypeScript tests, 0 lint errors, 0 warnings, clean release build.**
+All tests should pass. Baseline: **811 Rust tests (1 ignored — doc-test in `crates/pice-daemon/src/handlers/mod.rs` line 5), 78 TypeScript tests, 0 lint errors, 0 warnings, clean release build.**
 
 If any fail after your changes:
 
@@ -193,7 +193,7 @@ pnpm build
 cargo build --release
 ```
 
-Expected baseline: **809 Rust tests passing (1 ignored), 78 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.** One test (`handlers::tests::dispatch_plan_errors_without_provider`) is known-flaky due to timing — retry on spurious failure.
+Expected baseline: **811 Rust tests passing (1 ignored — doc-test in `pice-daemon/src/handlers/mod.rs`), 78 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.**
 
 ## Phase 3: Code Review of Current Changes
 
@@ -264,12 +264,12 @@ v0.2 daemon split:
   - seam_integration: ✓ / ✗
 
 Phase 4 adaptive evaluation:
-  - daemon adaptive_integration (~26 tests): ✓ / ✗
+  - daemon adaptive_integration (~27 tests): ✓ / ✗
   - daemon adaptive_concurrent (4 tests): ✓ / ✗
   - cli adaptive_integration (12 tests, including Pass-11 telemetry-off + stock-defaults): ✓ / ✗
   - TS roundtrip + deterministic stub (52 tests): ✓ / ✗
 
-Full Suite: 809 / 78 tests passing
+Full Suite: 811 / 78 tests passing
 Lint: 0 errors, 0 warnings (workspace + lib unwrap/expect denies)
 Build: PASS / FAIL
 ```
