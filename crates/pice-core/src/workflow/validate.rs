@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::layers::LayersConfig;
 use crate::seam::types::{LayerBoundary, ParseBoundaryError};
 use crate::seam::Registry;
-use crate::workflow::schema::WorkflowConfig;
+use crate::workflow::schema::{AdaptiveAlgo, WorkflowConfig};
 use crate::workflow::trigger;
 use crate::workflow::SCHEMA_VERSION;
 
@@ -89,7 +89,19 @@ pub fn validate_schema_only(cfg: &WorkflowConfig) -> ValidationReport {
         });
     }
 
-    if cfg.defaults.budget_usd < 0.0 {
+    // Phase 4.1 Pass-10 Codex MEDIUM #2: `is_finite()` first so a NaN/Inf
+    // YAML literal (`.nan` / `.inf`) surfaces as a deterministic config
+    // error at parse time, not as a runtime layer failure. NaN comparisons
+    // return false for every operator except `!=`, so the naive `< 0.0`
+    // check below would silently pass.
+    if !cfg.defaults.budget_usd.is_finite() {
+        report.errors.push(ValidationError {
+            field: "defaults.budget_usd".into(),
+            message: format!("budget_usd must be finite; got {}", cfg.defaults.budget_usd),
+            line: None,
+            column: None,
+        });
+    } else if cfg.defaults.budget_usd < 0.0 {
         report.errors.push(ValidationError {
             field: "defaults.budget_usd".into(),
             message: format!(
@@ -123,7 +135,15 @@ pub fn validate_schema_only(cfg: &WorkflowConfig) -> ValidationReport {
             }
         }
         if let Some(mc) = o.min_confidence {
-            if !(0.0..=1.0).contains(&mc) {
+            // Pass-10 Codex MEDIUM #2: finite-check first (NaN escapes range check).
+            if !mc.is_finite() {
+                report.errors.push(ValidationError {
+                    field: format!("layer_overrides.{layer}.min_confidence"),
+                    message: format!("min_confidence must be finite; got {mc}"),
+                    line: None,
+                    column: None,
+                });
+            } else if !(0.0..=1.0).contains(&mc) {
                 report.errors.push(ValidationError {
                     field: format!("layer_overrides.{layer}.min_confidence"),
                     message: format!("min_confidence must be between 0 and 1; got {mc}"),
@@ -133,7 +153,15 @@ pub fn validate_schema_only(cfg: &WorkflowConfig) -> ValidationReport {
             }
         }
         if let Some(b) = o.budget_usd {
-            if b < 0.0 {
+            // Pass-10 Codex MEDIUM #2: finite-check first (NaN escapes `<`).
+            if !b.is_finite() {
+                report.errors.push(ValidationError {
+                    field: format!("layer_overrides.{layer}.budget_usd"),
+                    message: format!("budget_usd must be finite; got {b}"),
+                    line: None,
+                    column: None,
+                });
+            } else if b < 0.0 {
                 report.errors.push(ValidationError {
                     field: format!("layer_overrides.{layer}.budget_usd"),
                     message: format!("budget_usd must be non-negative; got {b}"),
@@ -144,7 +172,144 @@ pub fn validate_schema_only(cfg: &WorkflowConfig) -> ValidationReport {
         }
     }
 
+    validate_adaptive_into(cfg, &mut report);
+
     report
+}
+
+/// Check adaptive sub-config ranges on the resolved evaluate phase.
+///
+/// Called inside `validate_schema_only` so both `pice validate` and the
+/// daemon's pre-execution validation catch misconfigured algorithm tuning.
+fn validate_adaptive_into(cfg: &WorkflowConfig, report: &mut ValidationReport) {
+    let eval = &cfg.phases.evaluate;
+
+    // Phase 4.1 Pass-10 Codex MEDIUM #2: NaN/Inf rejection for every
+    // adaptive numeric. NaN silently passes every subsequent `<=`, `>=`,
+    // `contains()` check (NaN comparisons return false), so a `.nan` YAML
+    // literal would slip through the whole validator and trip at runtime
+    // with a type-unsafe numeric operation. Surface as a config error
+    // here with the offending field named.
+    for (name, value) in [
+        ("prior_alpha", eval.sprt.prior_alpha),
+        ("prior_beta", eval.sprt.prior_beta),
+        ("accept_threshold", eval.sprt.accept_threshold),
+        ("reject_threshold", eval.sprt.reject_threshold),
+        ("divergence_threshold", eval.adts.divergence_threshold),
+        ("entropy_floor", eval.vec.entropy_floor),
+    ] {
+        if !value.is_finite() {
+            report.errors.push(ValidationError {
+                field: format!("phases.evaluate.{name}"),
+                message: format!("{name} must be finite; got {value}"),
+                line: None,
+                column: None,
+            });
+        }
+    }
+
+    // SPRT: accept > reject, both positive
+    if eval.sprt.accept_threshold <= eval.sprt.reject_threshold {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.sprt".into(),
+            message: format!(
+                "accept_threshold ({}) must be > reject_threshold ({})",
+                eval.sprt.accept_threshold, eval.sprt.reject_threshold
+            ),
+            line: None,
+            column: None,
+        });
+    }
+    if eval.sprt.prior_alpha <= 0.0 || eval.sprt.prior_beta <= 0.0 {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.sprt".into(),
+            message: format!(
+                "prior_alpha ({}) and prior_beta ({}) must both be > 0",
+                eval.sprt.prior_alpha, eval.sprt.prior_beta
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    // ADTS: divergence in [0, 10]
+    if !(0.0..=10.0).contains(&eval.adts.divergence_threshold) {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.adts.divergence_threshold".into(),
+            message: format!(
+                "divergence_threshold must be in [0, 10]; got {}",
+                eval.adts.divergence_threshold
+            ),
+            line: None,
+            column: None,
+        });
+    }
+
+    // Phase 4 Pass-5 Codex Critical #3 + High #5: standalone ADTS has no
+    // success path. `decide_halt(AdaptiveAlgo::Adts, ...)` returns halt=false
+    // from the algorithm-specific branch; `build_adaptive_layer_result` only
+    // marks `Passed` for `sprt_confidence_reached` or `vec_entropy`. Result:
+    // `adaptive_algorithm: adts` can only end Failed (escalation exhausted)
+    // or Pending (budget/max_passes) — never Passed. Additionally, ADTS
+    // silently degrades to a primary-only no-op when adversarial evaluation
+    // is disabled (High #5), because `paired_scores` stays empty and
+    // `run_adts` returns Continue forever.
+    //
+    // Overlay redesign (ADTS mutates next-pass params while SPRT/VEC drives
+    // halt) is tracked as follow-up. Until then, reject standalone ADTS at
+    // validation time with a clear upgrade path.
+    if matches!(eval.adaptive_algorithm, AdaptiveAlgo::Adts) {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.adaptive_algorithm".into(),
+            message: "standalone `adts` is not supported — it has no success path \
+                     (can only halt Failed on escalation exhaustion or Pending on \
+                     budget/max_passes). Use `bayesian_sprt` or `vec` as the base \
+                     completion rule; divergence-triggered escalation will be \
+                     re-enabled as an overlay in a follow-up release. See Phase 4 \
+                     Pass-5 Codex Critical #3 for details."
+                .into(),
+            line: None,
+            column: None,
+        });
+    }
+    for (layer, o) in &cfg.layer_overrides {
+        if matches!(o.adaptive_algorithm, Some(AdaptiveAlgo::Adts)) {
+            report.errors.push(ValidationError {
+                field: format!("layer_overrides.{layer}.adaptive_algorithm"),
+                message: "standalone `adts` is not supported (no success path). \
+                         Use `bayesian_sprt` or `vec`; see Phase 4 Pass-5 \
+                         Codex Critical #3."
+                    .into(),
+                line: None,
+                column: None,
+            });
+        }
+    }
+
+    // VEC: entropy_floor > 0
+    if eval.vec.entropy_floor <= 0.0 {
+        report.errors.push(ValidationError {
+            field: "phases.evaluate.vec.entropy_floor".into(),
+            message: format!("entropy_floor must be > 0; got {}", eval.vec.entropy_floor),
+            line: None,
+            column: None,
+        });
+    }
+
+    // Per-layer override: max_passes and budget_usd (not already covered above
+    // because max_passes=0 on a layer was not previously checked in the loop)
+    for (layer, o) in &cfg.layer_overrides {
+        if let Some(mp) = o.max_passes {
+            if mp == 0 {
+                report.errors.push(ValidationError {
+                    field: format!("layer_overrides.{layer}.max_passes"),
+                    message: "max_passes must be ≥ 1".into(),
+                    line: None,
+                    column: None,
+                });
+            }
+        }
+    }
 }
 
 // ─── Trigger checks ─────────────────────────────────────────────────────────
@@ -758,6 +923,74 @@ mod tests {
         assert!(report.errors.len() >= 3);
     }
 
+    // ─── Phase 4 Pass-5 Codex Critical #3 + High #5 ────────────────────────
+    //
+    // Standalone `adaptive_algorithm: adts` has no success path (can only halt
+    // Failed on escalation exhaustion or Pending on budget/max_passes). It
+    // also silently degrades to a primary-only no-op when adversarial
+    // evaluation is disabled. Until the overlay redesign lands, reject it at
+    // validation.
+
+    #[test]
+    fn adts_rejected_at_defaults() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.adaptive_algorithm = AdaptiveAlgo::Adts;
+        let report = validate_schema_only(&cfg);
+        assert!(!report.is_ok(), "ADTS at defaults must fail validation");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.field == "phases.evaluate.adaptive_algorithm"
+                    && e.message.contains("standalone `adts` is not supported")),
+            "expected standalone-ADTS rejection error; got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn adts_rejected_at_layer_override() {
+        let mut cfg = embedded_defaults();
+        let mut overrides = BTreeMap::new();
+        overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                adaptive_algorithm: Some(AdaptiveAlgo::Adts),
+                ..LayerOverride::default()
+            },
+        );
+        cfg.layer_overrides = overrides;
+        let report = validate_schema_only(&cfg);
+        assert!(!report.is_ok(), "ADTS at layer override must fail");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.field == "layer_overrides.backend.adaptive_algorithm"),
+            "expected layer-level ADTS rejection; got {:?}",
+            report.errors
+        );
+    }
+
+    #[test]
+    fn bayesian_sprt_and_vec_and_none_remain_accepted() {
+        for algo in [
+            AdaptiveAlgo::BayesianSprt,
+            AdaptiveAlgo::Vec,
+            AdaptiveAlgo::None,
+        ] {
+            let mut cfg = embedded_defaults();
+            cfg.phases.evaluate.adaptive_algorithm = algo;
+            let report = validate_schema_only(&cfg);
+            assert!(
+                report.errors.is_empty(),
+                "algo {:?} must remain valid; got errors {:?}",
+                algo,
+                report.errors
+            );
+        }
+    }
+
     // ─── Seam validation tests ──────────────────────────────────────────
 
     fn sample_registry() -> crate::seam::Registry {
@@ -982,6 +1215,94 @@ mod tests {
         cfg.seams = Some(seams);
         let report = validate_seams(&cfg, &sample_layers(), &sample_registry());
         assert!(report.is_ok(), "errors: {:?}", report.errors);
+    }
+
+    // ─── Adaptive validation tests ────────────────────────────────────
+
+    #[test]
+    fn adaptive_defaults_pass_validation() {
+        let cfg = embedded_defaults();
+        let report = validate_schema_only(&cfg);
+        assert!(report.is_ok(), "defaults must pass: {:?}", report.errors);
+    }
+
+    #[test]
+    fn sprt_accept_le_reject_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.sprt.accept_threshold = 0.5;
+        cfg.phases.evaluate.sprt.reject_threshold = 0.5;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("sprt") && e.message.contains("accept_threshold")));
+    }
+
+    #[test]
+    fn sprt_prior_alpha_zero_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.sprt.prior_alpha = 0.0;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("sprt") && e.message.contains("prior_alpha")));
+    }
+
+    #[test]
+    fn adts_divergence_out_of_range_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.adts.divergence_threshold = 11.0;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("adts") && e.message.contains("divergence_threshold")));
+    }
+
+    #[test]
+    fn vec_entropy_floor_zero_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.vec.entropy_floor = 0.0;
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("vec") && e.message.contains("entropy_floor")));
+    }
+
+    #[test]
+    fn layer_override_max_passes_zero_rejected() {
+        let mut cfg = embedded_defaults();
+        cfg.layer_overrides.insert(
+            "backend".into(),
+            LayerOverride {
+                max_passes: Some(0),
+                ..Default::default()
+            },
+        );
+        let report = validate_schema_only(&cfg);
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.field.contains("backend") && e.message.contains("max_passes")));
+    }
+
+    #[test]
+    fn adaptive_collects_all_errors() {
+        let mut cfg = embedded_defaults();
+        cfg.phases.evaluate.sprt.accept_threshold = 0.01;
+        cfg.phases.evaluate.sprt.reject_threshold = 1.0;
+        cfg.phases.evaluate.sprt.prior_alpha = -1.0;
+        cfg.phases.evaluate.adts.divergence_threshold = -0.5;
+        cfg.phases.evaluate.vec.entropy_floor = -0.01;
+        let report = validate_schema_only(&cfg);
+        assert!(
+            report.errors.len() >= 4,
+            "expected multiple adaptive errors collected, got {}: {:?}",
+            report.errors.len(),
+            report.errors
+        );
     }
 
     #[test]

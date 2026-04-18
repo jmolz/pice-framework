@@ -24,7 +24,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
-use super::{run_seams_for_layer, StreamSink};
+use super::adaptive_loop::{
+    run_adaptive_passes, AdaptiveContext, AdaptiveOutcome, PassMetricsSink,
+};
+use super::{run_seams_for_layer, ProviderOrchestrator, StreamSink};
 use crate::prompt::layer_builder::build_layer_evaluation_prompt;
 
 /// Configuration for a Stack Loops evaluation run.
@@ -76,6 +79,7 @@ pub async fn run_stack_loops(
     cfg: &StackLoopsConfig<'_>,
     sink: &dyn StreamSink,
     json_mode: bool,
+    pass_sink: &mut dyn PassMetricsSink,
 ) -> Result<VerificationManifest> {
     let config = cfg.layers;
     let plan_path = cfg.plan_path;
@@ -215,6 +219,7 @@ pub async fn run_stack_loops(
                     halted_by: None,
                     final_confidence: None,
                     total_cost_usd: None,
+                    escalation_events: None,
                 });
                 continue;
             }
@@ -236,6 +241,7 @@ pub async fn run_stack_loops(
                         halted_by: Some("missing layer definition".to_string()),
                         final_confidence: None,
                         total_cost_usd: None,
+                        escalation_events: None,
                     });
                     continue;
                 }
@@ -299,6 +305,7 @@ pub async fn run_stack_loops(
                     halted_by: Some(final_reason),
                     final_confidence: None,
                     total_cost_usd: None,
+                    escalation_events: None,
                 });
                 if !json_mode {
                     sink.send_chunk(&format!("  [{layer_name}] {label} (no file changes)\n"));
@@ -315,7 +322,9 @@ pub async fn run_stack_loops(
             // Load layer contract or fall back to plan contract
             let contract_content = load_layer_contract(project_root, layer_name, layer_def);
 
-            // Build context-isolated prompt
+            // Build context-isolated prompt (returned for future Phase 5
+            // prompt-inspection hooks; the adaptive loop below re-builds its
+            // own view from contract + diff + claude_md).
             let _prompt = build_layer_evaluation_prompt(
                 layer_name,
                 &contract_content,
@@ -323,21 +332,27 @@ pub async fn run_stack_loops(
                 &claude_md,
             );
 
-            // Phase 1: Record as PENDING — no provider evaluation yet.
-            // Full provider evaluation is wired in Phase 2. We fail closed:
-            // layers are NOT marked as PASSED without real evaluation.
-            //
-            // Phase 2 observability: the effective tier (from workflow
-            // `layer_overrides.{layer}.tier` with fallback to `defaults.tier`)
-            // is recorded in `halted_by` so workflow.yaml changes drive
-            // observable manifest output (PRDv2 Phase 2 validation criterion).
             let effective_tier = effective_tier_for(cfg.workflow, layer_name);
-            let timestamp = chrono::Utc::now().to_rfc3339();
 
-            // Phase 3 — run seam checks between this layer and its active
-            // boundary peers. Fail-closed: any `Failed` finding transitions
-            // the layer from `Pending` to `Failed` with `halted_by = "seam:<id>"`.
-            // `Warning` findings are advisory (do not downgrade status).
+            // Attempt to spawn the provider(s) and run the adaptive pass
+            // loop. If provider startup fails (common in test environments
+            // without a resolved binary), fall back to the Phase-1-pending
+            // placeholder so orchestration flow stays observable. This is
+            // a fail-closed path — no layer gets marked `Passed` on a
+            // provider failure.
+            let adaptive_outcome = try_run_layer_adaptive(
+                cfg,
+                layer_name,
+                &contract_content,
+                &filtered_diff,
+                &claude_md,
+                pass_sink,
+            )
+            .await;
+
+            // Phase 3 — seam checks. Run AFTER the adaptive loop completes;
+            // seam failures still downgrade layer status to Failed regardless
+            // of the adaptive halt reason.
             let seam_checks = run_seams_for_layer(
                 layer_name,
                 &active_set,
@@ -347,46 +362,43 @@ pub async fn run_stack_loops(
                 &full_diff,
                 &layer_paths,
             );
-            let first_failed = seam_checks
+            let first_failed_seam = seam_checks
                 .iter()
                 .find(|c| c.status == CheckStatus::Failed)
                 .map(|c| c.name.clone());
 
-            let (layer_status, halted_by) = match first_failed {
-                Some(failed_id) => (LayerStatus::Failed, Some(format!("seam:{failed_id}"))),
-                None => (
-                    LayerStatus::Pending,
-                    Some(format!("phase-1-pending-tier-{effective_tier}")),
+            let min_confidence = effective_min_confidence_for(cfg.workflow, layer_name);
+            let layer_result = match adaptive_outcome {
+                LayerAdaptiveResult::Completed(outcome) => build_adaptive_layer_result(
+                    layer_name.clone(),
+                    outcome,
+                    seam_checks,
+                    first_failed_seam,
+                    min_confidence,
+                ),
+                LayerAdaptiveResult::NotStarted => phase1_pending_layer_result(
+                    layer_name.clone(),
+                    effective_tier,
+                    filtered_diff.len(),
+                    seam_checks,
+                    first_failed_seam,
+                ),
+                // Pass-3 Codex Critical #2: runtime errors fail-close to
+                // `LayerStatus::Failed` (exit 2), NOT to the phase-1-pending
+                // placeholder (exit 0). Seam failures still take priority
+                // via `first_failed_seam` inside the helper.
+                LayerAdaptiveResult::RuntimeError(msg) => runtime_failed_layer_result(
+                    layer_name.clone(),
+                    msg,
+                    seam_checks,
+                    first_failed_seam,
                 ),
             };
 
-            let layer_result = LayerResult {
-                name: layer_name.clone(),
-                status: layer_status,
-                passes: vec![PassResult {
-                    index: 0,
-                    model: "phase-1-pending".to_string(),
-                    score: None,
-                    cost_usd: None,
-                    timestamp,
-                    findings: vec![format!(
-                        "Awaiting provider evaluation — {} bytes of filtered diff prepared",
-                        filtered_diff.len()
-                    )],
-                }],
-                seam_checks,
-                halted_by,
-                final_confidence: None,
-                total_cost_usd: None,
-            };
-
-            manifest.add_layer_result(layer_result);
-
             if !json_mode {
-                sink.send_chunk(&format!(
-                    "  [{layer_name}] PENDING (provider evaluation deferred)\n"
-                ));
+                sink.send_chunk(&format!("  [{}] {:?}\n", layer_name, layer_result.status));
             }
+            manifest.add_layer_result(layer_result);
 
             // Checkpoint: persist manifest after each layer result
             if let Some(ref path) = manifest_path {
@@ -459,6 +471,404 @@ pub async fn run_stack_loops(
     Ok(manifest)
 }
 
+/// Outcome of `try_run_layer_adaptive`.
+///
+/// Phase 4 Pass-3 fix for Codex Critical #2: the earlier `Option<AdaptiveOutcome>`
+/// return conflated two very different states —
+///
+/// - **Provider never started** (binary unresolvable, config invalid, or test
+///   fixture lacks a provider wired up). The loop literally did not execute,
+///   so the conservative behavior is to record the layer as `Pending` with
+///   the phase-1-pending placeholder. This preserves the graceful-degrade
+///   path existing tests rely on.
+/// - **Runtime error mid-loop** (provider spawn succeeded but then an RPC
+///   call timed out, the provider crashed, or the protocol returned an error
+///   that the loop could not recover from). This IS a failure: evaluation
+///   was attempted and broke. Silently downgrading it to `Pending` makes the
+///   overall exit code stay 0, which hides a real correctness problem from
+///   CI pipelines that rely on `pice evaluate` as a fail-closed gate.
+///
+/// Splitting the return lets the caller fail-close on runtime errors
+/// (→ `LayerStatus::Failed` → exit 2) while still tolerating missing
+/// providers in test fixtures.
+enum LayerAdaptiveResult {
+    /// Provider never started — conservative `Pending` placeholder.
+    NotStarted,
+    /// Loop completed (including natural halts like budget / max_passes).
+    Completed(AdaptiveOutcome),
+    /// Provider started but the loop or an RPC errored out. The message
+    /// is surfaced on the manifest's `halted_by` so operators can see
+    /// *why* the layer failed at the orchestrator level.
+    RuntimeError(String),
+}
+
+/// Attempt to run the per-layer adaptive pass loop.
+///
+/// Starts primary (and adversarial when ADTS is active) providers, invokes
+/// [`run_adaptive_passes`], and shuts them down. Returns
+/// [`LayerAdaptiveResult::NotStarted`] if any provider fails to start — the
+/// caller falls back to the Phase-1-pending placeholder to preserve the
+/// graceful-degrade path test fixtures depend on. Returns
+/// [`LayerAdaptiveResult::RuntimeError`] if the providers started but the
+/// loop or an RPC surfaced an unrecoverable error — the caller fails the
+/// layer so the overall evaluation exits non-zero (Pass-3 Codex fix).
+async fn try_run_layer_adaptive(
+    cfg: &StackLoopsConfig<'_>,
+    layer_name: &str,
+    contract_toml: &str,
+    filtered_diff: &str,
+    claude_md: &str,
+    pass_sink: &mut dyn PassMetricsSink,
+) -> LayerAdaptiveResult {
+    let workflow = cfg.workflow;
+    let algo = effective_adaptive_algo_for(workflow, layer_name);
+    let min_confidence = effective_min_confidence_for(workflow, layer_name);
+    let max_passes = effective_max_passes_for(workflow, layer_name);
+    let budget_usd = effective_budget_usd_for(workflow, layer_name);
+
+    // Build the per-layer contract payload. Providers expect JSON; the
+    // layer contract is a TOML fragment, so wrap it in an object with a
+    // `contract_toml` string field. Providers that understand the layered
+    // shape deserialize it; opaque providers pass it through.
+    let contract_json = serde_json::json!({
+        "layer": layer_name,
+        "contract_toml": contract_toml,
+    });
+
+    // Phase 4 Pass-4 fix for Codex Critical: `ProviderOrchestrator::start` is
+    // resolve + spawn + initialize. Previously ANY error from that composite
+    // routed to `NotStarted` → `phase-1-pending` (exit 0). That silently
+    // swallowed real startup failures (provider binary present but crashes on
+    // spawn, init RPC times out, initialize returns a protocol error) —
+    // exactly the failure mode the Pass-3 fail-close work was trying to stop.
+    //
+    // The intended carve-out is narrower: "provider cannot be RESOLVED" → the
+    // workflow names a provider the config/registry doesn't know about, so
+    // there is nothing we could have run. Anything past resolution that
+    // breaks is a runtime failure and must fail-close the layer.
+    //
+    // Probe `registry::resolve` first. Success here means we have a command
+    // and argv; a subsequent `start()` error is spawn or initialize, which
+    // is a real startup failure → `RuntimeError` → `LayerStatus::Failed`.
+    if pice_core::provider::registry::resolve(cfg.primary_provider, cfg.pice_config).is_none() {
+        warn!(
+            layer = %layer_name,
+            provider = %cfg.primary_provider,
+            "primary provider unresolvable, falling back to phase-1-pending",
+        );
+        return LayerAdaptiveResult::NotStarted;
+    }
+
+    let mut primary = match ProviderOrchestrator::start(cfg.primary_provider, cfg.pice_config).await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("primary provider startup failed: {e:#}");
+            warn!(layer = %layer_name, "{msg}");
+            // Resolvable but failed to start — fail the layer closed.
+            return LayerAdaptiveResult::RuntimeError(msg);
+        }
+    };
+
+    // Phase 4.1 capability gate (Pass-6 Codex Critical #1): adaptive budgets
+    // are only meaningful when the provider emits real per-pass `costUsd`.
+    // Without telemetry the loop falls back to `budget_usd / max_passes` as
+    // a synthetic seed debit, so `final_total_cost_usd` and every
+    // budget-halt decision are advisory at best — the exact "budget appears
+    // to be enforced, isn't actually" failure mode Codex flagged at
+    // adaptive_loop.rs:291-385. Fail closed here rather than silently
+    // running the hollow path. The check applies regardless of
+    // `adaptive_algorithm` because budget enforcement runs for every algo
+    // (including `None`, per CLAUDE.md — "Budget is a financial safety
+    // rail, not a strategy choice").
+    let cost_telemetry_available = primary.capabilities().cost_telemetry;
+    if budget_usd > 0.0 && !cost_telemetry_available {
+        let msg = format!(
+            "provider '{}' does not declare costTelemetry, but workflow.yaml requests \
+             budget_usd = {:.4} for layer '{}'. Adaptive budgets require real per-pass \
+             cost reporting; otherwise enforcement is synthetic. Either set \
+             budget_usd = 0 (no enforcement) or use a provider that emits costUsd on \
+             evaluate/create.",
+            cfg.primary_provider, budget_usd, layer_name,
+        );
+        warn!(layer = %layer_name, "{msg}");
+        let _ = primary.shutdown().await;
+        return LayerAdaptiveResult::RuntimeError(msg);
+    }
+    // Phase 4.1 Pass-11 Codex CRITICAL #1: when adaptive evaluation runs
+    // with `budget_usd = 0` AND the provider lacks costTelemetry (the
+    // shipped-default fresh-install path), neither the capability gate
+    // nor the budget rail is active. Warn loudly so operators know
+    // costs will be recorded as NULL (not synthetic `$0.0000`) and
+    // financial enforcement is opt-in.
+    if budget_usd == 0.0 && !cost_telemetry_available {
+        warn!(
+            layer = %layer_name,
+            provider = %cfg.primary_provider,
+            "adaptive evaluation running without cost telemetry capability AND without \
+             budget enforcement (budget_usd = 0). Per-pass cost_usd will be persisted as \
+             NULL; final_total_cost_usd will be NULL. Once your provider emits real \
+             costUsd on evaluate/create AND advertises costTelemetry=true, raise \
+             budget_usd > 0 to enable enforcement."
+        );
+    }
+
+    // Start the adversarial provider only when ADTS is selected.
+    let mut adversarial: Option<ProviderOrchestrator> = if algo
+        == pice_core::workflow::schema::AdaptiveAlgo::Adts
+        && cfg.pice_config.evaluation.adversarial.enabled
+    {
+        // Same resolve-then-start classification for the adversarial path.
+        if pice_core::provider::registry::resolve(
+            &cfg.pice_config.evaluation.adversarial.provider,
+            cfg.pice_config,
+        )
+        .is_none()
+        {
+            warn!(
+                layer = %layer_name,
+                provider = %cfg.pice_config.evaluation.adversarial.provider,
+                "adversarial provider unresolvable, falling back to phase-1-pending",
+            );
+            // ADTS without adversarial is degenerate — shut down primary and fall back.
+            let _ = primary.shutdown().await;
+            return LayerAdaptiveResult::NotStarted;
+        }
+        match ProviderOrchestrator::start(
+            &cfg.pice_config.evaluation.adversarial.provider,
+            cfg.pice_config,
+        )
+        .await
+        {
+            Ok(a) => Some(a),
+            Err(e) => {
+                let msg = format!("adversarial provider startup failed: {e:#}");
+                warn!(layer = %layer_name, "{msg}");
+                // Shut down primary then fail-close the layer.
+                let _ = primary.shutdown().await;
+                return LayerAdaptiveResult::RuntimeError(msg);
+            }
+        }
+    } else {
+        None
+    };
+
+    let ctx = AdaptiveContext {
+        algo,
+        sprt: workflow.phases.evaluate.sprt,
+        adts: workflow.phases.evaluate.adts,
+        vec: workflow.phases.evaluate.vec,
+        min_confidence,
+        max_passes,
+        budget_usd,
+        contract: contract_json,
+        diff: filtered_diff.to_string(),
+        claude_md: claude_md.to_string(),
+        primary_model: cfg.primary_model.to_string(),
+        adversarial_model: Some(cfg.pice_config.evaluation.adversarial.model.clone()),
+        base_effort: if cfg.pice_config.evaluation.adversarial.effort.is_empty() {
+            None
+        } else {
+            Some(cfg.pice_config.evaluation.adversarial.effort.clone())
+        },
+        cost_telemetry_available,
+    };
+
+    let result = run_adaptive_passes(&ctx, &mut primary, adversarial.as_mut(), pass_sink).await;
+
+    // Always shut the providers down, even on loop error.
+    let _ = primary.shutdown().await;
+    if let Some(adv) = adversarial {
+        let _ = adv.shutdown().await;
+    }
+
+    match result {
+        Ok(outcome) => LayerAdaptiveResult::Completed(outcome),
+        Err(e) => {
+            // Pass-3 Codex Critical #2: providers DID start, so this is a
+            // real runtime error — NOT a "provider never started" state.
+            // Surface the message so the caller can fail-close the layer.
+            let msg = format!("{e}");
+            warn!(layer = %layer_name, "adaptive pass loop failed: {msg}");
+            LayerAdaptiveResult::RuntimeError(msg)
+        }
+    }
+}
+
+/// Derive a `LayerResult` from an adaptive loop outcome and the seam-check
+/// findings. Seam failures override the halt reason and downgrade the layer
+/// status to `Failed`. Otherwise, the `halted_by` string selects the status:
+///
+/// | halted_by                      | status (no seam fail) |
+/// |--------------------------------|------------------------|
+/// | sprt_confidence_reached        | Passed                 |
+/// | vec_entropy                    | Passed                 |
+/// | sprt_rejected                  | Failed                 |
+/// | adts_escalation_exhausted      | Failed                 |
+/// | budget                         | Pending (re-run)       |
+/// | max_passes                     | Pending (re-run)       |
+/// | (anything else)                | Pending (conservative) |
+fn build_adaptive_layer_result(
+    layer_name: String,
+    outcome: AdaptiveOutcome,
+    seam_checks: Vec<SeamCheckResult>,
+    first_failed_seam: Option<String>,
+    min_confidence: f64,
+) -> LayerResult {
+    let (status, halted_by) = if let Some(failed_id) = first_failed_seam {
+        // Seam failure always wins — per stack-loops.md §"Fail-closed rollup".
+        (LayerStatus::Failed, Some(format!("seam:{failed_id}")))
+    } else {
+        match outcome.halted_by.as_deref() {
+            // Phase 4.1 Pass-11 Codex HIGH #2: metrics-persist failures are
+            // operational, NOT contract failures. Route to `Pending` (not
+            // `Failed`) and let the handler surface them via
+            // `metrics_persist_failed_response()` (exit 1, not exit 2).
+            // The check MUST precede the `runtime_error:` arm because that
+            // prefix would otherwise win for a hypothetical
+            // "runtime_error:metrics_persist_failed:" string — but we
+            // intentionally chose a non-overlapping prefix in adaptive_loop.rs
+            // so the routing is unambiguous. Pass-11.1 W2: prefix-check
+            // sourced from `ExitJsonStatus::is_metrics_persist_failed`
+            // (single source of truth, locked by unit test against drift).
+            Some(reason) if pice_core::cli::ExitJsonStatus::is_metrics_persist_failed(reason) => {
+                (LayerStatus::Pending, outcome.halted_by.clone())
+            }
+            // Phase 4 Pass-4 fix for Codex High: mid-loop provider errors
+            // flow through `run_adaptive_passes` as a preserved outcome with
+            // `halted_by = "runtime_error:..."`. Route them to `Failed` so
+            // the evaluation exits non-zero, while the passes/cost already
+            // written to the sink remain intact for reconciliation.
+            Some(reason) if reason.starts_with("runtime_error:") => {
+                (LayerStatus::Failed, outcome.halted_by.clone())
+            }
+            Some("sprt_confidence_reached") => (LayerStatus::Passed, outcome.halted_by.clone()),
+            // Phase 4 post-adversarial-review fix: `vec_entropy` halts when
+            // posterior entropy stops changing — that happens for failure
+            // sequences just as much as success sequences. Promoting every
+            // VEC halt to `Passed` is a correctness bug (false positive on
+            // failure-converged layers). Gate on `final_confidence >=
+            // min_confidence` before promoting; otherwise the layer enters
+            // `Failed` (posterior says fail) or `Pending` (no confidence
+            // reported — conservative).
+            Some("vec_entropy") => match outcome.final_confidence {
+                Some(conf) if conf >= min_confidence => {
+                    (LayerStatus::Passed, outcome.halted_by.clone())
+                }
+                Some(_) => (LayerStatus::Failed, outcome.halted_by.clone()),
+                None => (LayerStatus::Pending, outcome.halted_by.clone()),
+            },
+            Some("sprt_rejected") | Some("adts_escalation_exhausted") => {
+                (LayerStatus::Failed, outcome.halted_by.clone())
+            }
+            Some("budget") | Some("max_passes") => {
+                (LayerStatus::Pending, outcome.halted_by.clone())
+            }
+            _ => (LayerStatus::Pending, outcome.halted_by.clone()),
+        }
+    };
+
+    LayerResult {
+        name: layer_name,
+        status,
+        passes: outcome.passes,
+        seam_checks,
+        halted_by,
+        final_confidence: outcome.final_confidence,
+        total_cost_usd: outcome.total_cost_usd,
+        escalation_events: outcome.escalation_events,
+    }
+}
+
+/// Phase-1-pending fallback: records the layer as Pending with a placeholder
+/// pass so the manifest is well-formed and downstream tools see the layer
+/// was recognized but never evaluated.
+fn phase1_pending_layer_result(
+    layer_name: String,
+    effective_tier: u8,
+    filtered_diff_bytes: usize,
+    seam_checks: Vec<SeamCheckResult>,
+    first_failed_seam: Option<String>,
+) -> LayerResult {
+    let (status, halted_by) = match first_failed_seam {
+        Some(failed_id) => (LayerStatus::Failed, Some(format!("seam:{failed_id}"))),
+        None => (
+            LayerStatus::Pending,
+            Some(format!("phase-1-pending-tier-{effective_tier}")),
+        ),
+    };
+    LayerResult {
+        name: layer_name,
+        status,
+        passes: vec![PassResult {
+            index: 0,
+            model: "phase-1-pending".to_string(),
+            score: None,
+            cost_usd: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            findings: vec![format!(
+                "Awaiting provider evaluation — {filtered_diff_bytes} bytes of filtered diff prepared"
+            )],
+        }],
+        seam_checks,
+        halted_by,
+        final_confidence: None,
+        total_cost_usd: None,
+        escalation_events: None,
+    }
+}
+
+/// Pass-3 Codex Critical #2: Build a fail-closed `LayerResult` for the case
+/// where the adaptive loop started but a runtime error (timeout, RPC failure,
+/// provider crash mid-loop) prevented completion.
+///
+/// The layer status is `Failed`, which flows to `any_failed_layer = true` in
+/// `handlers/evaluate.rs`, which in turn emits `ExitJsonStatus::EvaluationFailed`
+/// and exit code 2. This is the critical difference from
+/// `phase1_pending_layer_result`: Pending evaluations exit 0 (evaluation was
+/// never attempted), but runtime errors exit non-zero (evaluation was
+/// attempted and broke — a CI pipeline depending on `pice evaluate` as a
+/// gate must fail the build, not pass it).
+///
+/// Seam failures still take priority: if a seam check failed, the layer's
+/// `halted_by` is `seam:{id}`; otherwise it's `runtime_error:{message}`.
+fn runtime_failed_layer_result(
+    layer_name: String,
+    error_message: String,
+    seam_checks: Vec<SeamCheckResult>,
+    first_failed_seam: Option<String>,
+) -> LayerResult {
+    let (status, halted_by) = match first_failed_seam {
+        // Seam failures win per stack-loops.md §"Fail-closed rollup".
+        Some(failed_id) => (LayerStatus::Failed, Some(format!("seam:{failed_id}"))),
+        None => (
+            LayerStatus::Failed,
+            Some(format!("runtime_error:{error_message}")),
+        ),
+    };
+    LayerResult {
+        name: layer_name,
+        status,
+        // Placeholder pass row preserves manifest shape for downstream tools
+        // that assume every layer has at least one pass. Distinct model name
+        // (`runtime-error`) lets operators filter these apart from
+        // `phase-1-pending` rows.
+        passes: vec![PassResult {
+            index: 0,
+            model: "runtime-error".to_string(),
+            score: None,
+            cost_usd: None,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            findings: vec![format!("Adaptive loop errored: {error_message}")],
+        }],
+        seam_checks,
+        halted_by,
+        final_confidence: None,
+        total_cost_usd: None,
+        escalation_events: None,
+    }
+}
+
 /// Resolve the effective tier for a layer: override wins, else defaults.
 fn effective_tier_for(workflow: &WorkflowConfig, layer_name: &str) -> u8 {
     workflow
@@ -466,6 +876,71 @@ fn effective_tier_for(workflow: &WorkflowConfig, layer_name: &str) -> u8 {
         .get(layer_name)
         .and_then(|o| o.tier)
         .unwrap_or(workflow.defaults.tier)
+}
+
+/// Resolve the effective `min_confidence` for a layer.
+fn effective_min_confidence_for(workflow: &WorkflowConfig, layer_name: &str) -> f64 {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.min_confidence)
+        .unwrap_or(workflow.defaults.min_confidence)
+}
+
+/// Resolve the effective `max_passes` for a layer.
+fn effective_max_passes_for(workflow: &WorkflowConfig, layer_name: &str) -> u32 {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.max_passes)
+        .unwrap_or(workflow.defaults.max_passes)
+}
+
+/// Resolve the effective `budget_usd` for a layer.
+fn effective_budget_usd_for(workflow: &WorkflowConfig, layer_name: &str) -> f64 {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.budget_usd)
+        .unwrap_or(workflow.defaults.budget_usd)
+}
+
+/// Resolve the effective adaptive config for a layer: algorithm, SPRT, ADTS, VEC.
+///
+/// The per-layer override can only choose a different `AdaptiveAlgo`; the
+/// sub-configs (`SprtConfig`, `AdtsConfig`, `VecConfig`) are set project-wide
+/// on `EvaluatePhase` and are not overridable per-layer. This keeps the
+/// per-layer surface small (single enum choice) while the project owner
+/// controls the tuning knobs globally.
+/// Used by the adaptive pass loop in Phase 4 Chunk C (Task 15).
+#[allow(dead_code)]
+fn effective_adaptive_config_for(
+    workflow: &WorkflowConfig,
+) -> (
+    pice_core::workflow::schema::AdaptiveAlgo,
+    pice_core::adaptive::SprtConfig,
+    pice_core::adaptive::AdtsConfig,
+    pice_core::adaptive::VecConfig,
+) {
+    (
+        workflow.phases.evaluate.adaptive_algorithm,
+        workflow.phases.evaluate.sprt,
+        workflow.phases.evaluate.adts,
+        workflow.phases.evaluate.vec,
+    )
+}
+
+/// Resolve the effective `AdaptiveAlgo` for a specific layer. Layer override
+/// wins; else falls back to the project-wide `evaluate.adaptive_algorithm`.
+fn effective_adaptive_algo_for(
+    workflow: &WorkflowConfig,
+    layer_name: &str,
+) -> pice_core::workflow::schema::AdaptiveAlgo {
+    workflow
+        .layer_overrides
+        .get(layer_name)
+        .and_then(|o| o.adaptive_algorithm)
+        .unwrap_or(workflow.phases.evaluate.adaptive_algorithm)
 }
 
 /// Load a layer-specific contract file, falling back to a generic message.
@@ -654,7 +1129,10 @@ mod tests {
             merged_seams: &empty_seams,
         };
 
-        let manifest = run_stack_loops(&cfg, &NullSink, false).await.unwrap();
+        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
+        let manifest = run_stack_loops(&cfg, &NullSink, false, &mut pass_sink)
+            .await
+            .unwrap();
 
         // Should have results for all 3 layers
         assert_eq!(manifest.layers.len(), 3);
@@ -751,7 +1229,10 @@ mod tests {
             merged_seams: &empty_seams,
         };
 
-        let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
+        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
+        let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+            .await
+            .unwrap();
 
         // With no changes: non-always_run layers are inactive → Skipped.
         // always_run layers are active but have empty diffs → Pending
@@ -886,7 +1367,10 @@ mod tests {
             merged_seams: &seams,
         };
 
-        let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
+        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
+        let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+            .await
+            .unwrap();
         let backend = manifest
             .layers
             .iter()
@@ -909,6 +1393,113 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "config_mismatch" && c.status == CheckStatus::Failed),
             "seam_checks should include the Failed config_mismatch entry"
+        );
+    }
+
+    // ─── Effective-resolution helper tests ──────────────────────────────
+
+    #[test]
+    fn effective_min_confidence_falls_back_to_defaults() {
+        let wf = test_workflow();
+        let eff = effective_min_confidence_for(&wf, "nonexistent");
+        assert!((eff - wf.defaults.min_confidence).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_min_confidence_uses_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                min_confidence: Some(0.99),
+                ..Default::default()
+            },
+        );
+        assert!((effective_min_confidence_for(&wf, "backend") - 0.99).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_max_passes_falls_back_to_defaults() {
+        let wf = test_workflow();
+        assert_eq!(
+            effective_max_passes_for(&wf, "nonexistent"),
+            wf.defaults.max_passes
+        );
+    }
+
+    #[test]
+    fn effective_max_passes_uses_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                max_passes: Some(10),
+                ..Default::default()
+            },
+        );
+        assert_eq!(effective_max_passes_for(&wf, "backend"), 10);
+    }
+
+    #[test]
+    fn effective_budget_usd_falls_back_to_defaults() {
+        let wf = test_workflow();
+        assert!(
+            (effective_budget_usd_for(&wf, "nonexistent") - wf.defaults.budget_usd).abs() < 1e-12
+        );
+    }
+
+    #[test]
+    fn effective_budget_usd_uses_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                budget_usd: Some(0.05),
+                ..Default::default()
+            },
+        );
+        assert!((effective_budget_usd_for(&wf, "backend") - 0.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn effective_adaptive_config_returns_project_values() {
+        let wf = test_workflow();
+        let (algo, sprt, adts, vec_cfg) = effective_adaptive_config_for(&wf);
+        assert_eq!(
+            algo,
+            pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
+        );
+        assert_eq!(sprt, pice_core::adaptive::SprtConfig::default());
+        assert_eq!(adts, pice_core::adaptive::AdtsConfig::default());
+        assert_eq!(vec_cfg, pice_core::adaptive::VecConfig::default());
+    }
+
+    #[test]
+    fn effective_adaptive_algo_falls_back_to_evaluate_phase() {
+        let wf = test_workflow();
+        assert_eq!(
+            effective_adaptive_algo_for(&wf, "nonexistent"),
+            pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
+        );
+    }
+
+    #[test]
+    fn effective_adaptive_algo_uses_layer_override() {
+        let mut wf = test_workflow();
+        wf.layer_overrides.insert(
+            "backend".into(),
+            pice_core::workflow::schema::LayerOverride {
+                adaptive_algorithm: Some(pice_core::workflow::schema::AdaptiveAlgo::None),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            effective_adaptive_algo_for(&wf, "backend"),
+            pice_core::workflow::schema::AdaptiveAlgo::None
+        );
+        assert_eq!(
+            effective_adaptive_algo_for(&wf, "frontend"),
+            pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
         );
     }
 }

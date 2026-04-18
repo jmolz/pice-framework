@@ -15,7 +15,7 @@ use pice_core::config::PiceConfig;
 use pice_core::layers::LayersConfig;
 use pice_core::workflow::loader;
 use pice_daemon::orchestrator::stack_loops::{run_stack_loops, StackLoopsConfig};
-use pice_daemon::orchestrator::NullSink;
+use pice_daemon::orchestrator::{NullPassSink, NullSink};
 use std::path::Path;
 
 fn write(path: &Path, contents: &str) {
@@ -125,7 +125,10 @@ layer_overrides:
         merged_seams: &empty_seams,
     };
 
-    let manifest = run_stack_loops(&cfg, &NullSink, false).await.unwrap();
+    let mut pass_sink = NullPassSink;
+    let manifest = run_stack_loops(&cfg, &NullSink, false, &mut pass_sink)
+        .await
+        .unwrap();
 
     // 5. Assert tier-3 for backend (overridden) and tier-2 for frontend (default)
     let backend = manifest
@@ -216,7 +219,10 @@ paths = ["src/server/**"]
         merged_seams: &empty_seams,
     };
 
-    let manifest = run_stack_loops(&cfg, &NullSink, true).await.unwrap();
+    let mut pass_sink = NullPassSink;
+    let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+        .await
+        .unwrap();
     let backend = manifest
         .layers
         .iter()

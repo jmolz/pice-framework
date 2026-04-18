@@ -15,6 +15,7 @@ import type {
   ResponseCompleteParams,
   ResponseToolUseParams,
   EvaluateCreateParams,
+  EvaluateCreateResult,
   SeamCheckSpec,
   SeamCheckResult,
   SeamCheckStatus,
@@ -133,6 +134,37 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     const json = JSON.stringify(caps);
     expect(json).toContain('"agentTeams"');
     expect(json).not.toContain('"agent_teams"');
+  });
+
+  // Phase 4.1: costTelemetry is the capability gate for adaptive budgets.
+  it('ProviderCapabilities costTelemetry serializes camelCase', () => {
+    const caps: ProviderCapabilities = {
+      workflow: true,
+      evaluation: true,
+      agentTeams: false,
+      models: ['stub'],
+      costTelemetry: true,
+    };
+    const json = JSON.stringify(caps);
+    expect(json).toContain('"costTelemetry":true');
+    expect(json).not.toContain('"cost_telemetry"');
+    const parsed: ProviderCapabilities = JSON.parse(json);
+    expect(parsed.costTelemetry).toBe(true);
+  });
+
+  // Legacy providers that predate costTelemetry must deserialize without
+  // the field — JSON.parse produces undefined, which consumers must treat
+  // as the fail-closed default (equivalent to false on the Rust side's
+  // `#[serde(default)]`).
+  it('ProviderCapabilities costTelemetry is optional (legacy provider)', () => {
+    const legacyJson = JSON.stringify({
+      workflow: true,
+      evaluation: true,
+      agentTeams: false,
+      models: [],
+    });
+    const parsed: ProviderCapabilities = JSON.parse(legacyJson);
+    expect(parsed.costTelemetry).toBeUndefined();
   });
 
   it('SessionCreate params/result roundtrip', () => {
@@ -465,6 +497,103 @@ describe('JSON-RPC roundtrip (matches Rust wire format)', () => {
     expect(METHOD_NOT_FOUND).toBe(-32601);
     expect(PROVIDER_NOT_INITIALIZED).toBe(-32000);
     expect(SESSION_NOT_FOUND).toBe(-32001);
+  });
+
+  // ── Phase 4 adaptive protocol roundtrips ──────────────────────────
+
+  it('EvaluateCreateParams with passIndex roundtrips', () => {
+    const params: EvaluateCreateParams = {
+      contract: { criteria: [] },
+      diff: '+line',
+      claudeMd: '# R',
+      passIndex: 3,
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"passIndex":3');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.passIndex).toBe(3);
+  });
+
+  it('EvaluateCreateParams without passIndex omits field', () => {
+    const params: EvaluateCreateParams = {
+      contract: {},
+      diff: '',
+      claudeMd: '',
+    };
+    const json = JSON.stringify(params);
+    expect(json).not.toContain('passIndex');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.passIndex).toBeUndefined();
+  });
+
+  it('EvaluateCreateResult with costUsd and confidence roundtrips', () => {
+    const result: EvaluateCreateResult = {
+      sessionId: 'eval-42',
+      costUsd: 0.025,
+      confidence: 0.93,
+    };
+    const json = JSON.stringify(result);
+    expect(json).toContain('"costUsd"');
+    expect(json).toContain('"confidence"');
+    const parsed: EvaluateCreateResult = JSON.parse(json);
+    expect(parsed.costUsd).toBe(0.025);
+    expect(parsed.confidence).toBe(0.93);
+  });
+
+  it('EvaluateCreateResult without costUsd/confidence omits fields', () => {
+    const result: EvaluateCreateResult = {
+      sessionId: 'eval-43',
+    };
+    const json = JSON.stringify(result);
+    expect(json).not.toContain('costUsd');
+    expect(json).not.toContain('confidence');
+    const parsed: EvaluateCreateResult = JSON.parse(json);
+    expect(parsed.costUsd).toBeUndefined();
+    expect(parsed.confidence).toBeUndefined();
+  });
+
+  // Phase 4 criterion #9: ADTS escalation fields roundtrip
+  it('EvaluateCreateParams with freshContext roundtrips', () => {
+    const params: EvaluateCreateParams = {
+      contract: {},
+      diff: '',
+      claudeMd: '',
+      passIndex: 1,
+      freshContext: true,
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"freshContext":true');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.freshContext).toBe(true);
+  });
+
+  it('EvaluateCreateParams with effortOverride roundtrips', () => {
+    const params: EvaluateCreateParams = {
+      contract: {},
+      diff: '',
+      claudeMd: '',
+      passIndex: 2,
+      freshContext: true,
+      effortOverride: 'xhigh',
+    };
+    const json = JSON.stringify(params);
+    expect(json).toContain('"effortOverride":"xhigh"');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.effortOverride).toBe('xhigh');
+  });
+
+  it('EvaluateCreateParams without freshContext/effortOverride omits fields', () => {
+    const params: EvaluateCreateParams = {
+      contract: {},
+      diff: '',
+      claudeMd: '',
+    };
+    const json = JSON.stringify(params);
+    expect(json).not.toContain('freshContext');
+    expect(json).not.toContain('effortOverride');
+    const parsed: EvaluateCreateParams = JSON.parse(json);
+    expect(parsed.freshContext).toBeUndefined();
+    expect(parsed.effortOverride).toBeUndefined();
   });
 
   it('full request/response wire format matches Rust', () => {

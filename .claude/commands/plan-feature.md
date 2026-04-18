@@ -106,9 +106,148 @@ This ensures:
 
 ---
 
+## Phase 5.5: Adversarial Plan Review
+
+Plans suffer the same confirmation bias that `/evaluate` was built to break: when you ask the agent that wrote the plan whether the plan looks good, you get reassurance, not critique. This phase subjects the draft plan to review from agents that did NOT write it, attacking the specific failure modes LLMs consistently fall into.
+
+### Philosophical foundation
+
+- **Karpathy's four LLM failure modes** (from [andrej-karpathy-skills](https://github.com/forrestchang/andrej-karpathy-skills)): plans drift into (1) hidden assumptions, (2) overcomplication, (3) orthogonal scope creep, and (4) aspirational success criteria. Adversaries attack each explicitly.
+- **PoetiQ's refinement loop** (ARC-AGI-2 winning architecture, Dec 2025): a plan is not complete until an independent verifier confirms it. The planner's confidence is not the signal; surviving critique is. Iterative refinement beats single-pass reasoning.
+
+### The Critique Prompt
+
+The same prompt is used by all adversaries (Tier 1 self-critique, Tier 2+ Claude sub-agent, Tier 2+ Codex GPT-5.4). It must attack six dimensions:
+
+```
+You are reviewing an implementation plan BEFORE code is written. You did NOT write this plan and have no stake in its approval. Your job is to find weaknesses along six dimensions. Be specific. Cite plan sections by heading. Reject generic concerns.
+
+1. HIDDEN ASSUMPTIONS (Karpathy "Think Before Coding"): What does the plan silently assume about the system, user intent, or environment? Where were multiple interpretations possible but one was picked without surfacing the alternative? Name each assumption and its likelihood of being wrong.
+
+2. OVERCOMPLICATION (Karpathy "Simplicity First"): What is speculative, bloated, or added "for flexibility" without being requested? Which specific parts would a senior engineer flag as over-engineered? What abstraction exists for single-use code? What error handling covers scenarios that can't happen?
+
+3. SCOPE DRIFT (Karpathy "Surgical Changes"): Does every task trace directly to the user's feature request? What orthogonal improvements, refactors, or cleanups are sneaking in? What dead code is being deleted that wasn't asked for?
+
+4. WEAK SUCCESS CRITERIA (Karpathy "Goal-Driven Execution"): Are the success criteria transformed into verifiable goals with explicit checks (tests, commands, observable outputs)? Which criteria are aspirational ("works well", "is clean") and must be rewritten as concrete assertions? Can an executor loop independently against these criteria, or will it stall waiting for clarification?
+
+5. VERIFICATION-LOOP READINESS (PoetiQ refinement): For each task, does the validation step let an executor know "done" without human input? Trace one execution path: where does the executor stall? What is the shortest feedback signal for each task?
+
+6. REASONING DIVERGENCE (PoetiQ cross-model verification): Setting aside the plan's internal logic, what conclusions would you reach independently about the best approach? Where does your reasoning diverge from the plan's? Name at least one genuine alternative path the plan did not consider.
+
+Output format:
+
+### Critical (plan must change before proceeding)
+- {dimension}: {specific weakness}. Section: {heading}. Suggested resolution: {change}
+
+### Consider (valid concern for user to weigh)
+- {dimension}: {specific weakness}. Section: {heading}
+
+### Reasoning divergence (alternative paths not taken)
+- {alternative approach and why it might be better}
+
+Do NOT output praise. Do NOT pad with generic concerns. Specificity is the quality bar — not volume.
+```
+
+The adversary receives: the plan file, `CLAUDE.md`, and `git log --oneline -15` — nothing else. It does NOT see the planning conversation, Phase 1–4 research, or any prior reasoning.
+
+### Tier 1: Self-Critique
+
+For Tier 1 plans (bug fixes, simple endpoints, UI tweaks), the planning agent runs the critique prompt itself against its own plan and writes findings directly into the plan file. Bias still exists at Tier 1, but the friction of writing concrete findings against each dimension catches the obvious misses. If you cannot name a specific weakness in each of the six dimensions, look harder — never skip to "no findings."
+
+### Tier 2+: Parallel Adversarial Streams
+
+Run two independent adversaries **in parallel** (not sequentially):
+
+**Stream A — Fresh Claude sub-agent.** Spawn via `Task` tool:
+- Tier 2 → `subagent_type: "general-purpose"`
+- Tier 3 → `subagent_type: "architect"`
+- Pass the critique prompt with plan + CLAUDE.md + git log appended.
+
+**Stream B — Codex GPT-5.4 task** (runs in background via `Bash` with `run_in_background: true`):
+
+```bash
+node "$HOME/.claude/plugins/marketplaces/openai-codex/plugins/codex/scripts/codex-companion.mjs" \
+  task --background --effort high \
+  "{the critique prompt above, with plan + CLAUDE.md + git log appended}"
+```
+
+For Tier 3, use `--effort xhigh` instead of `--effort high`.
+
+#### Rate-Limit Fallback
+
+Inherits the fallback from `/evaluate`. If Stream B output contains rate-limit markers (`rate limit`, `rate_limit_exceeded`, `429`, `too many requests`, `usage cap`, `quota exceeded`), read `~/.claude/.openai-fallback-key` and retry via direct OpenAI Responses API:
+
+- `model: "gpt-5.4"`, `reasoning.effort: "high"` (Tier 2) or `"xhigh"` (Tier 3)
+- `max_output_tokens: 32000`; on `status: "incomplete"` with `reason: "max_output_tokens"`, retry with larger budget
+- Do NOT run `codex login --api-key` (overwrites ChatGPT Team session)
+
+See `/evaluate` Step 3a for the exact curl recipe.
+
+### Refinement Loop (Tier 3 only)
+
+PoetiQ's core insight: iterative refinement beats single-pass reasoning. Tier 3 plans get up to 2 refinement cycles:
+
+**Cycle 1** — Run both streams, merge findings.
+- Zero Critical findings → proceed to persistence.
+- Critical findings exist → present to user:
+  ```
+  Adversarial review found {N} critical issues. Options:
+  1. Revise the plan to address them (one more refinement cycle)
+  2. Accept and mark as Acknowledged with explicit reasoning
+  3. Mixed — revise some, acknowledge others
+  ```
+
+**Cycle 2** — If user chose revise: rewrite affected plan sections, then re-run both streams with the NEW plan + the previous critique (so reviewers can verify fixes addressed the concerns). After Cycle 2, any remaining Critical findings must be Acknowledged by the user with explicit reasoning — no silent dismissal.
+
+Tier 2 runs a single cycle; skip Cycle 2.
+
+### Self-Auditing Stop Condition
+
+Stop refinement when any of:
+- Zero Critical findings remain, or
+- All Critical findings Acknowledged with explicit reasoning, or
+- Tier refinement-cycle limit reached (Tier 2: 1, Tier 3: 2)
+
+Do not over-refine. A plan that survives informed critique is ready.
+
+### Persist Findings in the Plan File
+
+Append findings to the plan file under a new `## Adversarial Review` section (the template reserves this slot above `## Notes`):
+
+```markdown
+## Adversarial Review
+
+**Tier**: {N}
+**Reviewers**: {"self-critique" | "Claude sub-agent + Codex GPT-5.4"}
+**Refinement cycles**: {N}
+**Attack framework**: Karpathy four principles + PoetiQ cross-model verification
+
+### Critical (resolved before proceeding)
+1. {finding} — section: {heading} — resolution: {revised text or Acknowledged with reasoning}
+
+### Consider (flagged, not acted on)
+1. {finding} — section: {heading}
+
+### Reasoning divergence (alternative paths not taken)
+1. {alternative} — why not: {reasoning}
+```
+
+### Feed into Phase 6
+
+Findings feed contract negotiation: Critical items become non-negotiable contract criteria (elevated thresholds); Consider items become negotiable additions the user can accept or reject during Phase 6. The adversarial reviewers often surface criteria the planner missed — the user's Phase 6 contract should reflect that enriched picture.
+
+---
+
 ## Phase 6: Contract Negotiation
 
-After writing the plan, draft a **contract** — the structured success criteria that `/evaluate` will grade against after implementation.
+After the adversarial review (Phase 5.5) completes, draft a **contract** — the structured success criteria that `/evaluate` will grade against after implementation. Incorporate adversarial findings:
+
+- Each **Critical** finding resolved via revision should be reflected in contract criteria (the weakness the adversary caught becomes a criterion to prove fixed)
+- Each **Critical** finding marked Acknowledged should appear as a contract criterion with an explicit pass-condition the user accepts
+- **Consider** findings can optionally become new criteria the user agrees to test against
+
+This keeps the contract honest: it grades against the plan as challenged, not the plan as originally self-assessed.
+
 
 ### Draft the Contract
 

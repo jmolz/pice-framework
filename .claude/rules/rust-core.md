@@ -80,3 +80,23 @@ paths:
 - **Every serde-derived config struct that represents a user-editable file MUST carry `#[serde(deny_unknown_fields)]`.** TOML and YAML readers silently drop unknown keys by default — a renamed or deprecated field in a stale config will then be silently ignored at runtime. This class of bug is invisible from the user's perspective: the workflow "runs" but respects no override. `deny_unknown_fields` converts that into a parse error with the bad key name.
 - The rule applies to: `pice-core::config::PiceConfig`, `pice-core::layers::LayersConfig`, all of `pice-core::workflow::schema::*`, and any future `.pice/*.{toml,yaml}` schema types. It does NOT apply to internal-only types (JSON-RPC wire types, manifest records that may be forward-extended) where unknown fields are expected during version drift.
 - Add a test that asserts a stale/misspelled top-level field produces a parse error whose message names the bad field. See `crates/pice-core/src/workflow/loader.rs::load_project_rejects_unknown_top_level_fields` for the pattern.
+
+## Centralize cross-crate string prefixes behind a const + helper
+
+When a string literal (e.g., a `halted_by` prefix, a status discriminant) is consumed by **2 or more sites** AND a typo would cause a silent semantic divergence (e.g., misrouted exit code, missed status mapping), centralize it in `pice-core` as both a `pub const &'static str` AND a small predicate helper. Every consumer site uses the helper; nobody re-types the literal.
+
+Pattern in `pice-core::cli::ExitJsonStatus`:
+
+```rust
+impl ExitJsonStatus {
+    pub const METRICS_PERSIST_FAILED_PREFIX: &'static str = "metrics_persist_failed:";
+
+    pub fn is_metrics_persist_failed(halted_by: &str) -> bool {
+        halted_by.starts_with(Self::METRICS_PERSIST_FAILED_PREFIX)
+    }
+}
+```
+
+Lock the agreement with a unit test that exercises both: builds a string from the constant and asserts the helper accepts it. See `crates/pice-core/src/cli/mod.rs::metrics_persist_failed_prefix_helper_agrees_with_constant`. Without this test, a refactor that updates the const but forgets the helper (or vice versa) compiles and silently changes routing semantics.
+
+This rule is the runtime-string analogue of the `ExitJsonStatus::as_str()` ↔ serde-kebab-case parity test for typed discriminants. Apply it whenever a literal crosses crate boundaries with semantic meaning.

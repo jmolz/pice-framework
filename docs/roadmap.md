@@ -1089,9 +1089,9 @@ Ideas shaped by real usage and community feedback, not commitments.
 | Version | Focus                                                        | Status          |
 | ------- | ------------------------------------------------------------ | --------------- |
 | v0.1    | Core PICE loop, dual-model eval, metrics                     | ✅ Released      |
-| v0.2    | Stack Loops (novel) + seam verification + adaptive algorithms | 🔬 Design phase  |
+| v0.2    | Stack Loops (novel) + seam verification (Phases 1–3)         | ✅ Released      |
 | v0.3    | Arch Experts (novel) + seam ownership + assumption mining     | 📋 Concept phase |
-| v0.4    | Implicit Contract Inference (novel, no prior art)            | 🔭 Research phase |
+| v0.4    | Adaptive evaluation (Bayesian-SPRT / ADTS / VEC, Phase 4)    | ✅ Shipped       |
 | v0.5    | Self-Evolving Verification (novel closed-loop architecture)  | 🔭 Research phase |
 
 We're building in the open. Follow progress in [Issues](https://github.com/jmolz/pice-framework/issues) and [Discussions](https://github.com/jmolz/pice-framework/discussions).

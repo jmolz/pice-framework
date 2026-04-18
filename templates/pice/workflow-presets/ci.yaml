@@ -1,15 +1,22 @@
 # Preset: ci
 # Intended for unattended CI runs — no human review, strict budget cap,
 # serial execution (max_parallelism: 1) for deterministic test ordering.
+#
+# Phase 4 tuning: `max_passes: 2` bounds CI wall time. SPRT may accept on
+# pass 1 when scores are confidently high; otherwise the run halts after
+# pass 2 with halted_by="max_passes" and the layer enters Pending. A CI
+# gate that needs more confidence should rerun with the `strict` preset
+# locally.
 
 schema_version: "0.2"
 
 defaults:
   tier: 2
   min_confidence: 0.90
-  max_passes: 5
+  max_passes: 2
   model: sonnet
-  budget_usd: 1.00
+  # Opt-out until cost-telemetry providers ship (Pass-9 HIGH #1).
+  budget_usd: 0.00
   cost_cap_behavior: halt
   max_parallelism: 1
 

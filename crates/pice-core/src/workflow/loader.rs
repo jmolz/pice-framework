@@ -19,8 +19,15 @@ const FRAMEWORK_WORKFLOW_YAML: &str = include_str!("../../../../templates/pice/w
 /// `embedded_defaults_parses` unit test. This is the sole exception to the
 /// no-unwrap rule in pice-core: the embedded string is build-time data.
 pub fn embedded_defaults() -> WorkflowConfig {
-    serde_yaml::from_str(FRAMEWORK_WORKFLOW_YAML)
-        .expect("embedded framework workflow.yaml must parse (build-time asserted)")
+    // Phase 4.1 Pass-6 C13: the embedded YAML is static build-time data;
+    // `embedded_defaults_parses` asserts it parses. A panic here would be
+    // a deterministic build failure, not a runtime surprise.
+    // Grandfathered under `-D clippy::expect_used`.
+    #[allow(clippy::expect_used)]
+    {
+        serde_yaml::from_str(FRAMEWORK_WORKFLOW_YAML)
+            .expect("embedded framework workflow.yaml must parse (build-time asserted)")
+    }
 }
 
 /// Load `<project_root>/.pice/workflow.yaml`. Returns `Ok(None)` if absent.
@@ -250,6 +257,7 @@ phases:
         // Contract criterion #1: serialize a fully-populated WorkflowConfig,
         // deserialize, assert equality. Catches `skip_serializing_if` data
         // loss and serde field-name drift across the full schema surface.
+        use crate::adaptive::types::{AdtsConfig, SprtConfig, VecConfig};
         use crate::workflow::schema::{
             AdaptiveAlgo, CostCapBehavior, Defaults, EvaluatePhase, ExecutePhase, LayerOverride,
             OnTimeout, PhaseConfig, Phases, RetryConfig, ReviewConfig, WorkflowConfig,
@@ -266,6 +274,7 @@ phases:
                 budget_usd: Some(0.9),
                 require_review: Some(true),
                 trigger: Some("confidence < 0.95".into()),
+                adaptive_algorithm: Some(AdaptiveAlgo::None),
             },
         );
 
@@ -308,6 +317,19 @@ phases:
                     parallel: true,
                     seam_checks: true,
                     adaptive_algorithm: AdaptiveAlgo::Adts,
+                    sprt: SprtConfig {
+                        prior_alpha: 2.0,
+                        prior_beta: 1.5,
+                        accept_threshold: 20.0,
+                        reject_threshold: 0.05,
+                    },
+                    adts: AdtsConfig {
+                        divergence_threshold: 3.0,
+                        max_divergence_escalations: 1,
+                    },
+                    vec: VecConfig {
+                        entropy_floor: 0.02,
+                    },
                     model_override,
                 },
             },

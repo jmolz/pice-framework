@@ -19,6 +19,7 @@
 //!
 //! | Module | Purpose |
 //! |--------|---------|
+//! | [`adaptive`] | SPRT/ADTS/VEC algorithms + halt dispatcher (PRDv2 Feature 7) |
 //! | [`config`] | TOML configuration parsing (`.pice/config.toml`) |
 //! | [`plan_parser`] | Markdown plan parsing, `## Contract` detection |
 //! | [`provider`] | Provider registry lookup (path walking) |
@@ -29,6 +30,7 @@
 //! | [`layers`] | Layer types, detection, diff filtering, manifest |
 //! | [`transport`] | Socket path abstractions (Unix / Windows pipe) |
 
+pub mod adaptive;
 pub mod cli;
 pub mod config;
 pub mod layers;

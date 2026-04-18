@@ -7,6 +7,7 @@
 //!
 //! Writes are atomic: write to `.tmp` then `std::fs::rename()`.
 
+use crate::adaptive::EscalationEvent;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -43,6 +44,12 @@ pub struct LayerResult {
     pub final_confidence: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
+    /// ADTS escalation audit trail. `None` when the adaptive loop did not run
+    /// or ran a non-ADTS algorithm; `Some(vec)` records the level transitions
+    /// in occurrence order. Required by Phase 4 contract criterion #9
+    /// (determinism) and contract criterion for the audit trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_events: Option<Vec<EscalationEvent>>,
 }
 
 /// Result of a single evaluation pass within a layer.
@@ -140,6 +147,16 @@ fn hash_project_root(project_root: &Path) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// Phase 4.1 Pass-6: the 12-character project namespace used in manifest
+/// paths under `~/.pice/state/{namespace}/`. Exposed so the daemon's
+/// per-manifest lock map (`DaemonContext::manifest_lock_for`) can key on
+/// the SAME namespace the manifest IO writes to — otherwise the lock and
+/// the writer would disagree on identity and the race window would reopen.
+pub fn manifest_project_namespace(project_root: &Path) -> String {
+    let full = hash_project_root(project_root);
+    full[..12.min(full.len())].to_string()
+}
+
 /// Return the user's home directory via environment variables.
 /// Uses `HOME` on Unix, `USERPROFILE` on Windows, with cross-fallback.
 fn home_dir() -> Result<PathBuf> {
@@ -168,7 +185,7 @@ impl VerificationManifest {
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read manifest from {}", path.display()))?;
-        let manifest: Self = serde_json::from_str(&content)
+        let mut manifest: Self = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse manifest from {}", path.display()))?;
         if manifest.schema_version != SCHEMA_VERSION {
             bail!(
@@ -176,6 +193,29 @@ impl VerificationManifest {
                 manifest.schema_version,
                 SCHEMA_VERSION,
             );
+        }
+        // Phase 4.1 Pass-10 Codex MEDIUM #1: defense-in-depth ceiling clamp
+        // at the load boundary. The compute path caps `final_confidence`
+        // via `cap_confidence()` before writing, but a stale, hand-edited,
+        // or foreign-written manifest can still carry a value above the
+        // correlated-Condorcet ceiling (0.966). Clamping on ingest makes
+        // EVERY downstream consumer (status handler, dashboard, CI
+        // adapter) observe the invariant without having to remember to
+        // clamp at their own report boundary. A warning surfaces the
+        // discrepancy rather than silently swallowing it.
+        for layer in &mut manifest.layers {
+            if let Some(conf) = layer.final_confidence {
+                if conf > crate::adaptive::CONFIDENCE_CEILING {
+                    tracing::warn!(
+                        layer = %layer.name,
+                        found = conf,
+                        ceiling = crate::adaptive::CONFIDENCE_CEILING,
+                        path = %path.display(),
+                        "manifest layer.final_confidence exceeds ceiling; clamping on load",
+                    );
+                    layer.final_confidence = Some(crate::adaptive::cap_confidence(conf));
+                }
+            }
         }
         Ok(manifest)
     }
@@ -323,6 +363,7 @@ mod tests {
             halted_by: None,
             final_confidence: None,
             total_cost_usd: None,
+            escalation_events: None,
         }
     }
 
@@ -353,6 +394,7 @@ mod tests {
             halted_by: None,
             final_confidence: Some(0.95),
             total_cost_usd: Some(0.003),
+            escalation_events: None,
         });
         manifest.gates.push(GateEntry {
             layer: "backend".to_string(),
@@ -570,6 +612,7 @@ mod tests {
             halted_by: None,
             final_confidence: None,
             total_cost_usd: None,
+            escalation_events: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         assert!(
@@ -584,6 +627,64 @@ mod tests {
             !json.contains("total_cost_usd"),
             "None fields should be omitted: {json}"
         );
+        assert!(
+            !json.contains("escalation_events"),
+            "None fields should be omitted: {json}"
+        );
+    }
+
+    // ── Phase 4 — escalation_events round-trip ────────────────────────────
+
+    #[test]
+    fn escalation_events_roundtrip_with_all_three_levels() {
+        let result = LayerResult {
+            name: "backend".to_string(),
+            status: LayerStatus::Failed,
+            passes: Vec::new(),
+            seam_checks: Vec::new(),
+            halted_by: Some("adts_escalation_exhausted".to_string()),
+            final_confidence: None,
+            total_cost_usd: Some(0.09),
+            escalation_events: Some(vec![
+                EscalationEvent::Level1FreshContext { at_pass: 1 },
+                EscalationEvent::Level2ElevatedEffort { at_pass: 2 },
+                EscalationEvent::Level3Exhausted { at_pass: 3 },
+            ]),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(
+            json.contains("\"escalation_events\""),
+            "populated field must appear: {json}"
+        );
+        assert!(json.contains("\"level1_fresh_context\""), "{json}");
+        assert!(json.contains("\"level2_elevated_effort\""), "{json}");
+        assert!(json.contains("\"level3_exhausted\""), "{json}");
+
+        let back: LayerResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.escalation_events.as_deref().map(|v| v.len()), Some(3));
+        let events = back.escalation_events.unwrap();
+        assert_eq!(
+            events[0],
+            EscalationEvent::Level1FreshContext { at_pass: 1 }
+        );
+        assert_eq!(
+            events[1],
+            EscalationEvent::Level2ElevatedEffort { at_pass: 2 }
+        );
+        assert_eq!(events[2], EscalationEvent::Level3Exhausted { at_pass: 3 });
+    }
+
+    #[test]
+    fn escalation_events_absent_from_legacy_manifests() {
+        // Manifest written before Phase 4 omits the field entirely — must still parse.
+        let legacy = r#"{
+            "name": "api",
+            "status": "passed",
+            "passes": [],
+            "seam_checks": []
+        }"#;
+        let back: LayerResult = serde_json::from_str(legacy).unwrap();
+        assert!(back.escalation_events.is_none());
     }
 
     #[test]

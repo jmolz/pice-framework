@@ -215,6 +215,14 @@ pub struct ProviderCapabilities {
         rename = "defaultEvalModel"
     )]
     pub default_eval_model: Option<String>,
+    /// Phase 4.1: whether the provider emits real per-pass `costUsd` on
+    /// `evaluate/create` responses. Adaptive evaluation with `budget_usd > 0`
+    /// REQUIRES this — otherwise budget enforcement is synthetic (seed-only)
+    /// and `final_total_cost_usd` misrepresents real spend. Default `false`
+    /// keeps legacy providers from silently claiming cost telemetry they
+    /// cannot deliver; providers must explicitly opt in.
+    #[serde(default, rename = "costTelemetry")]
+    pub cost_telemetry: bool,
 }
 
 /// Parameters for the `session/create` method.
@@ -311,7 +319,15 @@ pub struct ResponseCompleteParams {
 }
 
 /// Parameters for the `evaluate/create` method.
+///
+/// # Schema hardening
+///
+/// `deny_unknown_fields` rejects typos in the wire params — critical because
+/// the adaptive loop's ADTS signals (`freshContext`, `effortOverride`) are
+/// load-bearing and a silently-dropped field would disable escalation without
+/// warning. Phase 4 contract criterion #9.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EvaluateCreateParams {
     pub contract: serde_json::Value,
     pub diff: String,
@@ -330,6 +346,30 @@ pub struct EvaluateCreateParams {
         rename = "seamChecks"
     )]
     pub seam_checks: Option<Vec<SeamCheckSpec>>,
+    /// 0-indexed pass number within an adaptive evaluation loop. Absent
+    /// for single-pass (v0.1) evaluations. Advisory — providers may ignore.
+    /// The stub provider uses this to index `PICE_STUB_SCORES`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "passIndex")]
+    pub pass_index: Option<u32>,
+    /// ADTS Level 1+ signal: recreate the provider session instead of
+    /// reusing prior-pass context. Set on the pass immediately following a
+    /// divergent-score detection. Absent for SPRT/VEC/None or when ADTS is
+    /// in the `Continue` state. Phase 4 contract criterion #5.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "freshContext"
+    )]
+    pub fresh_context: Option<bool>,
+    /// ADTS Level 2 signal: override the base `effort` for this pass only.
+    /// Typically `"xhigh"` on a Level 2 escalation; absent otherwise. Takes
+    /// precedence over `effort` when both are set.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "effortOverride"
+    )]
+    pub effort_override: Option<String>,
 }
 
 /// Wire-form seam check specification, mirrored from `pice-core::seam::types`
@@ -346,10 +386,19 @@ pub struct SeamCheckSpec {
 }
 
 /// Result of the `evaluate/create` method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EvaluateCreateResult {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+    /// Estimated cost in USD for this pass. Provider-reported; absent when
+    /// the provider has no cost metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "costUsd")]
+    pub cost_usd: Option<f64>,
+    /// Provider's own confidence estimate for this pass (0.0–1.0). Used by
+    /// the adaptive loop as a secondary signal; the primary confidence
+    /// comes from the Bayesian posterior in `pice-core::adaptive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 /// Parameters for the `evaluate/score` method.
@@ -526,6 +575,7 @@ mod tests {
                 agent_teams: false,
                 models: vec!["claude-opus-4-6".to_string()],
                 default_eval_model: Some("claude-opus-4-6".to_string()),
+                cost_telemetry: true,
             },
             version: "0.1.0".to_string(),
         };
@@ -535,6 +585,7 @@ mod tests {
         assert!(parsed.capabilities.evaluation);
         assert!(!parsed.capabilities.agent_teams);
         assert_eq!(parsed.capabilities.models.len(), 1);
+        assert!(parsed.capabilities.cost_telemetry);
     }
 
     #[test]
@@ -545,11 +596,32 @@ mod tests {
             agent_teams: true,
             models: vec![],
             default_eval_model: None,
+            cost_telemetry: false,
         };
         let json = serde_json::to_string(&caps).unwrap();
         assert!(json.contains("\"agentTeams\""));
         assert!(!json.contains("\"agent_teams\""));
         assert!(!json.contains("defaultEvalModel"));
+        // Phase 4.1: cost_telemetry defaults to false and serializes camelCase.
+        assert!(json.contains("\"costTelemetry\":false"));
+        assert!(!json.contains("\"cost_telemetry\""));
+    }
+
+    /// Phase 4.1: a legacy provider that predates `costTelemetry` must
+    /// deserialize with `cost_telemetry = false` — the fail-closed default.
+    /// Without `#[serde(default)]` this would be a breaking change; with it,
+    /// adaptive evaluation against a legacy provider fails safely in the
+    /// capability gate instead of silently running on synthetic budgets.
+    #[test]
+    fn capabilities_legacy_provider_defaults_cost_telemetry_false() {
+        let json = r#"{
+            "workflow": true,
+            "evaluation": true,
+            "agentTeams": false,
+            "models": ["claude-opus-4-6"]
+        }"#;
+        let parsed: ProviderCapabilities = serde_json::from_str(json).unwrap();
+        assert!(!parsed.cost_telemetry, "legacy provider must default false");
     }
 
     #[test]
@@ -672,6 +744,9 @@ mod tests {
             model: None,
             effort: None,
             seam_checks: None,
+            pass_index: None,
+            fresh_context: None,
+            effort_override: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"claudeMd\""));
@@ -680,6 +755,10 @@ mod tests {
         assert!(
             !json.contains("seamChecks"),
             "None seam_checks should be skipped: {json}"
+        );
+        assert!(
+            !json.contains("passIndex"),
+            "None pass_index should be skipped: {json}"
         );
         let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.diff, "+added line");
@@ -694,6 +773,9 @@ mod tests {
             model: Some("gpt-5.4".to_string()),
             effort: Some("high".to_string()),
             seam_checks: None,
+            pass_index: None,
+            fresh_context: None,
+            effort_override: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("\"model\""));
@@ -727,6 +809,9 @@ mod tests {
                     }),
                 },
             ]),
+            pass_index: None,
+            fresh_context: None,
+            effort_override: None,
         };
         let json = serde_json::to_string(&params).unwrap();
         assert!(json.contains("seamChecks"));
@@ -740,6 +825,172 @@ mod tests {
         let bad = r#"{"id":"x","typo":1}"#;
         let res: Result<SeamCheckSpec, _> = serde_json::from_str(bad);
         assert!(res.is_err(), "unknown field should be rejected");
+    }
+
+    // ─── Phase 4 adaptive protocol roundtrips ──────────────────────────
+
+    #[test]
+    fn evaluate_create_params_with_pass_index_roundtrips() {
+        let params = EvaluateCreateParams {
+            contract: json!({"criteria": []}),
+            diff: "+line".into(),
+            claude_md: "# R".into(),
+            model: None,
+            effort: None,
+            seam_checks: None,
+            pass_index: Some(3),
+            fresh_context: None,
+            effort_override: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            json.contains("\"passIndex\":3"),
+            "camelCase wire key: {json}"
+        );
+        let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.pass_index, Some(3));
+    }
+
+    #[test]
+    fn evaluate_create_params_without_pass_index_omits_field_in_json() {
+        let params = EvaluateCreateParams {
+            contract: json!({}),
+            diff: String::new(),
+            claude_md: String::new(),
+            model: None,
+            effort: None,
+            seam_checks: None,
+            pass_index: None,
+            fresh_context: None,
+            effort_override: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            !json.contains("passIndex"),
+            "None pass_index must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn evaluate_create_result_with_cost_and_confidence_roundtrips() {
+        let result = EvaluateCreateResult {
+            session_id: "eval-42".into(),
+            cost_usd: Some(0.025),
+            confidence: Some(0.93),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"costUsd\""), "camelCase wire key: {json}");
+        assert!(
+            json.contains("\"confidence\""),
+            "confidence present: {json}"
+        );
+        let parsed: EvaluateCreateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, result);
+    }
+
+    // ─── Phase 4 criterion #9: schema hardening + ADTS escalation fields ──
+
+    #[test]
+    fn evaluate_create_params_rejects_unknown_field() {
+        // A typoed `passIndexx` would silently drop without deny_unknown_fields.
+        // ADTS escalation signals are load-bearing; a dropped field is a
+        // silent correctness bug.
+        let bad = r#"{
+            "contract":{},
+            "diff":"",
+            "claudeMd":"",
+            "passIndexx":3
+        }"#;
+        let res: Result<EvaluateCreateParams, _> = serde_json::from_str(bad);
+        assert!(res.is_err(), "unknown field must be rejected");
+        let err = res.unwrap_err().to_string();
+        assert!(
+            err.contains("passIndexx") || err.contains("unknown field"),
+            "error should name the offending field: {err}"
+        );
+    }
+
+    #[test]
+    fn evaluate_create_params_with_fresh_context_roundtrips() {
+        let params = EvaluateCreateParams {
+            contract: json!({}),
+            diff: String::new(),
+            claude_md: String::new(),
+            model: None,
+            effort: None,
+            seam_checks: None,
+            pass_index: Some(1),
+            fresh_context: Some(true),
+            effort_override: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            json.contains("\"freshContext\":true"),
+            "camelCase wire key: {json}"
+        );
+        let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.fresh_context, Some(true));
+    }
+
+    #[test]
+    fn evaluate_create_params_with_effort_override_roundtrips() {
+        let params = EvaluateCreateParams {
+            contract: json!({}),
+            diff: String::new(),
+            claude_md: String::new(),
+            model: None,
+            effort: Some("high".into()),
+            seam_checks: None,
+            pass_index: Some(2),
+            fresh_context: Some(true),
+            effort_override: Some("xhigh".into()),
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            json.contains("\"effortOverride\":\"xhigh\""),
+            "camelCase wire key + xhigh value: {json}"
+        );
+        let parsed: EvaluateCreateParams = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.effort_override.as_deref(), Some("xhigh"));
+    }
+
+    #[test]
+    fn evaluate_create_params_omits_fresh_context_and_effort_override_when_none() {
+        let params = EvaluateCreateParams {
+            contract: json!({}),
+            diff: String::new(),
+            claude_md: String::new(),
+            model: None,
+            effort: None,
+            seam_checks: None,
+            pass_index: None,
+            fresh_context: None,
+            effort_override: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(
+            !json.contains("freshContext"),
+            "None fresh_context must be omitted: {json}"
+        );
+        assert!(
+            !json.contains("effortOverride"),
+            "None effort_override must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn evaluate_create_result_without_cost_omits_optional_fields() {
+        let result = EvaluateCreateResult {
+            session_id: "eval-43".into(),
+            cost_usd: None,
+            confidence: None,
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(!json.contains("costUsd"), "None must be omitted: {json}");
+        assert!(!json.contains("confidence"), "None must be omitted: {json}");
+        let parsed: EvaluateCreateResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cost_usd, None);
+        assert_eq!(parsed.confidence, None);
     }
 
     #[test]

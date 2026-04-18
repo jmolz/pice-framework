@@ -1312,4 +1312,95 @@ mod tests {
             &vec!["version_skew".to_string()]
         );
     }
+
+    // ─── Adaptive sub-config overlay merge tests ────────────────────────
+
+    #[test]
+    fn user_can_override_sprt_accept_threshold_freely() {
+        // Adaptive sub-configs are NOT floor-guarded — algorithm tuning
+        // is orchestration, not a security boundary. The user may raise
+        // or lower any value without floor violation.
+        let b = base();
+        let mut u = overlay_from(&b);
+        u.phases.evaluate.sprt.accept_threshold = 50.0; // raise
+        let merged = merge_with_floor(b.clone(), u).unwrap();
+        assert_eq!(merged.phases.evaluate.sprt.accept_threshold, 50.0);
+
+        let mut u2 = overlay_from(&b);
+        u2.phases.evaluate.sprt.accept_threshold = 5.0; // lower
+        let merged2 = merge_with_floor(b, u2).unwrap();
+        assert_eq!(merged2.phases.evaluate.sprt.accept_threshold, 5.0);
+    }
+
+    #[test]
+    fn user_can_override_adts_divergence_freely() {
+        let b = base();
+        let mut u = overlay_from(&b);
+        u.phases.evaluate.adts.divergence_threshold = 0.5;
+        let merged = merge_with_floor(b, u).unwrap();
+        assert_eq!(merged.phases.evaluate.adts.divergence_threshold, 0.5);
+    }
+
+    #[test]
+    fn user_can_override_vec_entropy_floor_freely() {
+        let b = base();
+        let mut u = overlay_from(&b);
+        u.phases.evaluate.vec.entropy_floor = 0.5;
+        let merged = merge_with_floor(b, u).unwrap();
+        assert_eq!(merged.phases.evaluate.vec.entropy_floor, 0.5);
+    }
+
+    #[test]
+    fn user_cannot_lower_min_confidence_below_project_floor() {
+        // Confirm the existing floor rule still holds after the adaptive
+        // sub-config additions. This is a regression guard.
+        let mut u = overlay_from(&base());
+        u.defaults.min_confidence = 0.80;
+        let err = merge_with_floor(base(), u).unwrap_err().to_string();
+        assert!(err.contains("min_confidence"), "err: {err}");
+    }
+
+    #[test]
+    fn user_can_lower_or_raise_max_passes() {
+        // max_passes is NOT floor-guarded per Phase 2 decision. Confirm
+        // both directions succeed — this is the exact test the contract
+        // criterion #7 requires.
+        let mut up = overlay_from(&base());
+        up.defaults.max_passes = 10;
+        assert_eq!(
+            merge_with_floor(base(), up).unwrap().defaults.max_passes,
+            10
+        );
+
+        let mut down = overlay_from(&base());
+        down.defaults.max_passes = 2;
+        assert_eq!(
+            merge_with_floor(base(), down).unwrap().defaults.max_passes,
+            2
+        );
+    }
+
+    #[test]
+    fn user_can_lower_budget_usd() {
+        let mut u = overlay_from(&base());
+        u.defaults.budget_usd = 0.50;
+        let merged = merge_with_floor(base(), u).unwrap();
+        assert!((merged.defaults.budget_usd - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn user_cannot_raise_budget_usd_above_project_ceiling() {
+        let mut u = overlay_from(&base());
+        u.defaults.budget_usd = 10.0;
+        let err = merge_with_floor(base(), u).unwrap_err().to_string();
+        assert!(err.contains("budget_usd"), "err: {err}");
+    }
+
+    #[test]
+    fn user_can_raise_min_confidence() {
+        let mut u = overlay_from(&base());
+        u.defaults.min_confidence = 0.99;
+        let merged = merge_with_floor(base(), u).unwrap();
+        assert!((merged.defaults.min_confidence - 0.99).abs() < 1e-9);
+    }
 }

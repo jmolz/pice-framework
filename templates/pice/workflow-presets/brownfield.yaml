@@ -9,7 +9,8 @@ defaults:
   min_confidence: 0.92
   max_passes: 5
   model: sonnet
-  budget_usd: 1.50
+  # Opt-out until cost-telemetry providers ship (Pass-9 HIGH #1).
+  budget_usd: 0.00
   cost_cap_behavior: halt
 
 phases:
@@ -22,7 +23,10 @@ phases:
   evaluate:
     parallel: true
     seam_checks: true
-    adaptive_algorithm: adts
+    # Phase 4 Pass-5 Codex Critical #3: standalone `adts` is temporarily
+    # rejected at validation (no success path). Overlay design is tracked as
+    # a follow-up; brownfield teams keep `bayesian_sprt` in the interim.
+    adaptive_algorithm: bayesian_sprt
 
 layer_overrides: {}
 

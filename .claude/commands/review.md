@@ -27,35 +27,23 @@ If no contract exists, skip this and proceed normally. The contract evaluation i
 
 ## Phase 0.5: Database Migration Check
 
-Before running tests, verify that database migrations are up to date AND applied. Schema changes without applied migrations cause runtime failures that tests won't catch.
-
-<!-- CUSTOMIZE: Replace the commands below with your project's ORM/migration tool.
-     Common examples:
-       Drizzle:  pnpm db:generate --check / pnpm db:migrate
-       Prisma:   npx prisma migrate status / npx prisma migrate deploy
-       Django:   python manage.py showmigrations --plan | grep '\[ \]' / python manage.py migrate
-       Rails:    bin/rails db:migrate:status | grep 'down' / bin/rails db:migrate
-       Alembic:  alembic check / alembic upgrade head
-       Knex:     npx knex migrate:status / npx knex migrate:latest
--->
+PICE embeds SQLite migrations in `crates/pice-daemon/src/metrics/db.rs` (functions `migrate_v3`, etc.). There is no external migrations directory — schema evolution is in-process and idempotency is asserted by `migrate_v3_is_idempotent`, `migrate_from_v1_to_v3`, and `migrate_from_v2_to_v3` in `db.rs` inline `#[cfg(test)]` modules.
 
 ### Step 1: Check for schema drift
 
 ```bash
-# Check for new/untracked migration files
-git status --short -- '{migrations-directory}' 2>/dev/null
-# Check for uncommitted schema changes that might need a migration
-git diff HEAD --name-only -- '{schema-files}' 2>/dev/null
+# A schema change ALWAYS modifies metrics/db.rs's migrate_* function bodies.
+git diff HEAD --name-only -- 'crates/pice-daemon/src/metrics/db.rs' 'crates/pice-daemon/src/metrics/store.rs'
 ```
 
-If schema files were modified but no new migration file exists, run `{migration-generate-command}` to create one. Flag as **Critical** in the review output.
+If `db.rs` was modified, verify the new migration is **idempotent**, **forward-compatible** (existing rows survive), and the schema_version constant was bumped. Flag missing migration tests as **Critical**.
 
 ### Step 2: Apply migrations
 
-If there are new migration files (untracked `??` or modified in the migrations directory), **run the migrations directly** — do NOT skip this or defer to the user:
+PICE migrations apply on daemon startup — no separate apply step. Confirm by running the migration tests:
 
 ```bash
-{migration-apply-command}
+cargo test -p pice-daemon --lib metrics::db::tests -- --test-threads=1
 ```
 
 The command must succeed before proceeding. If it fails, flag as **Critical**.
@@ -64,65 +52,105 @@ The command must succeed before proceeding. If it fails, flag as **Critical**.
 
 Run these tests FIRST to verify that all previously shipped features are intact. This suite grows with every feature — when you ship a feature, add its tests here. If any fail, flag them as **Critical** and investigate before proceeding with the code review.
 
-<!-- CUSTOMIZE: Replace the test runner and file list below with your actual tests.
-     This section should be maintained as a living document — every time you ship
-     a feature or fix a bug, add its test(s) to the command below and document
-     them in the table.
-
-     Example test runners:
-       npx jest tests/foo.test.ts tests/bar.test.ts --no-coverage
-       npx vitest run tests/foo.test.ts tests/bar.test.ts
-       pytest tests/test_foo.py tests/test_bar.py -v
-       cargo test --test foo --test bar
--->
+PICE's full test corpus runs through two commands. The Rust workspace runner picks up every `#[cfg(test)]` module AND every `tests/*.rs` integration target automatically; the TS runner picks up every `__tests__/*.test.ts` file. Listing individual integration targets below documents what's covered for human review — the actual CI command is the workspace one.
 
 ```bash
-# Run all regression suite tests
-{test-runner} \
-  {test-file-1} \
-  {test-file-2} \
-  {test-file-3} \
-  {additional-flags}
+# Full workspace regression — covers every test target
+cargo test --workspace --all-targets && pnpm test
+```
+
+For targeted re-runs of specific milestones during a review:
+
+```bash
+# v0.1 baseline (provider host, CLI commands, validate, evaluate)
+cargo test -p pice-cli --test command_integration --test provider_integration \
+  --test provider_host_integration --test validate_integration --test evaluate_integration
+
+# v0.2 daemon split (lifecycle, auth, streaming, stale-socket recovery, workflow loader)
+cargo test -p pice-daemon --test lifecycle --test auth --test streaming \
+  --test server_unix_stale_socket --test workflow_integration
+
+# v0.2 Stack Loops + seam checks
+cargo test -p pice-daemon --test seam_integration
+
+# Phase 4 adaptive evaluation (SPRT/ADTS/VEC + concurrency + CLI exit routing)
+cargo test -p pice-daemon --test adaptive_integration --test adaptive_concurrent
+cargo test -p pice-cli --test adaptive_integration
+
+# TS provider stack
+pnpm test
 ```
 
 ### What each test covers
 
-<!-- CUSTOMIZE: Add a new section header for each feature milestone or sprint.
-     Each row documents one test file so anyone can understand what breaks if it fails.
-     The table format matches the Bloom project pattern for consistency.
+**v0.1 baseline (commit 00c7e74 — pre-Phase-4)**
 
-     Example section:
+| Test File | Feature | What It Validates |
+| --------- | ------- | ----------------- |
+| `pice-cli/tests/command_integration.rs` | CLI command dispatch | Top-level `pice` command parsing, `--help`, `--version`, JSON-mode flag propagation |
+| `pice-cli/tests/provider_integration.rs` | Provider registry | Resolve by name, walk-up search for `packages/`, error when absent |
+| `pice-cli/tests/provider_host_integration.rs` | Provider host process model | Spawn, JSON-RPC roundtrip, shutdown timeout split, notification forwarding |
+| `pice-cli/tests/validate_integration.rs` | `pice validate` end-to-end | Workflow YAML schema check, layer cross-references, typed `ExitJson` failure shape |
+| `pice-cli/tests/evaluate_integration.rs` | `pice evaluate` end-to-end | All six typed `ExitJsonStatus` discriminants (PlanNotFound, PlanParseFailed, NoContractSection, WorkflowValidationFailed, SeamFloorViolation, MergedSeamValidationFailed), clean-fixture exit 0, failing-seam exit 2 |
 
-     **Initial feature set (commit abc1234)**
+**v0.2 headless daemon (Phase 1-3)**
 
-     | Test File | Feature | What It Validates |
-     | --------- | ------- | ----------------- |
-     | `auth.signup.test.ts` (5 tests) | User signup | Email validation, password hashing, duplicate detection, welcome email, session creation |
-     | `api.customers.test.ts` (8 tests) | Customer CRUD | Create, read, update, delete, list with pagination, search, org scoping, auth guards |
--->
+| Test File | Feature | What It Validates |
+| --------- | ------- | ----------------- |
+| `pice-daemon/tests/lifecycle.rs` | Daemon start/stop/restart | SIGTERM graceful shutdown, manifest flush before exit, socket cleanup |
+| `pice-daemon/tests/auth.rs` | Bearer-token auth on socket | Token rotation per startup, `-32002` rejection for missing/invalid token, file mode 0600 |
+| `pice-daemon/tests/streaming.rs` | Streaming notifications over socket | Chunk forwarding, gate on `!req.json` (no stream in JSON mode) |
+| `pice-daemon/tests/server_unix_stale_socket.rs` | Stale socket recovery | Detect ECONNREFUSED, remove + recreate, idempotent multi-daemon prevention |
+| `pice-daemon/tests/workflow_integration.rs` | Workflow YAML loader + merge | Floor-merge semantics, deny_unknown_fields, schema_version mismatch error |
+| `pice-daemon/tests/seam_integration.rs` | Seam checks (12 categories) | Boundary parsing, fail-closed schema_drift, asymmetric openapi_compliance warning, dedupe at SQLite, 100ms budget enforcement |
 
-**{Milestone or sprint name} ({commit hash or date})**
+**Phase 4 adaptive evaluation (commits 722b264..b74e9c2)**
 
-| Test File                 | Feature        | What It Validates                                  |
-| ------------------------- | -------------- | -------------------------------------------------- |
-| `{test-file}` ({N} tests) | {Feature name} | {Brief description of what behaviors are verified} |
+| Test File | Feature | What It Validates |
+| --------- | ------- | ----------------- |
+| `pice-daemon/tests/adaptive_integration.rs` (~27 tests) | SPRT / ADTS / VEC end-to-end | All four halt reasons, ADTS three-level escalation audit trail, VEC entropy halt, budget halt before algorithm halt, context isolation (byte-identical prompt across passes), determinism, cost reconciliation, mid-loop sink failure parity (Pass-11 routes to `Pending` via `metrics_persist_failed:` prefix, exit 1 not 2), telemetry-off NULL-cost ground-truth at the sink layer (Pass-11.1 S3) |
+| `pice-daemon/tests/adaptive_concurrent.rs` (4 tests) | Per-manifest concurrency isolation | Same-feature lock serializes concurrent tasks, different-feature distinct locks, cross-process file lock blocks second acquirer (fs2 flock), disjoint pass_events on shared DB |
+| `pice-cli/tests/adaptive_integration.rs` (12 tests) | CLI exit-code routing + telemetry semantics | SPRT reject → exit 2 via typed `ExitJsonStatus::EvaluationFailed`; budget/max-passes → exit 0; corrupt-DB legacy + Stack Loops → `MetricsPersistFailed` exit 1; **stock-defaults workflow (capability-gate regression guard)**; **telemetry-off path collapses `total_cost_usd` to NULL with warning (Pass-11 CRITICAL #1 regression guard)** |
+| `provider-base/__tests__/roundtrip.test.ts` (43 tests) | TS-side protocol roundtrip | Every wire shape: session create/result, evaluate/create with passIndex/costUsd/freshContext/effortOverride/confidence camelCase, seam check result + finding, deny_unknown_fields on request params |
+| `provider-stub/__tests__/deterministic.test.ts` (9 tests) | Deterministic stub provider | `PICE_STUB_SCORES` parsing, `PICE_STUB_COST_TELEMETRY_OFF` capability override, mid-loop error trigger, cost field omission |
+| `provider-base/__tests__/provider.test.ts` (3 tests) | Base provider abstraction | initialize/createSession/destroy lifecycle |
+| `provider-base/__tests__/transport.test.ts` (11 tests) | stdio JSON-RPC transport | Framing, partial reads, error response shape |
+| `provider-claude-code/__tests__/claude-code.test.ts` (7 tests) | Claude Code SDK provider | Capability declaration, prompt assembly, error propagation |
+| `provider-codex/__tests__/codex.test.ts` (5 tests) | Codex/OpenAI evaluator provider | Adversarial review structuring, cost extraction |
 
 ### Source files these tests protect
 
-<!-- CUSTOMIZE: List every source file that the regression tests exercise.
-     This makes it easy to check: "I changed foo.ts — is it regression-protected?"
-
-     Example:
-     - `app/api/auth/route.ts` — signup, login, session management
-     - `lib/email.ts` — transactional email sending
-     - `lib/db/queries.ts` — customer CRUD queries
--->
-
-- `{source-file}` — {what it does}
+- `crates/pice-cli/src/main.rs` — CLI entrypoint
+- `crates/pice-cli/src/commands/*.rs` — render_response, JSON vs text output
+- `crates/pice-cli/src/provider/*.rs` — provider host process model
+- `crates/pice-daemon/src/lifecycle.rs` — SIGTERM/SIGINT, shutdown, watchdog
+- `crates/pice-daemon/src/server/router.rs` — RPC dispatch + per-manifest lock map
+- `crates/pice-daemon/src/server/auth.rs` — bearer token rotation, file mode 0600
+- `crates/pice-daemon/src/handlers/evaluate.rs` — `pice evaluate` backend, finalize, metrics-persist routing (mid-loop + finalize)
+- `crates/pice-daemon/src/handlers/status.rs` — `pice status` aggregation, confidence ceiling clamp at report boundary
+- `crates/pice-daemon/src/orchestrator/stack_loops.rs` — Stack Loops engine, seam runner, capability gate, telemetry-off warning
+- `crates/pice-daemon/src/orchestrator/adaptive_loop.rs` — SPRT/ADTS/VEC pass loop, write-ahead sink ordering, telemetry-aware cost resolution
+- `crates/pice-daemon/src/orchestrator/core.rs` — provider orchestrator, capability deserialization
+- `crates/pice-daemon/src/metrics/db.rs` — SQLite migrations (v1→v2→v3), foreign keys, CHECK constraints
+- `crates/pice-daemon/src/metrics/store.rs` — pass_events / evaluations / seam_findings / cost reconciliation SQL
+- `crates/pice-core/src/adaptive/*.rs` — pure SPRT/ADTS/VEC/cost/decide algorithms, `cap_confidence`, calibration
+- `crates/pice-core/src/workflow/*.rs` — YAML loader, schema, validate, floor-merge, trigger grammar
+- `crates/pice-core/src/layers/*.rs` — layers.toml parsing, manifest schema, file-tag filtering, confidence-clamp on load
+- `crates/pice-core/src/seam/*.rs` — SeamCheck trait, registry, default 12-category checks
+- `crates/pice-core/src/cli/mod.rs` — `ExitJsonStatus` typed discriminants
+- `crates/pice-protocol/src/lib.rs` — JSON-RPC contract types (Rust side)
+- `packages/provider-protocol/src/messages.ts` — JSON-RPC contract types (TS side)
+- `packages/provider-base/src/*.ts` — base provider, transport, capabilities helpers
+- `packages/provider-stub/src/*.ts` — deterministic test stub
+- `packages/provider-claude-code/src/*.ts` — Claude Code SDK bridge
+- `packages/provider-codex/src/*.ts` — Codex/OpenAI bridge
+- `templates/pice/workflow.yaml` + `templates/pice/workflow-presets/*.yaml` — shipped defaults (capability-gate compatible)
 
 ### Expected results
 
-All tests should pass. If any fail after your changes:
+All tests should pass. Baseline: **811 Rust tests (1 ignored — doc-test in `crates/pice-daemon/src/handlers/mod.rs` line 5), 78 TypeScript tests, 0 lint errors, 0 warnings, clean release build.**
+
+If any fail after your changes:
 
 1. Check if you modified the source files listed above
 2. Read the failing test to understand what behavior it expects
@@ -134,16 +162,8 @@ After running the regression suite and before finishing the review, check if any
 
 ```bash
 # Compare test files modified in uncommitted changes against the suite list
-git diff --name-only HEAD -- '{test-directories-glob}'
+git diff --name-only main...HEAD -- 'crates/**/tests/*.rs' 'packages/**/__tests__/*.test.ts'
 ```
-
-<!-- CUSTOMIZE: Replace the glob with your test file patterns.
-     Examples:
-       'tests/*.test.ts' '__tests__/**/*.test.ts'
-       'tests/test_*.py'
-       'spec/**/*_spec.rb'
-       'tests/**/*.rs'
--->
 
 For each test file that exercises a newly shipped or migrated feature and is NOT already in the regression suite:
 
@@ -152,7 +172,7 @@ For each test file that exercises a newly shipped or migrated feature and is NOT
 3. **Add any new source files to the "Source files these tests protect" list**
 4. **Add a line to the output format** checklist in Phase 4
 
-Also check all test directories — test files may live in multiple locations (e.g., `tests/`, `__tests__/`, `spec/`, `e2e/`).
+Also check inline `#[cfg(test)]` modules in `crates/*/src/**/*.rs` — Rust unit tests live next to source code, not in `tests/`. They are picked up automatically by `cargo test --workspace`, but new modules deserve a documentation row when they cover a new feature.
 
 This ensures the suite is always exhaustive: every feature we ship gets regression-protected automatically.
 
@@ -160,21 +180,20 @@ This ensures the suite is always exhaustive: every feature we ship gets regressi
 
 After regression tests pass, run the full suite:
 
-<!-- CUSTOMIZE: Replace with your project's actual validation commands.
-     These should match the commands in your CLAUDE.md or /validate command.
--->
-
 ```bash
-{lint-command}
-{test-command}
-{build-command}
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --lib -p pice-core -- -D clippy::unwrap_used -D clippy::expect_used
+cargo clippy --lib -p pice-daemon -- -D clippy::unwrap_used -D clippy::expect_used
+cargo test --workspace --all-targets
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+cargo build --release
 ```
 
-<!-- CUSTOMIZE: Set your expected baselines so drift is immediately visible.
-     Example: "Expected baseline: 0 lint errors (12 pre-existing warnings), 847 tests passing, clean build."
--->
-
-Expected baseline: {describe your known-good state — lint error count, test count, build status}
+Expected baseline: **811 Rust tests passing (1 ignored — doc-test in `pice-daemon/src/handlers/mod.rs`), 78 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.**
 
 ## Phase 3: Code Review of Current Changes
 
@@ -202,13 +221,14 @@ If reviewing a specific commit, check it out or diff against it.
 
 1. **Logic errors** and incorrect behavior
 2. **Edge cases** that aren't handled
-3. **Null/undefined reference** issues
-4. **Race conditions** or concurrency issues
-5. **Security vulnerabilities**
-6. **Resource management** — leaks, unclosed connections
-7. **API contract violations**
+3. **Null/undefined reference** issues — Rust `Option::unwrap`, TS `!.` non-null assertion
+4. **Race conditions** or concurrency issues — tokio task ordering, shared `Arc<Mutex<...>>` lock keying, cross-process flock
+5. **Security vulnerabilities** — command injection, SQL injection, unsafe `transmute`, file permissions
+6. **Resource management** — leaks, unclosed connections, RAII drop guards (`AutoStageGuard` pattern), tokio task cancellation
+7. **API contract violations** — JSON-RPC method names, kebab-case vs camelCase wire forms, `deny_unknown_fields` consistency between Rust + TS
 8. **Caching bugs** — staleness, bad keys, invalid invalidation, ineffective caching
-9. **Pattern violations** — check CLAUDE.md and .claude/rules/ for project conventions
+9. **Pattern violations** — check `CLAUDE.md` and `.claude/rules/` (especially `daemon.md`, `stack-loops.md`, `workflow-yaml.md`, `metrics.md`, `protocol.md`) for project conventions
+10. **PICE-specific invariants** — confidence ceiling 0.966, budget halt before algorithm halt, write-ahead sink ordering, byte-identical prompt across passes, fail-closed evaluation, capability gate
 
 ### Rules
 
@@ -222,9 +242,9 @@ If reviewing a specific commit, check it out or diff against it.
 ### Migration Status
 
 ```
-Schema Drift: NONE / DETECTED (tables/columns affected)
-New Migrations: [list files] or NONE
-Action: Run `{migration-generate-command}` then `{migration-apply-command}` or N/A
+Schema Drift: NONE / DETECTED (db.rs migrate_* changes)
+New Migration: bumped schema_version to vN — idempotency test added/updated YES/NO
+Action: Re-run `cargo test -p pice-daemon --lib metrics::db::tests` or N/A
 ```
 
 ### Regression Suite Results
@@ -232,28 +252,27 @@ Action: Run `{migration-generate-command}` then `{migration-apply-command}` or N
 ```
 Regression Suite: PASS / FAIL
 
-{Milestone name}:
-  - {Feature name} ({N} tests): ✓ / ✗
-  - {Feature name} ({N} tests): ✓ / ✗
+v0.1 baseline:
+  - command_integration (N tests): ✓ / ✗
+  - provider_integration / provider_host_integration: ✓ / ✗
+  - validate_integration: ✓ / ✗
+  - evaluate_integration: ✓ / ✗
 
-Full Suite: X passing, Y failing
-Lint: {error count} errors, {warning count} warnings
+v0.2 daemon split:
+  - lifecycle / auth / streaming / server_unix_stale_socket: ✓ / ✗
+  - workflow_integration: ✓ / ✗
+  - seam_integration: ✓ / ✗
+
+Phase 4 adaptive evaluation:
+  - daemon adaptive_integration (~27 tests): ✓ / ✗
+  - daemon adaptive_concurrent (4 tests): ✓ / ✗
+  - cli adaptive_integration (12 tests, including Pass-11 telemetry-off + stock-defaults): ✓ / ✗
+  - TS roundtrip + deterministic stub (52 tests): ✓ / ✗
+
+Full Suite: 811 / 78 tests passing
+Lint: 0 errors, 0 warnings (workspace + lib unwrap/expect denies)
 Build: PASS / FAIL
 ```
-
-<!-- CUSTOMIZE: As you add tests to the regression suite in Phase 1,
-     add a corresponding status line here so the output stays in sync.
-
-     Example:
-     Initial feature set:
-       - User signup (5 tests): ✓ / ✗
-       - Customer CRUD (8 tests): ✓ / ✗
-       - Campaign email (6 tests): ✓ / ✗
-
-     AI migration:
-       - Chat integration (3 tests): ✓ / ✗
-       - Command extraction (10 tests): ✓ / ✗
--->
 
 ### Contract Evaluation (if applicable)
 

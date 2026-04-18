@@ -172,6 +172,90 @@ CREATE TABLE seam_findings (
 
 These tables are populated by the daemon. The CLI reads from them for `pice status` and `pice metrics`. Dashboard (v0.3) reads the same tables.
 
+## v0.4+ Adaptive Evaluation
+
+Phase 4 adds the `pass_events` table (one row per provider invocation) and five new columns on `evaluations` (post-loop adaptive summary). Schema migrations are guarded by `PRAGMA table_info` so they're idempotent across daemon restarts.
+
+```sql
+-- New columns added to existing evaluations table
+ALTER TABLE evaluations ADD COLUMN passes_used         INTEGER;
+ALTER TABLE evaluations ADD COLUMN halted_by           TEXT;
+ALTER TABLE evaluations ADD COLUMN adaptive_algorithm  TEXT;
+ALTER TABLE evaluations ADD COLUMN final_confidence    REAL;
+ALTER TABLE evaluations ADD COLUMN final_total_cost_usd REAL;
+
+-- New table: per-pass audit trail
+CREATE TABLE pass_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    evaluation_id INTEGER NOT NULL,
+    pass_index INTEGER NOT NULL,            -- 1-indexed within the layer's loop
+    model TEXT NOT NULL,                    -- "stub-echo" | "claude-opus-4-7" | ...
+    score REAL,                             -- nullable: provider may not score
+    cost_usd REAL,                          -- nullable: provider may omit cost
+    timestamp TEXT NOT NULL,                -- ISO 8601
+    FOREIGN KEY (evaluation_id) REFERENCES evaluations(id) ON DELETE CASCADE
+);
+```
+
+### Write-path invariants
+
+- **Header insert before the loop, finalize after.** `insert_evaluation_header` writes a placeholder row with `passed=0, summary=NULL` so the adaptive loop has a valid `evaluation_id` to FK-attach pass_events to. `finalize_evaluation` rewrites `passed` and `summary` after the loop returns.
+- **`pass_events` writes happen BEFORE the halt-decision check.** A budget-halted loop still records the triggering pass cost. Skipping this would silently undercount on every budget halt.
+- **`update_evaluation_adaptive_summary` aggregates across layers.** `passes_used = SUM(layer.passes.len())`, `final_total_cost_usd = SUM(layer.total_cost_usd)` (so `evaluations.final_total_cost_usd` matches `SUM(pass_events.cost_usd)` per evaluation_id within 1e-9).
+- **`MetricsDb` is `!Sync`.** The rusqlite Connection's prepared-statement cache uses `RefCell`. The daemon wraps it in `Arc<Mutex<MetricsDb>>` so the per-pass sink can stay `Send` across the orchestrator's `await`. No contention because the sink is the only writer during the loop.
+- **`PRAGMA foreign_keys = ON` is set on every connection.** Required for `ON DELETE CASCADE` to fire when an evaluation row is deleted (e.g., during retention-policy GC).
+- **Concurrent isolation.** Two concurrent evaluations on different features write to disjoint `evaluation_id` groups in the same DB. There is no shared lock between evaluations beyond per-DB serialization (Phase 4 contract criterion #17).
+
+### Capability declaration is the source of truth for cost (Phase 4.1)
+
+When a provider does NOT declare `costTelemetry` in its `ProviderCapabilities`, the orchestrator MUST ignore any numeric `cost_usd` it reports — even if the value is well-formed (e.g., `Some(0.0)`). Declaring the capability is what asserts the value is real; without it, the value is meaningless instrument output.
+
+The adaptive loop carries `AdaptiveContext.cost_telemetry_available: bool` (sourced from `primary.capabilities().cost_telemetry` in `stack_loops::try_run_layer_adaptive`). The cost-resolution branch in `adaptive_loop::run_adaptive_passes` is a **three-outcome match**, with no "synthetic seed" fallback:
+
+```rust
+let (debited_cost, observed_cost): (Option<f64>, f64) = match primary_cost {
+    // 1. Real cost: provider declared telemetry AND value is non-negative.
+    Some(c) if CostStats::validate_nonnegative(c).is_ok() && ctx.cost_telemetry_available => {
+        any_real_cost_observed = true;
+        (Some(c), c)
+    }
+    // 2. Fail closed: budget enforced but provider lacks usable telemetry.
+    _ if ctx.budget_usd > 0.0 => {
+        halted_by_runtime_error = Some(format!("runtime_error:invalid_cost_usd:..."));
+        break;
+    }
+    // 3. Persist NULL: telemetry off AND no budget enforcement.
+    _ => (None, 0.0),
+};
+```
+
+- `pass_events.cost_usd` is `Option<f64>` and lands in SQLite as NULL via `rusqlite::params!` for outcomes 2-via-break-skipped and 3.
+- `LayerResult.total_cost_usd` is `Option<f64>` and is `None` when `passes.is_empty() || !any_real_cost_observed`. The single `any_real_cost_observed` boolean covers both "no passes ran" and "passes ran but no real cost observed" — do NOT reintroduce a `telemetry_unmeasured` flag or any per-pass synthetic seed (see Pass-11.1 W1).
+- The reconciliation invariant `evaluations.final_total_cost_usd == SUM(pass_events.cost_usd)` continues to hold under SQLite NULL semantics: `SUM(NULL, NULL, ...) = NULL`. The aggregator uses COALESCE only to default missing layer columns to `0.0` for display.
+- Adversarial path inherits the primary's `cost_telemetry_available` value as a Phase 4.1 simplification. When per-provider telemetry diverges (one declares, the other does not), redesign as `cost_telemetry_per_provider: HashMap<String, bool>` — see `TODO(adts-v2)` in `adaptive_loop.rs`.
+
+### Mid-loop sink failures route to Pending, not Failed (Phase 4.1)
+
+A sink-write failure during the loop is an **operational** failure (we cannot trust persisted metrics), not a **contract** failure (the provider scored fine). The adaptive loop signals this with a distinct `halted_by` prefix:
+
+- `metrics_persist_failed:` — operational. `LayerStatus::Pending`, exit code 1, `ExitJsonStatus::MetricsPersistFailed`. The evaluation can be retried.
+- `runtime_error:` — contract/data failure. `LayerStatus::Failed`, exit code 2, `ExitJsonStatus::EvaluationFailed`.
+
+Both prefixes flow through the same `halted_by_runtime_error: Option<String>` field on the loop result. The status-mapping site in `stack_loops::build_adaptive_layer_result` discriminates them — and **MUST** discriminate them via the centralized helper, never via inline string match:
+
+```rust
+match halted_by.as_deref() {
+    // Operational arm MUST come first; runtime_error is the catch-all.
+    Some(reason) if pice_core::cli::ExitJsonStatus::is_metrics_persist_failed(reason) => {
+        LayerStatus::Pending
+    }
+    Some(reason) if reason.starts_with("runtime_error:") => LayerStatus::Failed,
+    _ => LayerStatus::Passed,
+}
+```
+
+A typo at any one of the three call sites (loop construction, status mapping, evaluate handler) would silently misroute exit codes. The unit test `metrics_persist_failed_prefix_helper_agrees_with_constant` in `pice-core::cli` locks the helper to the constant at compile/test time. When adding a new structured halted_by prefix, follow the same pattern: add a const + `is_*` helper to `ExitJsonStatus`, route every site through the helper, and add a parity unit test.
+
 ## v0.5 Predictive Selection Data
 
 When v0.5 ships, `check_outcomes` captures the label needed for model training:

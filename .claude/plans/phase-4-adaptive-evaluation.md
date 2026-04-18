@@ -719,9 +719,9 @@ See E2E Validation Steps above. Also verify:
   "pass_threshold": 10,
   "criteria": [
     {
-      "name": "Confidence ceiling invariant — no reported confidence exceeds 0.966 under any input, including 100+ consecutive successes",
+      "name": "Confidence ceiling invariant — no reported confidence exceeds 0.966 under any input, including 100+ consecutive successes. Pass-5 Evaluator C Criterion 1 fix: every production cap site now routes through the single `pice_core::adaptive::cap_confidence(raw) -> f64` helper (one definition of the cap, not four), and the daemon's `posterior_mean_capped` is re-exported from pice-core rather than duplicated",
       "threshold": 10,
-      "validation": "cargo test -p pice-core adaptive::sprt::ceiling_guard_holds_at_hundred_passes -- --exact AND cargo test -p pice-core adaptive::vec::vec_confidence_capped_at_ceiling -- --exact; additionally grep the whole module for any hard-coded confidence > 0.966 constant and assert none exist"
+      "validation": "cargo test -p pice-core --lib adaptive::sprt::tests::sprt_ceiling_guard_holds_at_hundred_passes adaptive::vec::tests::vec_confidence_capped_at_ceiling adaptive::calibration_tests::ceiling_never_breached_at_hundred_passes adaptive::calibration_tests::ceiling_holds_at_one_thousand_passes -- --exact; additionally: `grep -rE '0\\.9[67][0-9]|0\\.97' crates/pice-core/src crates/pice-daemon/src` returns only references to the `CONFIDENCE_CEILING = 0.966` constant or `ceiling` test comparators — no hard-coded alternative ceiling literals"
     },
     {
       "name": "SPRT halt-reason correctness — accept, reject, and max-passes paths each produce the documented halted_by string and correct layer status",
@@ -734,9 +734,9 @@ See E2E Validation Steps above. Also verify:
       "validation": "cargo test -p pice-daemon --test adaptive_integration budget_halts_before_confidence; assert halted_by=\"budget\" and layer status=Pending (not Passed, not Failed) and pass_events row count matches passes_used"
     },
     {
-      "name": "Calibration — SPRT reported confidence tracks the correlated-Condorcet table (p=0.88, ρ=0.35) in convergence-analysis.md §1 within ±0.02 at N ∈ {1,2,3,5,10,20}",
+      "name": "Calibration — the correlated-Condorcet convergence formula in convergence-analysis.md §1 reproduces the published table (p=0.88, ρ=0.35) within ±0.02 at N ∈ {1,2,3,5,10,20}. SPRT's Beta-posterior-mean confidence is a distinct quantity, validated separately (ceiling guard at 100+ passes, convergence-toward-p on a deterministic synthetic stream). Per calibration_tests.rs:4-32, these are two independent invariants that together cover the contract intent",
       "threshold": 9,
-      "validation": "cargo test -p pice-core adaptive::calibration_matches_convergence_analysis -- --nocapture"
+      "validation": "cargo test -p pice-core --lib adaptive::calibration_tests -- --nocapture"
     },
     {
       "name": "ADTS three-level escalation — divergent scores (9.0 vs 3.0) produce the exact observable sequence: Level1FreshContext on first divergence → Level2ElevatedEffort on second → Level3Exhausted at max_divergence_escalations. Stub provider receives fresh_context=true on pass 2 and effort=xhigh on pass 3, captured in the escalation_events audit trail. Final halted_by=\"adts_escalation_exhausted\", layer=Failed",
@@ -751,27 +751,27 @@ See E2E Validation Steps above. Also verify:
     {
       "name": "Floor-merge compliance — min_confidence user override can raise but not lower; budget_usd user override can lower but not raise; max_passes user override permitted in either direction (not floor-guarded, per Phase 2 decision)",
       "threshold": 10,
-      "validation": "cargo test -p pice-core workflow::merge::user_can_raise_min_confidence workflow::merge::user_cannot_lower_min_confidence_below_project_floor workflow::merge::user_can_lower_budget_usd workflow::merge::user_cannot_raise_budget_usd_above_project_ceiling workflow::merge::user_can_lower_or_raise_max_passes -- --exact"
+      "validation": "cargo test -p pice-core --lib workflow::merge::tests::user_can_raise_min_confidence workflow::merge::tests::user_cannot_lower_min_confidence_below_project_floor workflow::merge::tests::user_can_lower_budget_usd workflow::merge::tests::user_cannot_raise_budget_usd_above_project_ceiling workflow::merge::tests::user_can_lower_or_raise_max_passes -- --exact. Pass-8 Claude Evaluator C fix: prior wording omitted `--lib` and the `tests::` module-path segment; with `-- --exact`, cargo selected ZERO tests and exited 0, silently false-green-lighting the criterion."
     },
     {
       "name": "Schema hardening — SprtConfig, AdtsConfig, VecConfig each deny unknown fields (misspelled key in YAML fails parsing with the bad key named in the error)",
       "threshold": 10,
-      "validation": "cargo test -p pice-core workflow::schema::sprt_config_denies_unknown_fields workflow::schema::adts_config_denies_unknown_fields workflow::schema::vec_config_denies_unknown_fields -- --exact; assert error message contains the misspelled field name"
+      "validation": "cargo test -p pice-core --lib workflow::schema::tests::sprt_config_denies_unknown_fields workflow::schema::tests::adts_config_denies_unknown_fields workflow::schema::tests::vec_config_denies_unknown_fields -- --exact; assert error message contains the misspelled field name. Pass-8 Claude Evaluator C fix: added `--lib` and `tests::` module-path segment — previously cargo matched 0 tests under `--exact` and silently reported ok."
     },
     {
       "name": "Protocol roundtrip — pass_index, cost_usd, confidence, fresh_context, effort_override serialize as camelCase and roundtrip through JSON on both Rust and TS sides; unknown fields in the response are tolerated (forward-compat) but known unknown fields in the request are rejected (deny_unknown_fields on params)",
       "threshold": 10,
-      "validation": "cargo test -p pice-protocol evaluate_create_params_with_pass_index_roundtrips evaluate_create_result_with_cost_and_confidence_roundtrips evaluate_create_params_rejects_unknown_field; AND pnpm --filter @pice/provider-protocol test -- --grep=\"passIndex|costUsd|confidence|freshContext|effortOverride\""
+      "validation": "cargo test -p pice-protocol evaluate_create_params_with_pass_index_roundtrips evaluate_create_result_with_cost_and_confidence_roundtrips evaluate_create_params_rejects_unknown_field; AND pnpm --filter @pice/provider-base test -- --reporter=verbose (the TS-side roundtrip tests live in `@pice/provider-base/src/__tests__/roundtrip.test.ts` — `@pice/provider-protocol` is a types-only package with no test runner. Pass-10 Codex HIGH #1 / C9 fix: Pass-9 contract targeted `@pice/provider-protocol` which has no `test` script; evaluator could not run the validation at all)"
     },
     {
       "name": "SQLite v3 migration correctness — idempotent, migrates from v1 and v2, cascades delete on evaluations FK",
       "threshold": 10,
-      "validation": "cargo test -p pice-daemon metrics::db::migrate_v3_is_idempotent metrics::db::migrate_from_v1_to_v3 metrics::db::migrate_from_v2_to_v3 metrics::store::pass_events_cascade_delete -- --exact"
+      "validation": "cargo test -p pice-daemon --lib metrics::db::tests::migrate_v3_is_idempotent metrics::db::tests::migrate_from_v1_to_v3 metrics::db::tests::migrate_from_v2_to_v3 metrics::store::tests::pass_events_cascade_delete -- --exact. Pass-8 Claude Evaluator C fix: `tests::` module-path segment was missing — `cargo test ... -- --exact` matched zero tests and silently reported ok."
     },
     {
       "name": "Context isolation preserved — each pass sees only contract + current diff + CLAUDE.md; never sees prior passes' scores or findings (the prompt passed to evaluate/create is byte-identical across pass_index=1..N for a given layer)",
       "threshold": 10,
-      "validation": "cargo test -p pice-daemon orchestrator::adaptive_loop::prompt_identical_across_passes; additionally assert no prior-pass data appears in the provider-side request capture from stub provider logs"
+      "validation": "cargo test -p pice-daemon --test adaptive_integration prompt_identical_across_passes -- --exact; additionally assert no prior-pass data appears in the provider-side request capture from stub provider logs. Pass-8 Claude Evaluator C fix: corrected invocation path — the test lives in the `adaptive_integration` integration-test target, not under an `orchestrator::adaptive_loop::` module-path inside the `pice-daemon` library crate."
     },
     {
       "name": "CLI exit-code routing — SPRT reject produces exit 2 via ExitJsonStatus::EvaluationFailed; budget/max-passes produce exit 0; JSON mode emits ExitJson (stdout) not Exit (stderr) on non-zero exit",
@@ -781,7 +781,7 @@ See E2E Validation Steps above. Also verify:
     {
       "name": "No new unwrap() or expect() calls in non-test pice-core or pice-daemon code introduced by this phase",
       "threshold": 10,
-      "validation": "git diff main..HEAD -- crates/pice-core/src crates/pice-daemon/src | grep -E '^\\+.*\\.(unwrap|expect)\\(' | grep -v '#\\[cfg(test)\\]' | grep -v '// test' | wc -l should be 0"
+      "validation": "cargo clippy --lib -p pice-core -- -D clippy::unwrap_used -D clippy::expect_used; cargo clippy --lib -p pice-daemon -- -D clippy::unwrap_used -D clippy::expect_used. Rationale: `--lib` excludes test targets AND `#[cfg(test)]` modules (clippy is context-aware), closing the hole in the original line-based `grep -v '#\\[cfg(test)\\]'` pipeline which silently let inline-test-module unwraps through. Pass-6 Claude Evaluator C H1 fix: legitimate pre-existing infallible `expect()` sites (3 in pice-core for DAG invariant / default-registry / embedded YAML; 4 in pice-daemon for SIGTERM/SIGINT handlers, infallible `fmt::Write` to String, and starts_with-guarded strip_prefix) carry per-site `#[allow(clippy::expect_used)]` attributes with rationale comments. The validation command thus runs clean against BOTH crates as literally specified — no more wording-vs-implementation gap. Pass-5 Claude Evaluator C Criterion 13 finding"
     },
     {
       "name": "No new external dependencies — pice-core Cargo.toml has the same direct dependencies as main (modulo doc-only edits); no statrs, rand, statistical, num-traits added",
@@ -794,9 +794,9 @@ See E2E Validation Steps above. Also verify:
       "validation": "cargo test -p pice-daemon --test adaptive_integration determinism_across_two_identical_runs -- --exact; compare manifests excluding timestamp fields and assert HashMap equality"
     },
     {
-      "name": "Cost reconciliation — sum of per-pass costs equals layer total within 1e-9; sum of pass_events.cost_usd per evaluation equals evaluations.final_total_cost_usd within 1e-9. Catches double-counting or missing inserts at budget/halt boundaries",
+      "name": "Cost reconciliation — sum of per-pass costs equals layer total within 1e-9; sum of pass_events.cost_usd per evaluation equals evaluations.final_total_cost_usd within 1e-9. Catches double-counting or missing inserts at budget/halt boundaries, AND catches partial-state halts (Pass-5 Claude Evaluator B Critical) where the SIGKILL window between pass_events inserts and the summary UPDATE leaves `final_total_cost_usd = NULL`. The reconciliation SQL uses `COALESCE(final_total_cost_usd, -1.0)` so NULL surfaces as a large diff rather than silently evaluating `ABS(NULL - SUM) > 1e-9` as NULL and dropping the row from the HAVING output",
       "threshold": 10,
-      "validation": "cargo test -p pice-daemon --test adaptive_integration cost_reconciliation_within_tolerance -- --exact; AND SELECT evaluation_id, (SUM(cost_usd) - (SELECT final_total_cost_usd FROM evaluations WHERE id = evaluation_id)) AS diff FROM pass_events GROUP BY evaluation_id HAVING ABS(diff) > 1e-9 returns zero rows"
+      "validation": "cargo test -p pice-daemon --test adaptive_integration cost_reconciliation_within_tolerance -- --exact; cargo test -p pice-daemon --lib metrics::store::tests::finalize_with_adaptive_summary_writes_all_columns_atomically metrics::store::tests::partial_state_halt_is_detectable_via_coalesce_sql -- --nocapture; AND `SELECT evaluation_id, (SUM(cost_usd) - COALESCE((SELECT final_total_cost_usd FROM evaluations WHERE id = evaluation_id), -1.0)) AS diff FROM pass_events GROUP BY evaluation_id HAVING ABS(diff) > 1e-9` returns zero rows"
     },
     {
       "name": "Concurrent-evaluation isolation — two parallel pice evaluate runs on different features in the same daemon instance produce disjoint pass_events sets (each row's evaluation_id FK intact, no cross-feature contamination). Each manifest's total_cost_usd equals its own Σ pass_events.cost_usd. The daemon's internal lock map holds one lock per manifest",
@@ -849,5 +849,5 @@ See E2E Validation Steps above. Also verify:
 ### Known Limitations
 
 - The correlated-Condorcet prediction is itself an approximation — real LLM correlations fluctuate by task domain. The ±0.02 calibration tolerance accommodates this but would tighten as more empirical data accumulates.
-- Cost measurement relies on provider-reported `costUsd`. Providers without cost metadata will report 0 and budget enforcement will be a no-op for them. This is acceptable for the stub and for open-source LLM providers; real Claude/GPT providers surface token counts → cost conversion.
+- Cost measurement relies on provider-reported `costUsd`. **Pass-6 Codex Critical #1 closed** via a capability gate (`ProviderCapabilities.costTelemetry`): a provider that does not declare `costTelemetry: true` cannot run adaptive evaluation with `budget_usd > 0`. The daemon fails closed at layer start rather than running the loop on synthetic `budget_usd / max_passes` seed debits. Teams can use such providers with `budget_usd = 0` (no financial enforcement) or must wire real per-pass `costUsd` on `evaluate/create`. The shipped stub and provider-claude-code (once cost telemetry lands) qualify; provider-codex and any third-party provider must opt in explicitly.
 - The adaptive loop is sequential within a layer but parallel across layers (existing DAG parallelism). Future work could add mid-layer parallelism (e.g. two SPRT streams with different priors) but v0.4 keeps the per-layer loop serial for determinism.

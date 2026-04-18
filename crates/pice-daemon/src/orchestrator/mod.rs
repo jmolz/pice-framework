@@ -18,12 +18,17 @@
 //! `pice_daemon::orchestrator::ProviderOrchestrator` rather than the nested
 //! `pice_daemon::orchestrator::core::ProviderOrchestrator` path.
 
+pub mod adaptive_loop;
 pub mod core;
 pub mod seam_runner;
 pub mod session;
 pub mod stack_loops;
 pub mod stream;
 
-pub use core::ProviderOrchestrator;
+pub use adaptive_loop::{
+    run_adaptive_passes, AdaptiveContext, AdaptiveOutcome, NullPassSink, PassMetricsSink,
+    RecordingPassEvent, RecordingPassSink,
+};
+pub use core::{PerPassOutcome, ProviderOrchestrator};
 pub use seam_runner::run_seams_for_layer;
 pub use stream::{NoticeLevel, NullSink, SharedSink, StreamEvent, StreamSink};

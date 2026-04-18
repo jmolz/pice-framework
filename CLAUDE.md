@@ -51,7 +51,7 @@ pnpm typecheck                 # Type check (tsc --noEmit)
 cargo fmt --check && cargo clippy -- -D warnings && cargo test && pnpm lint && pnpm typecheck && pnpm test && pnpm build && cargo build --release
 ```
 
-**Expected baseline:** 603 Rust tests (1 ignored), 60 TypeScript tests, 0 lint errors, 0 warnings, clean release build. One test (`handlers::tests::dispatch_plan_errors_without_provider`) is known-flaky due to timing — retry on spurious failure.
+**Expected baseline:** 811 Rust tests (1 ignored), 78 TypeScript tests, 0 lint errors, 0 warnings, clean release build. The 1 ignored test is the doc-test in `crates/pice-daemon/src/handlers/mod.rs` (line 5) — a documentation-only example that the doc harness intentionally skips. Pre-Phase-4 this slot was occupied by `handlers::tests::dispatch_plan_errors_without_provider` (timing-flaky); that test was de-flaked during Phase 3 and now runs to completion. If the doc-test annotation moves, update this baseline accordingly.
 
 ---
 
