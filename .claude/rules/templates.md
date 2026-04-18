@@ -19,6 +19,13 @@ paths:
 
 **Rule: when you update a file in `.claude/commands/` or `.claude/templates/`, check if the same file exists in `templates/claude/` and sync the change.**
 
+**Carve-out for project-materialized commands:** `.claude/commands/review.md` is a self-customizing command — its regression-suite table, source-file inventory, and baseline test counts are materialized to the PICE project (e.g., 811 Rust + 78 TS, specific Phase 4 daemon test files). Those project-specific blocks MUST NOT be synced into `templates/claude/commands/review.md`, which ships to new projects with placeholder text (`{test-runner}`, `{test-file-1}`, `{lint-command}`, etc.). When updating `review.md`, classify the change first:
+
+- **Methodology change** (new phase added, output format changed, contract-evaluation flow updated, new validation rule) → sync to template (preserving placeholders).
+- **Project state change** (new test file added to the regression suite, baseline count bumped, new source file inventoried) → root only.
+
+When in doubt, look at the placeholder syntax in the template: anything inside `{curly-braces}` or `<!-- CUSTOMIZE: ... -->` blocks is meant to be customized per project. Never replace those with PICE-specific values upstream — that would make every new `pice init` ship with PICE's test inventory baked in.
+
 Files that must stay in sync:
 
 | Root | Template |
