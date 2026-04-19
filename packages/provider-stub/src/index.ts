@@ -1,7 +1,14 @@
 import type { ProviderCapabilities, EvaluateCreateParams } from '@pice/provider-protocol';
 import { BaseProvider, StdioTransport } from '@pice/provider-base';
-import { parseStubScores, getStubEntry, type StubScoreEntry } from './deterministic.js';
+import {
+  parseStubScores,
+  getStubEntry,
+  perLayerScoreEnvName,
+  readStubLatencyMs,
+  type StubScoreEntry,
+} from './deterministic.js';
 import { appendFileSync } from 'node:fs';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 let nextSessionId = 1;
 
@@ -207,10 +214,37 @@ export class StubProvider extends BaseProvider {
       // tests that don't set the adversarial list behave identically.
       const isAdversarial =
         typeof p.model === 'string' && p.model.toLowerCase().includes('adversarial');
-      const scoreList =
-        isAdversarial && this.adversarialScores.length > 0
-          ? this.adversarialScores
-          : this.stubScores;
+
+      // Phase 5 cohort parallelism: per-layer score override. The daemon
+      // embeds `{ "layer": "<name>", "contract_toml": "..." }` in the
+      // evaluate/create contract payload (see
+      // `stack_loops.rs::try_run_layer_adaptive`'s `contract_json`).
+      // When present AND `PICE_STUB_SCORES_<LAYER_UPPER>` is set, the
+      // stub consumes that layer's private score list — so two parallel
+      // cohort tasks never race for indices on a shared array.
+      // Backwards-compatible: when no per-layer env is set, behavior is
+      // byte-identical to pre-Phase-5.
+      let scoreList: StubScoreEntry[];
+      if (
+        isAdversarial &&
+        this.adversarialScores.length > 0
+      ) {
+        scoreList = this.adversarialScores;
+      } else {
+        const layerName =
+          p.contract && typeof p.contract === 'object'
+            ? (p.contract as { layer?: unknown }).layer
+            : undefined;
+        const perLayer =
+          typeof layerName === 'string' && layerName.length > 0
+            ? process.env[perLayerScoreEnvName(layerName)]
+            : undefined;
+        if (perLayer !== undefined && perLayer !== '') {
+          scoreList = parseStubScores(perLayer);
+        } else {
+          scoreList = this.stubScores;
+        }
+      }
 
       const passIndex = p.passIndex ?? 0;
       const entry = getStubEntry(scoreList, passIndex);
@@ -254,6 +288,22 @@ export class StubProvider extends BaseProvider {
     transport.registerMethod('evaluate/score', async (params: unknown) => {
       this.requireInitialized();
       const { sessionId } = params as { sessionId: string };
+
+      // Phase 5 cohort parallelism: simulate provider latency for
+      // speedup benchmarks. Every score response sleeps this many ms
+      // BEFORE emitting the notification + returning, so the wall-clock
+      // cost of a cohort task is dominated by the sleep rather than by
+      // Node startup. Read per-call (not per-session) so a test can
+      // change it between passes without restarting the provider.
+      //
+      // `tokio::time::pause()` on the Rust bench side would zero this
+      // out silently — the bench uses `#[tokio::test(flavor =
+      // "multi_thread")]` precisely to keep real time advancing. See
+      // `benches/parallel_cohort_speedup.rs` top-of-file comment.
+      const latencyMs = readStubLatencyMs();
+      if (latencyMs > 0) {
+        await sleep(latencyMs);
+      }
 
       // Default score if `PICE_STUB_SCORES` is not configured. Kept at 8 for
       // backward compatibility with pre-Phase-4 tests; the Phase 4 adaptive
