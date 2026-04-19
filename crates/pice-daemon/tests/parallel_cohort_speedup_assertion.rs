@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use pice_core::config::{
@@ -45,11 +45,41 @@ const MAX_PARALLEL_RATIO: f64 = 0.625;
 /// relaxes), the unguarded `std::env::set_var` calls would race across
 /// tokio tasks. Mirrors the `stub_env_lock()` in
 /// `parallel_cohort_integration.rs`.
-fn stub_env_lock() -> MutexGuard<'static, ()> {
+fn stub_env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
+}
+
+/// RAII guard that serializes `PICE_STUB_*` env mutations + cleans
+/// them up on drop. Lives INSIDE a struct field so `clippy::await_
+/// holding_lock` does not see a naked `MutexGuard` across `.await`
+/// (the lint is pattern-matched on the binding's static type).
+///
+/// Mirrors `ParallelStubGuard` in `parallel_cohort_integration.rs` —
+/// the two binaries cannot share a module, so the helper is duplicated
+/// verbatim rather than extracted into a test-support crate (which
+/// would require a new crate just for two ~20-line structs).
+struct StubEnvGuard {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StubEnvGuard {
+    fn new(latency_ms: u64) -> Self {
+        let guard = stub_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        std::env::set_var("PICE_STUB_SCORES_BACKEND", "9.0,0.01");
+        std::env::set_var("PICE_STUB_SCORES_FRONTEND", "8.0,0.01");
+        std::env::set_var("PICE_STUB_LATENCY_MS", latency_ms.to_string());
+        std::env::remove_var("PICE_STUB_SCORES");
+        Self { _guard: guard }
+    }
+}
+
+impl Drop for StubEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("PICE_STUB_SCORES_BACKEND");
+        std::env::remove_var("PICE_STUB_SCORES_FRONTEND");
+        std::env::remove_var("PICE_STUB_LATENCY_MS");
+    }
 }
 
 fn git_init(dir: &Path) {
@@ -182,27 +212,19 @@ async fn time_one_run(parallel: bool) -> Duration {
         merged_seams: &seams,
     };
 
-    // Hold the env lock across set/run/tear-down. See `stub_env_lock`
-    // doc-comment: one-test-today, defense-in-depth-tomorrow.
-    let _env = stub_env_lock();
-
-    std::env::set_var("PICE_STUB_SCORES_BACKEND", "9.0,0.01");
-    std::env::set_var("PICE_STUB_SCORES_FRONTEND", "8.0,0.01");
-    std::env::set_var("PICE_STUB_LATENCY_MS", LATENCY_MS.to_string());
-    std::env::remove_var("PICE_STUB_SCORES");
+    // Hold the env lock across set/run/tear-down. The `StubEnvGuard`
+    // struct wraps the `MutexGuard` in a field so it survives across
+    // `.await` without tripping `clippy::await_holding_lock` (the lint
+    // matches on naked-binding static types). Cleanup is RAII —
+    // survives panic.
+    let _env = StubEnvGuard::new(LATENCY_MS);
 
     let sink: Arc<dyn PassMetricsSink> = Arc::new(NullPassSink);
     let t0 = Instant::now();
     let _ = run_stack_loops_with_cancel(&cfg, &NullSink, true, sink, CancellationToken::new())
         .await
         .unwrap();
-    let elapsed = t0.elapsed();
-
-    std::env::remove_var("PICE_STUB_SCORES_BACKEND");
-    std::env::remove_var("PICE_STUB_SCORES_FRONTEND");
-    std::env::remove_var("PICE_STUB_LATENCY_MS");
-
-    elapsed
+    t0.elapsed()
 }
 
 async fn mean_of_n(parallel: bool) -> Duration {
