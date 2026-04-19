@@ -79,7 +79,7 @@ pub async fn run_stack_loops(
     cfg: &StackLoopsConfig<'_>,
     sink: &dyn StreamSink,
     json_mode: bool,
-    pass_sink: &mut dyn PassMetricsSink,
+    pass_sink: std::sync::Arc<dyn PassMetricsSink>,
 ) -> Result<VerificationManifest> {
     let config = cfg.layers;
     let plan_path = cfg.plan_path;
@@ -346,7 +346,7 @@ pub async fn run_stack_loops(
                 &contract_content,
                 &filtered_diff,
                 &claude_md,
-                pass_sink,
+                pass_sink.as_ref(),
             )
             .await;
 
@@ -518,7 +518,7 @@ async fn try_run_layer_adaptive(
     contract_toml: &str,
     filtered_diff: &str,
     claude_md: &str,
-    pass_sink: &mut dyn PassMetricsSink,
+    pass_sink: &dyn PassMetricsSink,
 ) -> LayerAdaptiveResult {
     let workflow = cfg.workflow;
     let algo = effective_adaptive_algo_for(workflow, layer_name);
@@ -1129,8 +1129,9 @@ mod tests {
             merged_seams: &empty_seams,
         };
 
-        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
-        let manifest = run_stack_loops(&cfg, &NullSink, false, &mut pass_sink)
+        let pass_sink: std::sync::Arc<dyn super::super::adaptive_loop::PassMetricsSink> =
+            std::sync::Arc::new(super::super::adaptive_loop::NullPassSink);
+        let manifest = run_stack_loops(&cfg, &NullSink, false, pass_sink)
             .await
             .unwrap();
 
@@ -1229,8 +1230,9 @@ mod tests {
             merged_seams: &empty_seams,
         };
 
-        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
-        let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+        let pass_sink: std::sync::Arc<dyn super::super::adaptive_loop::PassMetricsSink> =
+            std::sync::Arc::new(super::super::adaptive_loop::NullPassSink);
+        let manifest = run_stack_loops(&cfg, &NullSink, true, pass_sink)
             .await
             .unwrap();
 
@@ -1367,8 +1369,9 @@ mod tests {
             merged_seams: &seams,
         };
 
-        let mut pass_sink = super::super::adaptive_loop::NullPassSink;
-        let manifest = run_stack_loops(&cfg, &NullSink, true, &mut pass_sink)
+        let pass_sink: std::sync::Arc<dyn super::super::adaptive_loop::PassMetricsSink> =
+            std::sync::Arc::new(super::super::adaptive_loop::NullPassSink);
+        let manifest = run_stack_loops(&cfg, &NullSink, true, pass_sink)
             .await
             .unwrap();
         let backend = manifest

@@ -231,7 +231,7 @@ pub struct DbBackedPassSink {
 
 impl crate::orchestrator::PassMetricsSink for DbBackedPassSink {
     fn record_pass(
-        &mut self,
+        &self,
         pass_index: u32,
         model: &str,
         score: Option<f64>,

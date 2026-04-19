@@ -247,10 +247,11 @@ async fn concurrent_evaluations_on_shared_db_have_disjoint_pass_events() {
     let seams_b: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     let handle_a = tokio::spawn(async move {
-        let mut sink = DbBackedPassSink {
-            db: dba_clone,
-            evaluation_id: eval_id_a,
-        };
+        let sink: std::sync::Arc<dyn pice_daemon::orchestrator::PassMetricsSink> =
+            std::sync::Arc::new(DbBackedPassSink {
+                db: dba_clone,
+                evaluation_id: eval_id_a,
+            });
         bara.wait().await;
         let cfg = StackLoopsConfig {
             layers: &layers_a,
@@ -262,16 +263,17 @@ async fn concurrent_evaluations_on_shared_db_have_disjoint_pass_events() {
             workflow: &wf_a,
             merged_seams: &seams_a,
         };
-        run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        run_stack_loops(&cfg, &NullSink, true, sink)
             .await
             .unwrap()
     });
 
     let handle_b = tokio::spawn(async move {
-        let mut sink = DbBackedPassSink {
-            db: dbb_clone,
-            evaluation_id: eval_id_b,
-        };
+        let sink: std::sync::Arc<dyn pice_daemon::orchestrator::PassMetricsSink> =
+            std::sync::Arc::new(DbBackedPassSink {
+                db: dbb_clone,
+                evaluation_id: eval_id_b,
+            });
         barb.wait().await;
         let cfg = StackLoopsConfig {
             layers: &layers_b,
@@ -283,7 +285,7 @@ async fn concurrent_evaluations_on_shared_db_have_disjoint_pass_events() {
             workflow: &wf_b,
             merged_seams: &seams_b,
         };
-        run_stack_loops(&cfg, &NullSink, true, &mut sink)
+        run_stack_loops(&cfg, &NullSink, true, sink)
             .await
             .unwrap()
     });
