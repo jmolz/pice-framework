@@ -40,7 +40,15 @@ use crate::prompt::layer_builder::build_layer_evaluation_prompt;
 /// swamps the API. Users can LOWER via `defaults.max_parallelism`; they
 /// cannot raise above this cap. Revisiting requires rate-limit-aware backoff
 /// in the providers (v0.6 concern).
-const MAX_PARALLELISM_HARD_CAP: usize = 16;
+///
+/// The canonical value lives in `pice-core::workflow::schema`; re-exporting
+/// here as a `usize` keeps the `clamp(1, MAX_PARALLELISM_HARD_CAP)` math
+/// type-friendly and gives both the load-time validator
+/// (`validate_schema_only` warns if user config > cap) and the dispatch-time
+/// clamp + `warn!` a single source of truth. A typo on one site can never
+/// diverge from the other.
+const MAX_PARALLELISM_HARD_CAP: usize =
+    pice_core::workflow::schema::MAX_PARALLELISM_HARD_CAP as usize;
 
 /// Configuration for a Stack Loops evaluation run.
 ///
@@ -240,13 +248,30 @@ pub async fn run_stack_loops_with_cancel(
     // (defensive minimum of 1). Hard-capped at
     // `MAX_PARALLELISM_HARD_CAP` regardless of user config, to stay
     // rate-limit-friendly with Anthropic / OpenAI.
-    let max_parallelism = cfg
+    //
+    // Operator feedback loop: if the user explicitly set
+    // `max_parallelism` above the hard cap, emit a runtime `warn!`
+    // NAMING both values so the daemon log is actionable. This
+    // complements the load-time `ValidationWarning` from
+    // `validate_schema_only` (surfaced by `pice validate`) — dual-
+    // surface enforcement of the rule `.claude/rules/stack-loops.md`
+    // calls "both sites". Users who ran the daemon directly without
+    // `pice validate` first still see the feedback.
+    let requested_parallelism = cfg
         .workflow
         .defaults
         .max_parallelism
         .map(|n| n as usize)
-        .unwrap_or_else(num_cpus::get)
-        .clamp(1, MAX_PARALLELISM_HARD_CAP);
+        .unwrap_or_else(num_cpus::get);
+    let max_parallelism = requested_parallelism.clamp(1, MAX_PARALLELISM_HARD_CAP);
+    if requested_parallelism > MAX_PARALLELISM_HARD_CAP {
+        warn!(
+            requested = requested_parallelism,
+            cap = MAX_PARALLELISM_HARD_CAP,
+            "defaults.max_parallelism exceeds hard cap; clamping. Run `pice validate` \
+             to surface this warning pre-evaluation."
+        );
+    }
 
     let parallel_configured = cfg.workflow.phases.evaluate.parallel;
 
@@ -1320,6 +1345,7 @@ async fn evaluate_one_layer(
         inputs.primary_model.clone(),
         inputs.pice_config.clone(),
         inputs.workflow.clone(),
+        inputs.project_root.clone(),
         Arc::clone(&pass_sink),
     );
 
@@ -1412,6 +1438,7 @@ async fn try_run_layer_adaptive_owned(
     primary_model: String,
     pice_config: PiceConfig,
     workflow: WorkflowConfig,
+    project_root: PathBuf,
     pass_sink: Arc<dyn PassMetricsSink>,
 ) -> LayerAdaptiveResult {
     // Build a transient `StackLoopsConfig` and delegate to the shared
@@ -1422,16 +1449,26 @@ async fn try_run_layer_adaptive_owned(
     // NOTE: we construct a minimal `LayersConfig` placeholder because
     // `try_run_layer_adaptive` doesn't actually read `cfg.layers` for
     // the adaptive path — only `primary_provider`, `primary_model`,
-    // `pice_config`, and `workflow`. The placeholder keeps the struct
-    // constructable without pulling the real layers config into the
-    // spawned task (another compile-time isolation lever).
+    // `pice_config`, `workflow`, and (post-review) `project_root`. The
+    // placeholder keeps the struct constructable without pulling the
+    // real layers config into the spawned task (another compile-time
+    // isolation lever).
+    //
+    // `project_root` is the REAL layer input — NOT a dummy. A prior
+    // revision passed `Path::new(".")` here on the assumption that
+    // `try_run_layer_adaptive` would not read the field. That held
+    // today but was a latent hazard: any future refactor touching
+    // `cfg.project_root` would silently resolve against the daemon's
+    // current working directory (typically `~/.pice/`) instead of the
+    // user's project. Threading the real path through
+    // `LayerInputs::project_root` closes the hazard.
     let empty_layers = LayersConfig::default();
     let dummy_plan = std::path::PathBuf::from("/dev/null");
     let dummy_seams: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let cfg = StackLoopsConfig {
         layers: &empty_layers,
         plan_path: &dummy_plan,
-        project_root: Path::new("."),
+        project_root: project_root.as_path(),
         primary_provider: &primary_provider,
         primary_model: &primary_model,
         pice_config: &pice_config,

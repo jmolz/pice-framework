@@ -31,6 +31,29 @@ pub struct WorkflowConfig {
     pub seams: Option<BTreeMap<String, Vec<String>>>,
 }
 
+/// Hard upper bound on `defaults.max_parallelism`, regardless of user config.
+///
+/// Phase 5 cohort parallelism: caps the cohort-level concurrency the daemon
+/// will ever dispatch. Users may LOWER this via `defaults.max_parallelism`;
+/// they cannot raise it. Raising requires provider-side rate-limit-aware
+/// backoff (a v0.6 concern) — without it, ≥17-way fan-out against Anthropic
+/// or OpenAI breaks rate limits for both this user's workspace and any
+/// other concurrent PICE invocations.
+///
+/// The constant lives in `pice-core` so BOTH surfaces enforce it:
+/// load-time `validate_schema_only` emits a `ValidationWarning` (surfaced
+/// by `pice validate` and the daemon's pre-execution check) when a user
+/// sets `max_parallelism` above this floor; dispatch-time
+/// `pice-daemon::orchestrator::stack_loops` clamps to this value and emits
+/// a runtime `warn!` if the clamp actually fires.
+///
+/// A reviewer-flagged gap in the prior implementation was that ONLY the
+/// dispatch site enforced the cap — a user who set `max_parallelism: 32`
+/// saw zero feedback from `pice validate` and only a silent clamp at
+/// runtime. This dual-surface pattern is the defense-in-depth the
+/// `.claude/rules/stack-loops.md` "both sites" invariant asks for.
+pub const MAX_PARALLELISM_HARD_CAP: u32 = 16;
+
 /// Pipeline-wide defaults applied when no layer override specifies otherwise.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
