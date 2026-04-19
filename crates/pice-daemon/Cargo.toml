@@ -45,6 +45,14 @@ num_cpus = "1.16"
 # Phase 5 cohort parallelism: cancellation primitive. Child tokens
 # propagate cleanly through spawned cohort tasks — chosen over
 # `tokio::sync::watch::Receiver<bool>` which would require manual cascade.
+#
+# **Feature gating.** `tokio_util::sync::CancellationToken` is exposed
+# under the `rt` feature in tokio-util 0.7.x — there is NO separate
+# `sync` feature in the crate's manifest (features are: default, compat,
+# codec, time, net, rt, io, io-util, slab). Confirmed by attempting
+# `features = ["rt", "sync"]` and hitting a cargo resolver error
+# ("tokio-util does not have that feature"). `rt` is the correct and
+# minimal feature set for this dependency.
 tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]

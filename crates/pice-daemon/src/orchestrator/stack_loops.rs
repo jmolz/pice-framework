@@ -10,6 +10,7 @@
 //! orchestrator records a placeholder result and continues.
 
 use anyhow::{Context, Result};
+use pice_core::cli::CancelledReason;
 use pice_core::config::PiceConfig;
 use pice_core::layers::filter::{filter_diff_by_globs, scan_files_by_globs};
 use pice_core::layers::manifest::{
@@ -509,7 +510,7 @@ pub async fn run_stack_loops_with_cancel(
                             status: LayerStatus::Failed,
                             passes: Vec::new(),
                             seam_checks: no_seam_checks(),
-                            halted_by: Some("cancelled:join_aborted".to_string()),
+                            halted_by: Some(CancelledReason::JoinAborted.as_halted_by()),
                             final_confidence: None,
                             total_cost_usd: None,
                             escalation_events: None,
@@ -1291,7 +1292,7 @@ async fn evaluate_one_layer(
             status: LayerStatus::Failed,
             passes: Vec::new(),
             seam_checks: no_seam_checks(),
-            halted_by: Some("cancelled:pre_spawn".to_string()),
+            halted_by: Some(CancelledReason::PreSpawn.as_halted_by()),
             final_confidence: None,
             total_cost_usd: None,
             escalation_events: None,
@@ -1330,7 +1331,7 @@ async fn evaluate_one_layer(
                 status: LayerStatus::Failed,
                 passes: Vec::new(),
                 seam_checks: no_seam_checks(),
-                halted_by: Some("cancelled:in_flight".to_string()),
+                halted_by: Some(CancelledReason::InFlight.as_halted_by()),
                 final_confidence: None,
                 total_cost_usd: None,
                 escalation_events: None,
