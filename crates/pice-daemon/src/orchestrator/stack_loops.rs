@@ -445,31 +445,35 @@ pub async fn run_stack_loops_with_cancel(
             }
 
             // Drain the JoinSet. Cancellation wins over completion — on
-            // `cancel.cancelled()` we abort all in-flight tasks and mark
-            // layers that didn't reach `evaluate_one_layer`'s early-cancel
-            // branch as `cancelled:join_aborted`.
+            // `cancel.cancelled()` we abort all in-flight tasks ONCE and
+            // then keep draining the remaining handles so spawned tasks
+            // that reached `evaluate_one_layer`'s `cancelled:in_flight`
+            // branch are collected normally.
+            //
+            // `cancel_fired` gates the select branch: `cancel.cancelled()`
+            // resolves permanently once triggered, so without the gate we
+            // would re-enter that arm on every subsequent iteration and
+            // spin — hanging the drain + starving other tests on the
+            // global env mutex.
             let mut collected: Vec<LayerOutcome> = Vec::new();
+            let mut cancel_fired = false;
             loop {
+                if join_set.is_empty() {
+                    break;
+                }
                 tokio::select! {
                     biased;
-                    _ = cancel.cancelled(), if !collected.is_empty() || !join_set.is_empty() => {
-                        // Abort every still-running task. Already-completed
-                        // tasks survive in `join_set` until drained.
+                    _ = cancel.cancelled(), if !cancel_fired => {
+                        cancel_fired = true;
                         join_set.abort_all();
-                        // Continue the loop so we drain the aborted
-                        // handles — that lets each task's `evaluate_one_layer`
-                        // cancellation-select fire where possible.
                     }
                     joined = join_set.join_next() => {
                         match joined {
                             Some(Ok(out)) => collected.push(out),
                             Some(Err(join_err)) if join_err.is_cancelled() => {
-                                // Spawn-level cancellation (abort_all()).
-                                // We don't know the layer name from a
-                                // cancelled join handle, so we record a
-                                // synthetic outcome AFTER the drain by
-                                // diffing against the original cohort.
-                                // Continue draining.
+                                // Spawn-level cancellation from abort_all().
+                                // Synthetic outcome assembled after drain
+                                // by diffing against the original cohort.
                             }
                             Some(Err(join_err)) => {
                                 warn!("cohort task join error: {join_err}");
