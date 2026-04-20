@@ -392,8 +392,20 @@ impl VerificationManifest {
         Ok(())
     }
 
-    /// Returns `~/.pice/state/`.
+    /// Returns the manifest state root.
+    ///
+    /// Resolution order: `$PICE_STATE_DIR` if set, else
+    /// `~/.pice/state/`. The env override is honored so that test
+    /// fixtures can pin a tempdir without touching real user state,
+    /// AND so that the CLI / daemon handlers and the pice-core manifest
+    /// path helpers agree on the same location. Phase 6 eval review
+    /// surfaced a prior divergence where `handlers/review_gate.rs`
+    /// honored the env var but `manifest_path_for` did not — fixtures
+    /// seeded one place and the handler looked in another.
     pub fn state_dir() -> Result<PathBuf> {
+        if let Ok(dir) = std::env::var("PICE_STATE_DIR") {
+            return Ok(PathBuf::from(dir));
+        }
         let home = home_dir()?;
         Ok(home.join(".pice").join("state"))
     }

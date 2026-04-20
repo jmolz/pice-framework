@@ -44,3 +44,4 @@ pub mod prompt;
 pub mod provider;
 pub mod server;
 pub mod templates;
+pub mod test_support;
