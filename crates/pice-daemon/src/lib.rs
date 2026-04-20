@@ -33,6 +33,7 @@
 //! enforces (auth token handling, manifest-as-source-of-truth, single-daemon
 //! prevention, graceful shutdown budget, etc.).
 
+pub mod clock;
 pub mod handlers;
 pub mod inline;
 pub mod lifecycle;

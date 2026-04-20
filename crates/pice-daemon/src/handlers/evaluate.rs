@@ -721,6 +721,9 @@ pub async fn run(
                 LayerStatus::Pending => "PENDING",
                 LayerStatus::InProgress => "IN-PROGRESS",
                 LayerStatus::Skipped => "SKIP",
+                // Phase 6: a gate paused the cohort advance; the layer
+                // has already graded Passed but needs reviewer action.
+                LayerStatus::PendingReview => "REVIEW",
             };
             let detail = lr
                 .halted_by

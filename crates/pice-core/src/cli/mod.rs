@@ -126,6 +126,41 @@ pub enum ExitJsonStatus {
     /// from "evaluation succeeded but metrics didn't land" — both have
     /// operator-observable consequences but very different remediations.
     MetricsPersistFailed,
+
+    /// Phase 6 review gates: a gate was rejected with no retries remaining
+    /// (or the `on_timeout: reject` branch fired on an expired gate). The
+    /// layer is `Failed` and the overall manifest is `Failed` — exit 2,
+    /// treated like a contract failure because the reviewer explicitly
+    /// declined the change.
+    ReviewGateRejected,
+
+    /// Phase 6 review gates: a gate with `on_timeout: reject` expired
+    /// without a decision and the reconciler fired the timeout action.
+    /// Distinct from `ReviewGateRejected` so dashboards can surface
+    /// timeout rates separately from manual-reject rates. Exit 2.
+    ReviewGateTimeout,
+
+    /// Phase 6 review gates: a concurrent `pice review-gate --decision`
+    /// call raced another reviewer — the second caller's SQLite write
+    /// hit the `gate_decisions.gate_id` UNIQUE constraint, or the gate
+    /// had already transitioned out of `Pending` before the handler
+    /// acquired the manifest locks. Exit 1 (operator-actionable; the
+    /// first reviewer's decision is the source of truth).
+    ReviewGateConflict,
+
+    /// Phase 6 review gates: `pice evaluate` ran to a gate boundary in
+    /// a non-TTY (CI / `--json`) context. The pending gates are reported
+    /// on stdout and the process exits with **3** so shell loops can
+    /// distinguish "work not done, needs reviewer action" from exit 1
+    /// (failure) / exit 2 (rejected). New exit code — extends the
+    /// existing 0/1/2 surface without overlap.
+    ReviewGatePending,
+
+    /// Phase 6 review gates: `pice review-gate` invoked without the
+    /// flag combination needed to identify a decision target (e.g.,
+    /// neither `--list` nor `--gate-id` supplied; or `--gate-id` with
+    /// no `--decision` and stdin is not a TTY). Exit 1.
+    MissingDecision,
 }
 
 impl ExitJsonStatus {
@@ -139,6 +174,28 @@ impl ExitJsonStatus {
     /// updates ONE site and both consumers pick it up automatically —
     /// closes Pass-11.1 W2 (duplicated routing logic).
     pub const METRICS_PERSIST_FAILED_PREFIX: &'static str = "metrics_persist_failed:";
+
+    /// Phase 6 review gates: `halted_by` prefix for a layer that was
+    /// rejected at a review gate with no retries remaining. Emitted by
+    /// the `ReviewGate::Decide` handler; consumers map to exit code 2
+    /// (`LayerStatus::Failed`, `ManifestStatus::Failed`).
+    pub const HALTED_GATE_REJECTED: &'static str = "gate_rejected";
+
+    /// Phase 6 review gates: `halted_by` prefix for a layer that timed
+    /// out at a review gate with `on_timeout: reject`. Emitted by the
+    /// `GateReconciler` and the `gate/decide` timeout prelude. Maps to
+    /// exit code 2 alongside [`Self::HALTED_GATE_REJECTED`].
+    pub const HALTED_GATE_TIMEOUT_REJECT: &'static str = "gate_timeout_reject";
+
+    /// True if `halted_by` represents a review-gate halt (either manual
+    /// reject-without-retries or timeout_reject). Used by both the
+    /// orchestrator's halt router and the CLI's exit-code mapper. Flat
+    /// underscore convention matches `sprt_*` — a future switch to
+    /// prefix-family (`gate_rejected:manual` / `gate_rejected:timeout`)
+    /// would only touch this module.
+    pub fn is_gate_halt(halted_by: &str) -> bool {
+        halted_by == Self::HALTED_GATE_REJECTED || halted_by == Self::HALTED_GATE_TIMEOUT_REJECT
+    }
 
     /// Wire prefix carried in the per-layer `LayerResult.halted_by` string
     /// when a parallel cohort task is cancelled (via
@@ -170,6 +227,43 @@ impl ExitJsonStatus {
             Self::MergedSeamValidationFailed => "merged-seam-validation-failed",
             Self::EvaluationFailed => "evaluation-failed",
             Self::MetricsPersistFailed => "metrics-persist-failed",
+            Self::ReviewGateRejected => "review-gate-rejected",
+            Self::ReviewGateTimeout => "review-gate-timeout",
+            Self::ReviewGateConflict => "review-gate-conflict",
+            Self::ReviewGatePending => "review-gate-pending",
+            Self::MissingDecision => "missing-decision",
+        }
+    }
+
+    /// Conventional process exit code for a given structured status.
+    ///
+    /// | Family | Exit | Semantics |
+    /// |--------|------|-----------|
+    /// | contract failure (reviewer reject, grading fail) | 2 | the change does not meet the bar |
+    /// | operational failure (parse, validation, persistence, conflict, missing decision) | 1 | tooling / config / race |
+    /// | `ReviewGatePending` | 3 | work paused pending human decision (Phase 6) |
+    ///
+    /// Centralizing the mapping here — instead of hardcoding `code: 1|2`
+    /// at each `ExitJson` construction site — lets a future release retire
+    /// an exit code with a single edit instead of N handler touches.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            // Contract/reviewer-level rejection family.
+            Self::EvaluationFailed
+            | Self::NoContractSection
+            | Self::ReviewGateRejected
+            | Self::ReviewGateTimeout => 2,
+            // Work-paused-waiting-for-human-review family (Phase 6).
+            Self::ReviewGatePending => 3,
+            // Operational failure family (everything else).
+            Self::PlanNotFound
+            | Self::PlanParseFailed
+            | Self::WorkflowValidationFailed
+            | Self::SeamFloorViolation
+            | Self::MergedSeamValidationFailed
+            | Self::MetricsPersistFailed
+            | Self::ReviewGateConflict
+            | Self::MissingDecision => 1,
         }
     }
 
@@ -749,6 +843,11 @@ mod tests {
             ExitJsonStatus::MergedSeamValidationFailed,
             ExitJsonStatus::EvaluationFailed,
             ExitJsonStatus::MetricsPersistFailed,
+            ExitJsonStatus::ReviewGateRejected,
+            ExitJsonStatus::ReviewGateTimeout,
+            ExitJsonStatus::ReviewGateConflict,
+            ExitJsonStatus::ReviewGatePending,
+            ExitJsonStatus::MissingDecision,
         ];
         for variant in &all_variants {
             let serde_output = serde_json::to_string(variant).unwrap();
@@ -759,5 +858,70 @@ mod tests {
                  update the as_str() match arm or the serde rename to stay in sync"
             );
         }
+    }
+
+    /// Phase 6 Task 3: lock the exit-code mapping so a rename or new
+    /// variant can't silently misroute. Exit 3 is NEW in Phase 6 —
+    /// reserved for `ReviewGatePending` and nothing else.
+    #[test]
+    fn exit_code_family_mapping_is_stable() {
+        // Contract/reviewer-reject family → 2
+        assert_eq!(ExitJsonStatus::EvaluationFailed.exit_code(), 2);
+        assert_eq!(ExitJsonStatus::NoContractSection.exit_code(), 2);
+        assert_eq!(ExitJsonStatus::ReviewGateRejected.exit_code(), 2);
+        assert_eq!(ExitJsonStatus::ReviewGateTimeout.exit_code(), 2);
+        // Pause-for-review family → 3 (Phase 6 new exit code)
+        assert_eq!(ExitJsonStatus::ReviewGatePending.exit_code(), 3);
+        // Operational family → 1
+        assert_eq!(ExitJsonStatus::PlanNotFound.exit_code(), 1);
+        assert_eq!(ExitJsonStatus::ReviewGateConflict.exit_code(), 1);
+        assert_eq!(ExitJsonStatus::MissingDecision.exit_code(), 1);
+        assert_eq!(ExitJsonStatus::MetricsPersistFailed.exit_code(), 1);
+        // Exhaustive sweep: every variant's exit code is one of {1, 2, 3}.
+        for v in [
+            ExitJsonStatus::PlanNotFound,
+            ExitJsonStatus::PlanParseFailed,
+            ExitJsonStatus::NoContractSection,
+            ExitJsonStatus::WorkflowValidationFailed,
+            ExitJsonStatus::SeamFloorViolation,
+            ExitJsonStatus::MergedSeamValidationFailed,
+            ExitJsonStatus::EvaluationFailed,
+            ExitJsonStatus::MetricsPersistFailed,
+            ExitJsonStatus::ReviewGateRejected,
+            ExitJsonStatus::ReviewGateTimeout,
+            ExitJsonStatus::ReviewGateConflict,
+            ExitJsonStatus::ReviewGatePending,
+            ExitJsonStatus::MissingDecision,
+        ] {
+            let code = v.exit_code();
+            assert!(
+                (1..=3).contains(&code),
+                "{v:?} returned exit code {code} outside {{1, 2, 3}} — \
+                 extending the surface requires explicit CLI conventions update"
+            );
+        }
+    }
+
+    /// Phase 6 Task 3: lock the gate-halt prefix constants against the
+    /// `is_gate_halt` predicate. Flat-underscore convention (matching
+    /// `sprt_*`) is the agreed style; refactoring to a prefix family
+    /// (`gate_rejected:*`) in a later phase must update ONE file.
+    #[test]
+    fn gate_halt_prefixes_agree_with_is_gate_halt() {
+        assert!(ExitJsonStatus::is_gate_halt(
+            ExitJsonStatus::HALTED_GATE_REJECTED
+        ));
+        assert!(ExitJsonStatus::is_gate_halt(
+            ExitJsonStatus::HALTED_GATE_TIMEOUT_REJECT
+        ));
+        // Adjacent halt families must not be misrouted through the gate
+        // predicate — e.g., a future `gate_approved` halt (there is
+        // none) must not match, nor a `sprt_rejected`.
+        assert!(!ExitJsonStatus::is_gate_halt("sprt_rejected"));
+        assert!(!ExitJsonStatus::is_gate_halt("gate_approved"));
+        assert!(!ExitJsonStatus::is_gate_halt(""));
+        assert!(!ExitJsonStatus::is_gate_halt(
+            ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX
+        ));
     }
 }

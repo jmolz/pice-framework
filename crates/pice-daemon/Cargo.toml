@@ -54,6 +54,17 @@ num_cpus = "1.16"
 # ("tokio-util does not have that feature"). `rt` is the correct and
 # minimal feature set for this dependency.
 tokio-util = { version = "0.7", features = ["rt"] }
+# Phase 6 review gates: async trait sugar for `Clock`.
+#
+# The trait wraps `tokio::time::sleep` in production and `Arc<Notify>`
+# wake-up in tests. Picked `async-trait` over returning
+# `Pin<Box<dyn Future>>` by hand because `Arc<dyn Clock>` is threaded
+# through every handler via `DaemonContext` — the manual-Pin approach
+# triples the trait definition's surface area without buying anything
+# beyond avoiding this 20-line macro dependency. `async-trait` stays
+# scoped to `pice-daemon` (pice-core remains async-free per
+# contract criterion #15).
+async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = "3"

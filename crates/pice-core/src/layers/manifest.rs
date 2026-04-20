@@ -8,14 +8,36 @@
 //! Writes are atomic: write to `.tmp` then `std::fs::rename()`.
 
 use crate::adaptive::EscalationEvent;
-use anyhow::{bail, Context, Result};
+use crate::workflow::schema::OnTimeout;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-/// Current schema version. New manifests always use this value; `load()`
-/// rejects anything that doesn't match.
-const SCHEMA_VERSION: &str = "0.2";
+/// Current schema version. New manifests always use this value; `save()`
+/// always writes it. `load()` accepts both [`SCHEMA_VERSION`] and
+/// [`SCHEMA_VERSION_V2`] for backward compatibility (Phase 6 soft-migration);
+/// first `save()` after load upgrades the file on disk to the current version.
+pub const SCHEMA_VERSION: &str = "0.3";
+
+/// Previous (Phase 5) schema version. `load()` accepts manifests with this
+/// value by defaulting `gates = []` (Phase 6 added the review-gate fields).
+/// Any other schema version — including `"0.4"` or `"1.0"` — is rejected
+/// with [`ManifestError::UnsupportedSchema`].
+pub const SCHEMA_VERSION_V2: &str = "0.2";
+
+/// Typed manifest I/O errors. Exposed so callers can `matches!` on specific
+/// variants (e.g., unknown schema version) instead of string-sniffing an
+/// `anyhow::Error` message.
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestError {
+    #[error(
+        "unsupported manifest schema version '{found}' (expected '{expected_current}' or '{expected_prior}')",
+        expected_current = SCHEMA_VERSION,
+        expected_prior = SCHEMA_VERSION_V2,
+    )]
+    UnsupportedSchema { found: String },
+}
 
 // ─── Core types ─────────────────────────────────────────────────────────────
 
@@ -82,17 +104,47 @@ pub struct SeamCheckResult {
     pub details: Option<String>,
 }
 
-/// Approval gate entry. Phase 6 fills these — parsed but unused in Phase 1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Approval gate entry — current state of a review pause for a layer.
+///
+/// Phase 6 ships the real schema. Fields are pinned at gate-request time so
+/// a subsequent workflow edit (e.g., lowering `timeout_hours`) does NOT
+/// retroactively change the expiration of an already-pending gate.
+///
+/// `decision` / `decided_at` remain `None` until the gate is actioned;
+/// `audit_decision_string()` from `pice_core::gate` produces the value.
+///
+/// Serde defaults on new fields preserve forward-compatibility when a
+/// future phase adds optional fields — the struct is internal-only so
+/// `deny_unknown_fields` is intentionally not applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateEntry {
+    /// Stable gate identifier (`{feature_id}:{layer}:{ulid}`), unique in
+    /// both the manifest and the `gate_decisions` audit table.
+    pub id: String,
     pub layer: String,
     pub status: GateStatus,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub triggered_by: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_at: Option<String>,
+    /// The trigger expression that fired (copied from the effective
+    /// `review.trigger` at request time for audit reproducibility).
+    pub trigger_expression: String,
+    /// RFC3339 timestamp for when the gate was created.
+    pub requested_at: String,
+    /// Pinned from `ReviewConfig.timeout_hours` at request time.
+    pub timeout_at: String,
+    /// Pinned from `ReviewConfig.on_timeout` at request time.
+    pub on_timeout_action: OnTimeout,
+    /// Pinned at the first gate for a given `layer` from the effective
+    /// `retry_on_reject`; decremented on each reject-retry. Subsequent
+    /// re-gates for the same layer REUSE this counter rather than
+    /// resetting it — rejecting a layer does not refill the reject budget.
+    pub reject_attempts_remaining: u32,
+    /// The decision string produced by
+    /// `pice_core::gate::GateDecisionOutcome::audit_decision_string()`.
+    /// One of: `approve`, `reject`, `skip`, `timeout_reject`,
+    /// `timeout_approve`, `timeout_skip`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<String>,
 }
 
 // ─── Status enums ───────────────────────────────────────────────────────────
@@ -105,6 +157,10 @@ pub enum ManifestStatus {
     Passed,
     Failed,
     FailedInterrupted,
+    /// Phase 6: at least one layer is in `LayerStatus::PendingReview` and
+    /// the feature cannot advance until a reviewer actions the gate(s).
+    /// Serializes as `"pending-review"`.
+    PendingReview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -115,6 +171,10 @@ pub enum LayerStatus {
     Passed,
     Failed,
     Skipped,
+    /// Phase 6: the layer graded `Passed` but the review trigger fired, so
+    /// the cohort boundary halted waiting for a human decision. Serializes
+    /// as `"pending-review"`.
+    PendingReview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -181,19 +241,69 @@ impl VerificationManifest {
         }
     }
 
-    /// Load a manifest from a JSON file. Rejects `schema_version` != `"0.2"`.
+    /// Load a manifest from a JSON file.
+    ///
+    /// Phase 6 soft-migration: accepts `schema_version` in
+    /// `{SCHEMA_VERSION, SCHEMA_VERSION_V2}`. For v0.2 manifests, gates are
+    /// defaulted to `[]` (pre-Phase-6 features have no review gates). Any
+    /// other version is rejected with a typed
+    /// [`ManifestError::UnsupportedSchema`] so tests can `matches!` on the
+    /// variant instead of string-sniffing the message.
+    ///
+    /// The in-memory `schema_version` is upgraded to [`SCHEMA_VERSION`]
+    /// after a successful 0.2 load; the first subsequent `save()` writes
+    /// the new version to disk.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read manifest from {}", path.display()))?;
-        let mut manifest: Self = serde_json::from_str(&content)
+
+        // Peek at `schema_version` via an untyped parse so we can upgrade
+        // a v0.2 payload (which may lack `gates` entirely or carry pre-Phase-6
+        // shapes) before the strongly-typed deserializer sees it.
+        let mut raw: serde_json::Value = serde_json::from_str(&content)
             .with_context(|| format!("failed to parse manifest from {}", path.display()))?;
-        if manifest.schema_version != SCHEMA_VERSION {
-            bail!(
-                "unsupported manifest schema version '{}' (expected '{}')",
-                manifest.schema_version,
-                SCHEMA_VERSION,
-            );
+        let found_version = raw
+            .get("schema_version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        match found_version.as_str() {
+            v if v == SCHEMA_VERSION => {
+                // Current version — parse as-is.
+            }
+            v if v == SCHEMA_VERSION_V2 => {
+                // Soft migration: strip any legacy gate entries; upgrade
+                // `schema_version` in memory so save() writes the current
+                // version on the next checkpoint.
+                if let Some(obj) = raw.as_object_mut() {
+                    obj.insert("gates".to_string(), serde_json::json!([]));
+                    obj.insert(
+                        "schema_version".to_string(),
+                        serde_json::Value::String(SCHEMA_VERSION.to_string()),
+                    );
+                }
+                tracing::info!(
+                    path = %path.display(),
+                    from = SCHEMA_VERSION_V2,
+                    to = SCHEMA_VERSION,
+                    "upgrading manifest in memory; next save() will write new schema",
+                );
+            }
+            _ => {
+                return Err(ManifestError::UnsupportedSchema {
+                    found: found_version,
+                }
+                .into());
+            }
         }
+
+        let mut manifest: Self = serde_json::from_value(raw).with_context(|| {
+            format!(
+                "failed to parse manifest body from {} (schema {SCHEMA_VERSION})",
+                path.display()
+            )
+        })?;
         // Phase 4.1 Pass-10 Codex MEDIUM #1: defense-in-depth ceiling clamp
         // at the load boundary. The compute path caps `final_confidence`
         // via `cap_confidence()` before writing, but a stale, hand-edited,
@@ -318,10 +428,15 @@ impl VerificationManifest {
     /// Compute `overall_status` from `layers`:
     ///
     /// - If any layer is `Failed` → `Failed`
-    /// - If every layer is `Passed` (or `Skipped`) → `Passed`
+    /// - Else if any layer is `PendingReview` → `PendingReview` (Phase 6)
+    /// - Else if every layer is `Passed` (or `Skipped`) → `Passed`
     /// - Otherwise (some `Pending`/`InProgress`) → `InProgress`
     ///
-    /// An empty `layers` vec is treated as `Pending`.
+    /// An empty `layers` vec is treated as `Pending`. `PendingReview` takes
+    /// precedence over `InProgress` so a feature with a gate waiting on a
+    /// reviewer reports the review state rather than generic in-progress,
+    /// but `Failed` still wins over `PendingReview` — a failed layer halts
+    /// the feature regardless of pending gates.
     pub fn compute_overall_status(&mut self) {
         if self.layers.is_empty() {
             self.overall_status = ManifestStatus::Pending;
@@ -331,6 +446,15 @@ impl VerificationManifest {
         let any_failed = self.layers.iter().any(|l| l.status == LayerStatus::Failed);
         if any_failed {
             self.overall_status = ManifestStatus::Failed;
+            return;
+        }
+
+        let any_pending_review = self
+            .layers
+            .iter()
+            .any(|l| l.status == LayerStatus::PendingReview);
+        if any_pending_review {
+            self.overall_status = ManifestStatus::PendingReview;
             return;
         }
 
@@ -397,17 +521,22 @@ mod tests {
             escalation_events: None,
         });
         manifest.gates.push(GateEntry {
+            id: "feat-123:backend:0000000000000001".to_string(),
             layer: "backend".to_string(),
             status: GateStatus::Approved,
-            triggered_by: Some("cost_threshold".to_string()),
-            timeout_at: None,
-            decision: Some("auto-approved".to_string()),
+            trigger_expression: "layer == backend".to_string(),
+            requested_at: "2026-04-13T10:00:00Z".to_string(),
+            timeout_at: "2026-04-14T10:00:00Z".to_string(),
+            on_timeout_action: OnTimeout::Reject,
+            reject_attempts_remaining: 1,
+            decision: Some("approve".to_string()),
+            decided_at: Some("2026-04-13T10:05:00Z".to_string()),
         });
 
         manifest.save(&path).unwrap();
         let loaded = VerificationManifest::load(&path).unwrap();
 
-        assert_eq!(loaded.schema_version, "0.2");
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
         assert_eq!(loaded.feature_id, "feat-123");
         assert_eq!(loaded.project_root_hash, manifest.project_root_hash);
         assert_eq!(loaded.layers.len(), 1);
@@ -468,6 +597,25 @@ mod tests {
     }
 
     #[test]
+    fn overall_status_pending_review_wins_over_in_progress_but_loses_to_failed() {
+        // Phase 6 precedence rule: PendingReview is surfaced as the
+        // feature-level status so `pice status` can show "⏸ pending
+        // review" instead of a generic "InProgress", but a Failed layer
+        // still halts regardless of any gates in flight.
+        let mut m = VerificationManifest::new("feat-mixed", Path::new("/project"));
+        m.add_layer_result(layer("backend", LayerStatus::Passed));
+        m.add_layer_result(layer("infra", LayerStatus::PendingReview));
+        m.add_layer_result(layer("api", LayerStatus::Pending));
+        m.compute_overall_status();
+        assert_eq!(m.overall_status, ManifestStatus::PendingReview);
+
+        // Failed wins.
+        m.layers[2].status = LayerStatus::Failed;
+        m.compute_overall_status();
+        assert_eq!(m.overall_status, ManifestStatus::Failed);
+    }
+
+    #[test]
     fn overall_status_skipped_layers_count_as_pass() {
         let mut manifest = VerificationManifest::new("feat-skip", Path::new("/project"));
         manifest.add_layer_result(layer("backend", LayerStatus::Passed));
@@ -495,7 +643,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("old.manifest.json");
 
-        // Write a manifest with a wrong schema version directly.
+        // Write a manifest with a wrong schema version directly — `0.1` is
+        // prior to the Phase-6 soft-migration window, so it must be
+        // rejected outright.
         let json = serde_json::json!({
             "schema_version": "0.1",
             "feature_id": "feat-old",
@@ -513,8 +663,8 @@ mod tests {
             "error should mention the bad version, got: {msg}"
         );
         assert!(
-            msg.contains("0.2"),
-            "error should mention the expected version, got: {msg}"
+            msg.contains(SCHEMA_VERSION),
+            "error should mention the expected current version, got: {msg}"
         );
     }
 
@@ -753,6 +903,171 @@ mod tests {
         let path_b =
             VerificationManifest::manifest_path_for("feat", Path::new("/project")).unwrap();
         assert_eq!(path_a, path_b);
+    }
+
+    // ── Phase 6 — soft schema migration + gate-entry round-trip ──────────
+
+    #[test]
+    fn load_accepts_v0_2_manifest_with_empty_gates_default() {
+        // A Phase-5 manifest on disk may omit `gates` entirely OR carry
+        // pre-Phase-6 shapes that wouldn't deserialize into the new
+        // GateEntry. Either way, load() must accept it by defaulting
+        // gates to [] and upgrading the in-memory schema_version.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v02.manifest.json");
+
+        let json = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_V2,
+            "feature_id": "feat-old",
+            "project_root_hash": "abc123",
+            "layers": [],
+            // Pre-Phase-6 manifest includes a legacy gate with fields that
+            // would fail the new struct's deserialization (`triggered_by`,
+            // no `id`, no `trigger_expression`, etc.). Soft-load must
+            // discard it silently.
+            "gates": [{
+                "layer": "backend",
+                "status": "approved",
+                "triggered_by": "tier >= 3",
+                "timeout_at": null,
+                "decision": "auto-approved"
+            }],
+            "overall_status": "pending"
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let loaded = VerificationManifest::load(&path).expect("v0.2 load should succeed");
+        assert_eq!(
+            loaded.schema_version, SCHEMA_VERSION,
+            "in-memory schema_version must upgrade to current"
+        );
+        assert!(
+            loaded.gates.is_empty(),
+            "legacy gates must be discarded on soft-load"
+        );
+        assert_eq!(loaded.feature_id, "feat-old");
+    }
+
+    #[test]
+    fn save_always_writes_v0_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v02.manifest.json");
+
+        // Start from a v0.2 manifest on disk.
+        let json = serde_json::json!({
+            "schema_version": SCHEMA_VERSION_V2,
+            "feature_id": "feat-upgrade",
+            "project_root_hash": "xyz",
+            "layers": [],
+            "gates": [],
+            "overall_status": "pending"
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        // Load + save → file should now carry the current schema_version.
+        let loaded = VerificationManifest::load(&path).unwrap();
+        loaded.save(&path).unwrap();
+
+        let re_read: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            re_read["schema_version"].as_str(),
+            Some(SCHEMA_VERSION),
+            "first save after v0.2 load must upgrade the file to current schema"
+        );
+    }
+
+    #[test]
+    fn schema_version_unknown_rejects_with_named_error() {
+        // Criterion 12 of the Phase-6 contract: unknown versions must
+        // produce a typed `ManifestError::UnsupportedSchema` variant so
+        // tests can `matches!` on it rather than string-sniffing the
+        // anyhow message. Downcasting via anyhow proves the typed variant
+        // is reachable at the boundary.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.manifest.json");
+
+        let json = serde_json::json!({
+            "schema_version": "0.4",
+            "feature_id": "feat-future",
+            "project_root_hash": "abc",
+            "layers": [],
+            "gates": [],
+            "overall_status": "pending"
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let err = VerificationManifest::load(&path).unwrap_err();
+        let typed = err.downcast_ref::<ManifestError>();
+        assert!(
+            matches!(
+                typed,
+                Some(ManifestError::UnsupportedSchema { found }) if found == "0.4"
+            ),
+            "expected ManifestError::UnsupportedSchema {{ found: \"0.4\" }}, got: {typed:?}"
+        );
+    }
+
+    #[test]
+    fn pending_review_status_round_trips() {
+        // New Phase-6 enum variants must serialize/deserialize as
+        // kebab-case — a bare `"pending-review"` wire token without a
+        // discriminator prefix, matching the existing ManifestStatus /
+        // LayerStatus pattern.
+        let manifest_status_json = serde_json::to_string(&ManifestStatus::PendingReview).unwrap();
+        assert_eq!(manifest_status_json, "\"pending-review\"");
+        let back: ManifestStatus = serde_json::from_str("\"pending-review\"").unwrap();
+        assert_eq!(back, ManifestStatus::PendingReview);
+
+        let layer_status_json = serde_json::to_string(&LayerStatus::PendingReview).unwrap();
+        assert_eq!(layer_status_json, "\"pending-review\"");
+        let back: LayerStatus = serde_json::from_str("\"pending-review\"").unwrap();
+        assert_eq!(back, LayerStatus::PendingReview);
+    }
+
+    #[test]
+    fn gate_entry_round_trips_all_phase_6_fields() {
+        let gate = GateEntry {
+            id: "feat-abc:infrastructure:01HM7XQ".to_string(),
+            layer: "infrastructure".to_string(),
+            status: GateStatus::Pending,
+            trigger_expression: "layer == infrastructure".to_string(),
+            requested_at: "2026-04-20T09:00:00Z".to_string(),
+            timeout_at: "2026-04-21T09:00:00Z".to_string(),
+            on_timeout_action: OnTimeout::Reject,
+            reject_attempts_remaining: 1,
+            decision: None,
+            decided_at: None,
+        };
+        let wire = serde_json::to_string(&gate).unwrap();
+        // All required fields must appear on the wire.
+        assert!(wire.contains("\"id\":\"feat-abc:infrastructure:01HM7XQ\""));
+        assert!(wire.contains("\"layer\":\"infrastructure\""));
+        assert!(wire.contains("\"trigger_expression\":\"layer == infrastructure\""));
+        assert!(wire.contains("\"requested_at\":\"2026-04-20T09:00:00Z\""));
+        assert!(wire.contains("\"timeout_at\":\"2026-04-21T09:00:00Z\""));
+        assert!(wire.contains("\"on_timeout_action\":\"reject\""));
+        assert!(wire.contains("\"reject_attempts_remaining\":1"));
+        // Optional fields should be omitted when None.
+        assert!(
+            !wire.contains("\"decision\""),
+            "None decision must be omitted: {wire}"
+        );
+        assert!(
+            !wire.contains("\"decided_at\""),
+            "None decided_at must be omitted: {wire}"
+        );
+
+        // Populated decision/decided_at roundtrip.
+        let decided = GateEntry {
+            decision: Some("approve".to_string()),
+            decided_at: Some("2026-04-20T09:05:00Z".to_string()),
+            status: GateStatus::Approved,
+            ..gate.clone()
+        };
+        let wire = serde_json::to_string(&decided).unwrap();
+        let back: GateEntry = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, decided);
     }
 
     #[test]
