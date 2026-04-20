@@ -123,6 +123,15 @@ All of these go through the daemon. The CLI is an adapter, not a participant.
 - **Streaming handlers MUST gate on `!req.json`**: never install `streaming_handler()` or use `to_shared_sink()` when JSON mode is active. Stream chunks on stdout corrupt the JSON response.
 - Capture handlers (commit, handoff) that use `run_session_and_capture()` should use `NullSink` as the shared sink in JSON mode.
 
+## Channel ownership invariant (Phase 6+)
+
+**Interactive prompt text is CLI-owned and written to stderr**; daemon-emitted streaming text and normal command output go to stdout (unchanged). This preserves the stdout-as-JSON invariant in `--json` mode and lets `DecisionSource` implementations write prompts without branching on `req.json`.
+
+Concrete consequences:
+- The review-gate TTY prompt (`crates/pice-cli/src/input/decision_source.rs::TtyDecisionSource`) writes the box-drawing prompt to a `Write` writer that the caller wires to `std::io::stderr()`. The daemon never sees or emits prompt bytes.
+- `pice evaluate` in TTY mode on a pending-review response prints the prompt to stderr via `DecisionSource` and continues writing the evaluate summary to stdout. A concurrent `pice evaluate --json` run is therefore parseable — any text on stderr is non-contaminating.
+- The daemon's `ReviewGate::Decide` handler NEVER reads environment variables for the reviewer name. `ReviewGateSubcommand::Decide.reviewer` is resolved CLI-side (`$USER` / `$USERNAME` / `unknown` fallback) and threaded through the RPC.
+
 ## Structured JSON failure responses
 
 `CommandResponse` has two exit variants. They are NOT interchangeable:

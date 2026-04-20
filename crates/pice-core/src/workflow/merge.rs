@@ -372,6 +372,31 @@ fn merge_layer_override_fields(
         }
         base.trigger = overlay.trigger.clone();
     }
+
+    // Phase 6: per-layer retry_on_reject is RAISE-ONLY.
+    //
+    // Layer floor resolution mirrors the other raise-only fields
+    // (tier, min_confidence): if the project explicitly set
+    // `layer_overrides.<layer>.retry_on_reject`, that IS the floor;
+    // otherwise fall back to the project-level `review.retry_on_reject`.
+    // A fresh per-layer user override that undercuts EITHER surface is a
+    // floor violation — this prevents laundering a lower reviewer budget
+    // through a layer override that the project never defined.
+    if let Some(o_rr) = overlay.retry_on_reject {
+        let layer_project_floor = project_layer.retry_on_reject;
+        let global_project_floor = project_review.map(|r| r.retry_on_reject).unwrap_or(0);
+        let floor = layer_project_floor.unwrap_or(global_project_floor);
+        if o_rr < floor {
+            violations.push(FloorViolation {
+                field: format!("layer_overrides.{layer}.retry_on_reject"),
+                project: floor.to_string(),
+                user: o_rr.to_string(),
+                reason: "retry_on_reject may only be raised",
+            });
+        } else {
+            base.retry_on_reject = Some(o_rr);
+        }
+    }
 }
 
 fn merge_review(
@@ -438,6 +463,24 @@ fn merge_review(
             b.timeout_hours = overlay.timeout_hours;
             b.on_timeout = overlay.on_timeout;
             b.notification = overlay.notification.clone();
+
+            // Phase 6: retry_on_reject is a RAISE-ONLY floor — a user
+            // overlay may grant reviewers more retries but never fewer
+            // than the project committed to. Rationale: the project
+            // baseline is the minimum review opportunity the team has
+            // agreed reviewers need before the feature halts; a local
+            // override that lowers it would silently shrink the
+            // reviewer's decision budget.
+            if overlay.retry_on_reject < b.retry_on_reject {
+                violations.push(FloorViolation {
+                    field: "review.retry_on_reject".into(),
+                    project: b.retry_on_reject.to_string(),
+                    user: overlay.retry_on_reject.to_string(),
+                    reason: "retry_on_reject may only be raised",
+                });
+            } else {
+                b.retry_on_reject = overlay.retry_on_reject;
+            }
         }
     }
 }
@@ -666,6 +709,7 @@ mod tests {
             timeout_hours: 24,
             on_timeout: OnTimeout::Reject,
             notification: "stdout".into(),
+            retry_on_reject: 0,
         });
         let mut u = overlay_from(&b);
         u.review = Some(ReviewConfig {
@@ -1402,5 +1446,95 @@ mod tests {
         u.defaults.min_confidence = 0.99;
         let merged = merge_with_floor(base(), u).unwrap();
         assert!((merged.defaults.min_confidence - 0.99).abs() < 1e-9);
+    }
+
+    // ── Phase 6 — retry_on_reject floor semantics ─────────────────────
+
+    /// Helper: build a base workflow with a project-committed
+    /// `review.retry_on_reject`.
+    fn base_with_retry(retry: u32) -> WorkflowConfig {
+        let mut b = base();
+        b.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("layer == infrastructure".to_string()),
+            timeout_hours: 24,
+            on_timeout: OnTimeout::Reject,
+            notification: "stdout".to_string(),
+            retry_on_reject: retry,
+        });
+        b
+    }
+
+    #[test]
+    fn retry_on_reject_user_lower_rejected() {
+        // Project committed to 2 retries; a local overlay lowering to 0
+        // would shrink reviewer budget — floor violation.
+        let base = base_with_retry(2);
+        let mut u = overlay_from(&base);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("layer == infrastructure".to_string()),
+            timeout_hours: 24,
+            on_timeout: OnTimeout::Reject,
+            notification: "stdout".to_string(),
+            retry_on_reject: 0,
+        });
+        let err = merge_with_floor(base, u).unwrap_err().to_string();
+        assert!(
+            err.contains("retry_on_reject"),
+            "err should surface the violating field: {err}"
+        );
+    }
+
+    #[test]
+    fn retry_on_reject_user_higher_allowed() {
+        // Project committed to 1 retry; user grants 3. Raising is the
+        // only allowed direction, so the merge succeeds and the user
+        // value wins.
+        let base = base_with_retry(1);
+        let mut u = overlay_from(&base);
+        u.review = Some(ReviewConfig {
+            enabled: true,
+            trigger: Some("layer == infrastructure".to_string()),
+            timeout_hours: 24,
+            on_timeout: OnTimeout::Reject,
+            notification: "stdout".to_string(),
+            retry_on_reject: 3,
+        });
+        let merged = merge_with_floor(base, u).unwrap();
+        assert_eq!(merged.review.unwrap().retry_on_reject, 3);
+    }
+
+    #[test]
+    fn layer_override_retry_on_reject_floor_matches_project() {
+        // Layer-level raise-only rule: project requires 2 at the layer
+        // level; user lowering to 1 for that layer is a violation.
+        // Project-level fallback is lower (0), but the layer-level
+        // commitment wins — matches the tier / min_confidence pattern.
+        let mut base = base_with_retry(0);
+        let layer_override = LayerOverride {
+            retry_on_reject: Some(2),
+            ..LayerOverride::default()
+        };
+        base.layer_overrides
+            .insert("infrastructure".to_string(), layer_override);
+
+        let mut u = overlay_from(&base);
+        let user_layer = LayerOverride {
+            retry_on_reject: Some(1),
+            ..LayerOverride::default()
+        };
+        u.layer_overrides
+            .insert("infrastructure".to_string(), user_layer);
+
+        let err = merge_with_floor(base, u).unwrap_err().to_string();
+        assert!(
+            err.contains("layer_overrides.infrastructure.retry_on_reject"),
+            "err should name the layer-level field: {err}"
+        );
+        assert!(
+            err.contains("2"),
+            "err should cite the project floor (2): {err}"
+        );
     }
 }

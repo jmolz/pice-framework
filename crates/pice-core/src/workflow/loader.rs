@@ -275,6 +275,7 @@ phases:
                 require_review: Some(true),
                 trigger: Some("confidence < 0.95".into()),
                 adaptive_algorithm: Some(AdaptiveAlgo::None),
+                retry_on_reject: Some(2),
             },
         );
 
@@ -340,6 +341,7 @@ phases:
                 timeout_hours: 48,
                 on_timeout: OnTimeout::Reject,
                 notification: "stdout".into(),
+                retry_on_reject: 1,
             }),
             seams: Some(seams),
         };

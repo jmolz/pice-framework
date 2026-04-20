@@ -1172,4 +1172,325 @@ mod tests {
             TASKS * CALLS_PER_TASK
         );
     }
+
+    // ── Phase 6 — gate_decisions writer + reader tests ────────────────
+
+    fn sample_row<'a>() -> GateDecisionRow<'a> {
+        GateDecisionRow {
+            gate_id: "g1",
+            feature_id: "feat",
+            layer: "infra",
+            trigger_expression: "layer == infra",
+            decision: "approve",
+            reviewer: Some("jacob"),
+            reason: None,
+            requested_at: "2026-04-20T00:00:00Z",
+            decided_at: "2026-04-20T00:05:00Z",
+            elapsed_seconds: 300,
+        }
+    }
+
+    #[test]
+    fn insert_gate_decision_roundtrip() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        let id = insert_gate_decision(&db, &sample_row()).unwrap();
+        assert!(id > 0);
+
+        let rows = query_gate_decisions(&db, &GateDecisionsFilter::default()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r.gate_id, "g1");
+        assert_eq!(r.feature_id, "feat");
+        assert_eq!(r.decision, "approve");
+        assert_eq!(r.reviewer.as_deref(), Some("jacob"));
+        assert_eq!(r.elapsed_seconds, 300);
+    }
+
+    #[test]
+    fn insert_gate_decision_duplicate_surfaces_as_gate_conflict() {
+        // Second insert on the same gate_id must hit the UNIQUE
+        // constraint and return `GateInsertError::DuplicateGateId` —
+        // the ReviewGate::Decide handler relies on this to produce
+        // `ExitJsonStatus::ReviewGateConflict` without inspecting
+        // SQLite error strings.
+        let db = MetricsDb::open_in_memory().unwrap();
+        insert_gate_decision(&db, &sample_row()).unwrap();
+        let err = insert_gate_decision(&db, &sample_row()).unwrap_err();
+        assert!(matches!(
+            err,
+            GateInsertError::DuplicateGateId { ref gate_id } if gate_id == "g1"
+        ));
+    }
+
+    #[test]
+    fn query_gate_decisions_filters_by_feature() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        insert_gate_decision(
+            &db,
+            &GateDecisionRow {
+                gate_id: "g1",
+                ..sample_row()
+            },
+        )
+        .unwrap();
+        insert_gate_decision(
+            &db,
+            &GateDecisionRow {
+                gate_id: "g2",
+                feature_id: "other",
+                ..sample_row()
+            },
+        )
+        .unwrap();
+
+        let rows = query_gate_decisions(
+            &db,
+            &GateDecisionsFilter {
+                feature_id: Some("feat".to_string()),
+                ..GateDecisionsFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].feature_id, "feat");
+    }
+
+    #[test]
+    fn query_gate_decisions_filters_by_since() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        insert_gate_decision(
+            &db,
+            &GateDecisionRow {
+                gate_id: "g1",
+                requested_at: "2026-01-01T00:00:00Z",
+                ..sample_row()
+            },
+        )
+        .unwrap();
+        insert_gate_decision(
+            &db,
+            &GateDecisionRow {
+                gate_id: "g2",
+                requested_at: "2026-04-01T00:00:00Z",
+                ..sample_row()
+            },
+        )
+        .unwrap();
+
+        let rows = query_gate_decisions(
+            &db,
+            &GateDecisionsFilter {
+                since: Some("2026-03-01T00:00:00Z".to_string()),
+                ..GateDecisionsFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].gate_id, "g2");
+    }
+
+    #[test]
+    fn query_gate_decisions_orders_by_requested_at_ascending() {
+        // Ascending order is deterministic for CSV output. A later
+        // phase may add a `--reverse` flag; the default orientation
+        // must stay stable.
+        let db = MetricsDb::open_in_memory().unwrap();
+        insert_gate_decision(
+            &db,
+            &GateDecisionRow {
+                gate_id: "late",
+                requested_at: "2026-05-01T00:00:00Z",
+                ..sample_row()
+            },
+        )
+        .unwrap();
+        insert_gate_decision(
+            &db,
+            &GateDecisionRow {
+                gate_id: "early",
+                requested_at: "2026-01-01T00:00:00Z",
+                ..sample_row()
+            },
+        )
+        .unwrap();
+        let rows = query_gate_decisions(&db, &GateDecisionsFilter::default()).unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.gate_id.as_str()).collect::<Vec<_>>(),
+            vec!["early", "late"]
+        );
+    }
+}
+
+// ─── Phase 6: gate_decisions writer + reader helpers ──────────────────────
+//
+// Mirror the `insert_seam_finding` pattern: a `Row<'a>` struct for
+// writes + a records struct for reads. The writer returns a typed
+// `GateInsertError` so the `ReviewGate::Decide` handler can map the
+// UNIQUE-violation branch onto `ExitJsonStatus::ReviewGateConflict`
+// without string-sniffing SQLite error messages.
+
+/// Params for a single `gate_decisions` row insert. Borrow-by-reference
+/// so the caller doesn't have to clone RFC3339 strings.
+#[derive(Debug, Clone)]
+pub struct GateDecisionRow<'a> {
+    pub gate_id: &'a str,
+    pub feature_id: &'a str,
+    pub layer: &'a str,
+    pub trigger_expression: &'a str,
+    pub decision: &'a str,
+    pub reviewer: Option<&'a str>,
+    pub reason: Option<&'a str>,
+    pub requested_at: &'a str,
+    pub decided_at: &'a str,
+    pub elapsed_seconds: i64,
+}
+
+/// Read-side row shape for `query_gate_decisions`. Owned strings so the
+/// caller can drop the `MetricsDb` handle after the query returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateDecisionRecord {
+    pub id: i64,
+    pub gate_id: String,
+    pub feature_id: String,
+    pub layer: String,
+    pub trigger_expression: String,
+    pub decision: String,
+    pub reviewer: Option<String>,
+    pub reason: Option<String>,
+    pub requested_at: String,
+    pub decided_at: String,
+    pub elapsed_seconds: i64,
+}
+
+/// Filter spec for `query_gate_decisions`. All fields are optional; an
+/// empty filter returns every row.
+#[derive(Debug, Clone, Default)]
+pub struct GateDecisionsFilter {
+    pub feature_id: Option<String>,
+    /// Lower bound on `requested_at` (RFC3339). Inclusive.
+    pub since: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// Typed error for `insert_gate_decision`. The handler downcasts to
+/// map `DuplicateGateId` → `ExitJsonStatus::ReviewGateConflict`;
+/// everything else bubbles as a generic `MetricsPersistFailed`.
+#[derive(Debug, thiserror::Error)]
+pub enum GateInsertError {
+    #[error("gate_id '{gate_id}' already has a decision row")]
+    DuplicateGateId { gate_id: String },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
+
+/// Insert a gate_decisions row. The `UNIQUE(gate_id)` constraint turns
+/// a concurrent double-decide into a typed `DuplicateGateId` error at
+/// the first SQLite call — no in-process CAS needed.
+pub fn insert_gate_decision(
+    db: &MetricsDb,
+    row: &GateDecisionRow<'_>,
+) -> std::result::Result<i64, GateInsertError> {
+    let result = db.conn().execute(
+        "INSERT INTO gate_decisions (gate_id, feature_id, layer, trigger_expression, \
+         decision, reviewer, reason, requested_at, decided_at, elapsed_seconds) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            row.gate_id,
+            row.feature_id,
+            row.layer,
+            row.trigger_expression,
+            row.decision,
+            row.reviewer,
+            row.reason,
+            row.requested_at,
+            row.decided_at,
+            row.elapsed_seconds,
+        ],
+    );
+    match result {
+        Ok(_) => Ok(db.conn().last_insert_rowid()),
+        Err(e) if is_gate_id_unique_violation(&e) => Err(GateInsertError::DuplicateGateId {
+            gate_id: row.gate_id.to_string(),
+        }),
+        Err(e) => Err(GateInsertError::Other(
+            anyhow::Error::new(e).context("failed to insert gate decision"),
+        )),
+    }
+}
+
+/// Query helpers share the UNIQUE-violation classifier so downstream
+/// callers can't regress by inlining their own `e.to_string().contains(...)`.
+fn is_gate_id_unique_violation(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(
+            libsqlite3_sys::Error {
+                code: libsqlite3_sys::ErrorCode::ConstraintViolation,
+                ..
+            },
+            Some(msg),
+        ) if msg.contains("gate_decisions.gate_id")
+    )
+}
+
+use rusqlite::ffi as libsqlite3_sys;
+
+/// Read `gate_decisions` rows matching the filter, ordered by
+/// `requested_at` ascending for deterministic CSV output. Passes the
+/// LIMIT clause through `LIMIT ?`; an omitted limit defaults to a
+/// large sentinel so the code path is uniform.
+pub fn query_gate_decisions(
+    db: &MetricsDb,
+    filter: &GateDecisionsFilter,
+) -> Result<Vec<GateDecisionRecord>> {
+    // Build the WHERE clause dynamically but with placeholder bind
+    // positions — all user input flows through `?N` params, never
+    // string-interpolated.
+    let mut sql = String::from(
+        "SELECT id, gate_id, feature_id, layer, trigger_expression, decision, \
+         reviewer, reason, requested_at, decided_at, elapsed_seconds \
+         FROM gate_decisions WHERE 1=1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(fid) = &filter.feature_id {
+        sql.push_str(" AND feature_id = ?");
+        params.push(Box::new(fid.clone()));
+    }
+    if let Some(since) = &filter.since {
+        sql.push_str(" AND requested_at >= ?");
+        params.push(Box::new(since.clone()));
+    }
+    sql.push_str(" ORDER BY requested_at ASC");
+    if let Some(limit) = filter.limit {
+        sql.push_str(" LIMIT ?");
+        params.push(Box::new(limit));
+    }
+
+    let conn = db.conn();
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("failed to prepare gate_decisions query")?;
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| &**b).collect();
+    let rows = stmt
+        .query_map(param_refs.as_slice(), |row| {
+            Ok(GateDecisionRecord {
+                id: row.get(0)?,
+                gate_id: row.get(1)?,
+                feature_id: row.get(2)?,
+                layer: row.get(3)?,
+                trigger_expression: row.get(4)?,
+                decision: row.get(5)?,
+                reviewer: row.get(6)?,
+                reason: row.get(7)?,
+                requested_at: row.get(8)?,
+                decided_at: row.get(9)?,
+                elapsed_seconds: row.get(10)?,
+            })
+        })
+        .context("failed to query gate_decisions")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("failed to read gate_decisions row")?);
+    }
+    Ok(out)
 }

@@ -60,8 +60,19 @@ pub async fn run(
                         // Phase 4: surface per-layer adaptive fields when a
                         // verification manifest exists for this plan. Best-effort:
                         // a missing or malformed manifest is silently skipped.
-                        if let Some(layers_json) = load_layer_snapshot(&path, project_root) {
-                            info["layers"] = layers_json;
+                        if let Some(snapshot) = load_manifest_snapshot(&path, project_root) {
+                            if let Some(layers) = snapshot.layers {
+                                info["layers"] = layers;
+                            }
+                            // Phase 6: surface pending gates so the
+                            // CLI can advise the user to run
+                            // `pice review-gate --list`.
+                            if !snapshot.gates.is_empty() {
+                                info["gates"] = serde_json::Value::Array(snapshot.gates);
+                            }
+                            if let Some(ms) = snapshot.overall_status {
+                                info["overall_status"] = serde_json::Value::String(ms);
+                            }
                         }
 
                         info
@@ -152,6 +163,17 @@ pub async fn run(
                 // has adaptive fields populated.
                 if let Some(layers) = plan.get("layers").and_then(|v| v.as_array()) {
                     render_adaptive_layer_block(&mut output, layers);
+                    // Phase 6: surface pending-review layers with a
+                    // prominent line so reviewers know to run
+                    // `pice review-gate`. This complements the
+                    // compact adaptive block above.
+                    for layer in layers {
+                        let status = layer.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        if status == "pending-review" {
+                            let name = layer.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                            output.push_str(&format!("  ⏸ pending review: {name}\n"));
+                        }
+                    }
                 }
             }
         }
@@ -160,16 +182,29 @@ pub async fn run(
     }
 }
 
-/// Attempt to load the verification manifest for a plan file and extract
-/// the per-layer adaptive snapshot used by `pice status`.
+/// The subset of a verification manifest that `pice status` surfaces.
 ///
-/// Returns `None` when the manifest does not exist, fails to read, or fails
-/// to parse — `pice status` must remain best-effort regardless of manifest
-/// state.
-fn load_layer_snapshot(
+/// Split out from the flat `Value` return that Phase 4 used so Phase 6
+/// can carry the pending-gates list + overall-status alongside the
+/// per-layer adaptive fields without overloading the JSON shape. A
+/// `None` on any field means "nothing to report" and the handler
+/// skips emitting it.
+struct StatusManifestSnapshot {
+    layers: Option<Value>,
+    gates: Vec<Value>,
+    overall_status: Option<String>,
+}
+
+/// Attempt to load the verification manifest for a plan file and extract
+/// the status-report snapshot.
+///
+/// Returns `None` when the manifest does not exist, fails to read, or
+/// fails to parse — `pice status` must remain best-effort regardless
+/// of manifest state.
+fn load_manifest_snapshot(
     plan_path: &std::path::Path,
     project_root: &std::path::Path,
-) -> Option<Value> {
+) -> Option<StatusManifestSnapshot> {
     let feature_id = plan_path.file_stem().and_then(|s| s.to_str())?;
     let manifest_path = VerificationManifest::manifest_path_for(feature_id, project_root).ok()?;
     if !manifest_path.exists() {
@@ -210,7 +245,37 @@ fn load_layer_snapshot(
             layer_json
         })
         .collect();
-    Some(Value::Array(layers))
+
+    // Phase 6: surface pending gates so the dashboard + JSON consumers
+    // can enumerate them without a separate review-gate/list RPC.
+    // Filter to Pending status — decided gates are historical and live
+    // in the `gate_decisions` audit table, not the live manifest.
+    let gates: Vec<Value> = manifest
+        .gates
+        .iter()
+        .filter(|g| g.status == pice_core::layers::manifest::GateStatus::Pending)
+        .map(|g| {
+            json!({
+                "id": g.id,
+                "layer": g.layer,
+                "trigger_expression": g.trigger_expression,
+                "timeout_at": g.timeout_at,
+            })
+        })
+        .collect();
+
+    // Serialize ManifestStatus via serde so the kebab-case wire form
+    // is used — callers check for `"pending-review"` against this
+    // exact string.
+    let overall_status = serde_json::to_value(&manifest.overall_status)
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+
+    Some(StatusManifestSnapshot {
+        layers: Some(Value::Array(layers)),
+        gates,
+        overall_status,
+    })
 }
 
 /// Render a per-layer adaptive block beneath a plan row in text mode.
@@ -392,7 +457,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
         let project_root = tmp.path();
         let plan_path = project_root.join(".claude/plans/feature-x.md");
-        let got = load_layer_snapshot(&plan_path, project_root);
+        let got = load_manifest_snapshot(&plan_path, project_root);
         assert!(got.is_none());
     }
 
@@ -405,8 +470,13 @@ mod tests {
         setup_manifest_at("feature-x", project_root, adaptive_layer_fixture());
 
         let plan_path = project_root.join(".claude/plans/feature-x.md");
-        let got = load_layer_snapshot(&plan_path, project_root).expect("manifest loaded");
-        let layers = got.as_array().expect("array");
+        let snapshot = load_manifest_snapshot(&plan_path, project_root).expect("manifest loaded");
+        let layers = snapshot
+            .layers
+            .as_ref()
+            .expect("layers")
+            .as_array()
+            .expect("array");
         assert_eq!(layers.len(), 2);
 
         // Adaptive layer carries all adaptive fields.
@@ -427,6 +497,71 @@ mod tests {
         assert!(legacy.get("final_confidence").is_none());
         assert!(legacy.get("total_cost_usd").is_none());
         assert!(legacy.get("escalation_events").is_none());
+
+        // Phase 6: gates list should be empty for this fixture (no
+        // PendingReview gates), and overall status passed through.
+        assert!(snapshot.gates.is_empty());
+        assert_eq!(snapshot.overall_status.as_deref(), Some("in-progress"));
+    }
+
+    /// Phase 6 Task 13: pending gates in the manifest surface under
+    /// `snapshot.gates`. The status handler JSON output maps this to a
+    /// top-level `gates: [{id, layer, trigger_expression, timeout_at}]`
+    /// field.
+    #[test]
+    fn load_layer_snapshot_surfaces_pending_gates() {
+        use pice_core::layers::manifest::{GateEntry, GateStatus};
+        use pice_core::workflow::schema::OnTimeout;
+
+        let _g = home_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+        let project_root = tmp.path();
+
+        // Build manifest with a PendingReview layer + its gate.
+        let path = VerificationManifest::manifest_path_for("feature-gated", project_root).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut manifest = VerificationManifest::new("feature-gated", project_root);
+        manifest.layers.push(LayerResult {
+            name: "infrastructure".to_string(),
+            status: LayerStatus::PendingReview,
+            passes: vec![],
+            seam_checks: vec![],
+            halted_by: None,
+            final_confidence: None,
+            total_cost_usd: None,
+            escalation_events: None,
+        });
+        manifest.gates.push(GateEntry {
+            id: "feature-gated:infrastructure:01".to_string(),
+            layer: "infrastructure".to_string(),
+            status: GateStatus::Pending,
+            trigger_expression: "layer == infrastructure".to_string(),
+            requested_at: "2026-04-20T09:00:00Z".to_string(),
+            timeout_at: "2026-04-21T09:00:00Z".to_string(),
+            on_timeout_action: OnTimeout::Reject,
+            reject_attempts_remaining: 1,
+            decision: None,
+            decided_at: None,
+        });
+        manifest.compute_overall_status();
+        manifest.save(&path).unwrap();
+
+        let plan_path = project_root.join(".claude/plans/feature-gated.md");
+        let snapshot = load_manifest_snapshot(&plan_path, project_root).expect("manifest loaded");
+        assert_eq!(snapshot.gates.len(), 1);
+        assert_eq!(snapshot.gates[0]["id"], "feature-gated:infrastructure:01");
+        assert_eq!(snapshot.gates[0]["layer"], "infrastructure");
+        assert_eq!(snapshot.overall_status.as_deref(), Some("pending-review"));
+
+        // Decided gates (non-Pending) must NOT surface — they live in
+        // the audit trail, not the live-blocking list.
+        let mut manifest2 = manifest.clone();
+        manifest2.gates[0].status = GateStatus::Approved;
+        manifest2.gates[0].decision = Some("approve".to_string());
+        manifest2.save(&path).unwrap();
+        let snapshot2 = load_manifest_snapshot(&plan_path, project_root).expect("reload");
+        assert!(snapshot2.gates.is_empty());
     }
 
     #[test]

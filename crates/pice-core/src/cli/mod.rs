@@ -43,6 +43,15 @@ pub enum CommandRequest {
     Benchmark(BenchmarkRequest),
     Layers(LayersRequest),
     Validate(ValidateRequest),
+    /// Phase 6: list pending review gates or record a reviewer decision.
+    /// Subcommand-dispatched so the CLI binds `pice review-gate --list`
+    /// and `pice review-gate --gate-id … --decision …` to different
+    /// fields without requiring two RPC method names.
+    ReviewGate(ReviewGateRequest),
+    /// Phase 6: export the `gate_decisions` audit trail (CSV / JSON).
+    /// First subcommand is `Gates`; additional audit surfaces (e.g.,
+    /// `Seams`) can extend the enum without a new RPC variant.
+    Audit(AuditRequest),
     // NOTE: Completions is handled entirely by clap at the CLI layer.
     // NOTE: Daemon subcommand (start/stop/etc.) is also CLI-only.
 }
@@ -408,6 +417,123 @@ pub struct ValidateRequest {
     pub json: bool,
     #[serde(default)]
     pub check_models: bool,
+}
+
+// ─── Phase 6: review-gate + audit request / response DTOs ───────────────────
+
+/// Top-level wire struct for `pice review-gate` commands. Mirrors the
+/// [`LayersRequest`] pattern: the subcommand discriminates list vs
+/// decide so one RPC variant serves both CLI entry points.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGateRequest {
+    pub subcommand: ReviewGateSubcommand,
+    pub json: bool,
+}
+
+/// `action`-tagged review-gate subcommand enum. `list` returns every
+/// pending gate (optionally filtered to a feature); `decide` records a
+/// reviewer's approve/reject/skip against a specific gate id.
+///
+/// `reviewer` is the caller's resolved username (`$USER` / `$USERNAME`
+/// on the CLI side, never read from process env by the daemon) so the
+/// audit trail attributes every decision to a human or a CI bot name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ReviewGateSubcommand {
+    List {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feature_id: Option<String>,
+    },
+    Decide {
+        gate_id: String,
+        decision: crate::gate::GateDecision,
+        reviewer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+/// Response DTO for `ReviewGateSubcommand::List`. A cross-feature
+/// snapshot so `pice review-gate --list` can enumerate every gate
+/// blocking the user without per-feature RPC round-trips.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateListResponse {
+    pub gates: Vec<GateListEntry>,
+}
+
+/// Flattened view of a pending gate for the list RPC. Distinct from
+/// [`crate::layers::manifest::GateEntry`] because the list surfaces
+/// CROSS-feature data (it includes `feature_id`) while the manifest
+/// gate is always scoped to its owning feature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateListEntry {
+    pub id: String,
+    pub feature_id: String,
+    pub layer: String,
+    pub trigger_expression: String,
+    pub requested_at: String,
+    pub timeout_at: String,
+    pub reject_attempts_remaining: u32,
+}
+
+/// Response DTO for `ReviewGateSubcommand::Decide`. Includes the
+/// remaining `pending_gates` on the feature so a TTY-driven prompt
+/// loop on the CLI side can surface "2 of 3 gates decided" without an
+/// extra `List` round-trip — this closes the Claude Cycle-2 multi-gate
+/// race finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GateDecideResponse {
+    /// The audit-decision string (one of `approve`, `reject`, `skip`,
+    /// `timeout_reject`, `timeout_approve`, `timeout_skip`). Distinct
+    /// from the requested `decision` because a timeout prelude may
+    /// have fired first — the response returns the outcome that
+    /// actually landed.
+    pub decision: String,
+    pub layer_status: crate::layers::manifest::LayerStatus,
+    pub manifest_status: crate::layers::manifest::ManifestStatus,
+    pub reject_attempts_remaining: u32,
+    /// Remaining gates on the same feature that still need a decision
+    /// after this one. Empty vec → the CLI loop can now re-invoke
+    /// `pice evaluate` to resume the cohort loop.
+    pub pending_gates: Vec<crate::layers::manifest::GateEntry>,
+    /// SQLite `gate_decisions.id` of the audit row inserted by this
+    /// decision. Operationally useful for linking dashboard events to
+    /// the audit trail without a SELECT scan.
+    pub audit_id: i64,
+}
+
+/// Top-level wire struct for `pice audit`. First subcommand is
+/// `Gates`; future audit surfaces (seam findings, cost events) add
+/// variants without needing a new RPC method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRequest {
+    pub subcommand: AuditSubcommand,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AuditSubcommand {
+    Gates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feature_id: Option<String>,
+        /// RFC3339 lower bound on `requested_at`. Stored as a string
+        /// (not `DateTime<Utc>`) so the CLI can pass `--since 2026-04-20T00:00:00Z`
+        /// directly without parsing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        /// CSV vs JSON output — orthogonal to the `json` field on
+        /// [`AuditRequest`] because `--csv` and `--json` are mutually
+        /// exclusive human/machine format knobs, not "human vs RPC"
+        /// shapes. Both flags suppress human-friendly `println!`.
+        #[serde(default)]
+        csv: bool,
+    },
 }
 
 #[cfg(test)]
@@ -900,6 +1026,149 @@ mod tests {
                  extending the surface requires explicit CLI conventions update"
             );
         }
+    }
+
+    // ── Phase 6: review-gate + audit RPC roundtrips ──────────────────
+
+    #[test]
+    fn review_gate_list_request_roundtrip() {
+        let req = CommandRequest::ReviewGate(ReviewGateRequest {
+            subcommand: ReviewGateSubcommand::List {
+                feature_id: Some("feat-abc".to_string()),
+            },
+            json: true,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"command\":\"review-gate\""));
+        assert!(wire.contains("\"action\":\"list\""));
+        assert!(wire.contains("\"feature_id\":\"feat-abc\""));
+        let parsed: CommandRequest = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandRequest::ReviewGate(r) => {
+                assert!(r.json);
+                match r.subcommand {
+                    ReviewGateSubcommand::List { feature_id } => {
+                        assert_eq!(feature_id.as_deref(), Some("feat-abc"));
+                    }
+                    _ => panic!("expected List subcommand"),
+                }
+            }
+            _ => panic!("expected ReviewGate variant"),
+        }
+    }
+
+    #[test]
+    fn review_gate_decide_request_roundtrip() {
+        let req = CommandRequest::ReviewGate(ReviewGateRequest {
+            subcommand: ReviewGateSubcommand::Decide {
+                gate_id: "feat:infra:01".to_string(),
+                decision: crate::gate::GateDecision::Reject,
+                reviewer: "jacob".to_string(),
+                reason: Some("blocked on staging deploy".to_string()),
+            },
+            json: false,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"action\":\"decide\""));
+        assert!(wire.contains("\"decision\":\"reject\""));
+        assert!(wire.contains("\"reviewer\":\"jacob\""));
+        let parsed: CommandRequest = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandRequest::ReviewGate(r) => match r.subcommand {
+                ReviewGateSubcommand::Decide {
+                    gate_id,
+                    decision,
+                    reviewer,
+                    reason,
+                } => {
+                    assert_eq!(gate_id, "feat:infra:01");
+                    assert_eq!(decision, crate::gate::GateDecision::Reject);
+                    assert_eq!(reviewer, "jacob");
+                    assert_eq!(reason.as_deref(), Some("blocked on staging deploy"));
+                }
+                _ => panic!("expected Decide"),
+            },
+            _ => panic!("expected ReviewGate"),
+        }
+    }
+
+    #[test]
+    fn audit_gates_request_roundtrip() {
+        let req = CommandRequest::Audit(AuditRequest {
+            subcommand: AuditSubcommand::Gates {
+                feature_id: None,
+                since: Some("2026-04-01T00:00:00Z".to_string()),
+                csv: true,
+            },
+            json: false,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"command\":\"audit\""));
+        assert!(wire.contains("\"action\":\"gates\""));
+        assert!(wire.contains("\"csv\":true"));
+        let parsed: CommandRequest = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandRequest::Audit(r) => match r.subcommand {
+                AuditSubcommand::Gates {
+                    feature_id,
+                    since,
+                    csv,
+                } => {
+                    assert!(feature_id.is_none());
+                    assert_eq!(since.as_deref(), Some("2026-04-01T00:00:00Z"));
+                    assert!(csv);
+                }
+            },
+            _ => panic!("expected Audit"),
+        }
+    }
+
+    #[test]
+    fn gate_list_response_roundtrip() {
+        let resp = GateListResponse {
+            gates: vec![GateListEntry {
+                id: "feat:infra:01".to_string(),
+                feature_id: "feat".to_string(),
+                layer: "infra".to_string(),
+                trigger_expression: "always".to_string(),
+                requested_at: "2026-04-20T00:00:00Z".to_string(),
+                timeout_at: "2026-04-21T00:00:00Z".to_string(),
+                reject_attempts_remaining: 1,
+            }],
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        let back: GateListResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn gate_decide_response_roundtrip() {
+        use crate::layers::manifest::{LayerStatus, ManifestStatus};
+        let resp = GateDecideResponse {
+            decision: "approve".to_string(),
+            layer_status: LayerStatus::Passed,
+            manifest_status: ManifestStatus::InProgress,
+            reject_attempts_remaining: 2,
+            pending_gates: vec![],
+            audit_id: 42,
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        assert!(wire.contains("\"layer_status\":\"passed\""));
+        assert!(wire.contains("\"manifest_status\":\"in-progress\""));
+        let back: GateDecideResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn phase_6_request_dtos_deny_unknown_fields() {
+        // All new DTOs carry `deny_unknown_fields`. Exercise the
+        // rejection so a rename like `gate_id` → `gateId` can't
+        // silently no-op in a user's stale CLI call.
+        let bad = r#"{"subcommand":{"action":"list","bogusField":1},"json":false}"#;
+        let err = serde_json::from_str::<ReviewGateRequest>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("bogusField") || err.to_string().contains("unknown field")
+        );
     }
 
     /// Phase 6 Task 3: lock the gate-halt prefix constants against the

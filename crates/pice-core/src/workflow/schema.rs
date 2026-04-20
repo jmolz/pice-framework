@@ -235,6 +235,12 @@ pub struct LayerOverride {
     pub trigger: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_algorithm: Option<AdaptiveAlgo>,
+    /// Phase 6: per-layer override for how many reject-with-retry cycles
+    /// a gate on this layer allows before halting with `gate_rejected`.
+    /// Floor-merged against `review.retry_on_reject` — a user may
+    /// raise but not lower the project-committed budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on_reject: Option<u32>,
 }
 
 /// Review gate configuration.
@@ -251,6 +257,14 @@ pub struct ReviewConfig {
     pub on_timeout: OnTimeout,
     #[serde(default = "default_notification")]
     pub notification: String,
+    /// Phase 6: number of reject-with-retry cycles the reviewer gets
+    /// before the gate halts the feature with `gate_rejected`. `0`
+    /// (the default) means "one reject is final"; `1` allows one retry
+    /// (two total review attempts), and so on. Floor-merged as a
+    /// hard-raise-only field: a user workflow overlay cannot lower
+    /// this below the project-committed value.
+    #[serde(default)]
+    pub retry_on_reject: u32,
 }
 
 impl Default for ReviewConfig {
@@ -261,6 +275,7 @@ impl Default for ReviewConfig {
             timeout_hours: default_timeout_hours(),
             on_timeout: OnTimeout::default(),
             notification: default_notification(),
+            retry_on_reject: 0,
         }
     }
 }

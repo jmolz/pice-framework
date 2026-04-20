@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod benchmark;
 pub mod commit;
 pub mod daemon;

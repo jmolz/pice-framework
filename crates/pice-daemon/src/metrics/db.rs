@@ -107,6 +107,9 @@ impl MetricsDb {
         if current < 3 {
             self.migrate_v3()?;
         }
+        if current < 4 {
+            self.migrate_v4()?;
+        }
         Ok(())
     }
 
@@ -300,6 +303,86 @@ impl MetricsDb {
         Ok(())
     }
 
+    /// Phase 6 — create the `gate_decisions` audit table for reviewer
+    /// approve/reject/skip (and timeout analogues) events.
+    ///
+    /// `gate_id` carries a UNIQUE constraint that doubles as a CAS
+    /// primitive: the second concurrent `ReviewGate::Decide` RPC on the
+    /// same gate hits a SQLite constraint violation and surfaces as
+    /// [`pice_core::cli::ExitJsonStatus::ReviewGateConflict`]. This is
+    /// the mechanism the Phase 6 plan relies on to avoid writing a
+    /// separate in-process CAS — SQLite IS the serializer.
+    ///
+    /// `decision` is CHECK-constrained to the six audit-decision
+    /// strings produced by
+    /// [`pice_core::gate::GateDecisionOutcome::audit_decision_string`].
+    /// Any drift (e.g. a daemon release that adds `timeout_error`)
+    /// would be rejected at write time — forcing the schema + code to
+    /// stay in sync.
+    ///
+    /// No FK to `evaluations` because a gate can fire during a feature
+    /// run that never produces an `evaluations` row (the insert happens
+    /// after grading completes). Orphans are acceptable for an audit
+    /// log — they represent "reviewer actioned something that never
+    /// graded."
+    fn migrate_v4(&self) -> Result<()> {
+        // Same `BEGIN IMMEDIATE` + guard-against-concurrent-migrator
+        // pattern as migrate_v3. This one is simpler (single CREATE)
+        // so the full handler pattern is inlined here rather than
+        // split into a body helper.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .context("failed to begin migrate_v4 transaction")?;
+
+        let result = (|| -> Result<()> {
+            let current = self.current_schema_version()?;
+            if current >= 4 {
+                return Ok(());
+            }
+            self.conn
+                .execute_batch(
+                    "
+            CREATE TABLE IF NOT EXISTS gate_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                gate_id TEXT NOT NULL UNIQUE,
+                feature_id TEXT NOT NULL,
+                layer TEXT NOT NULL,
+                trigger_expression TEXT NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN
+                    ('approve','reject','skip','timeout_reject','timeout_approve','timeout_skip')),
+                reviewer TEXT,
+                reason TEXT,
+                requested_at TEXT NOT NULL,
+                decided_at TEXT NOT NULL,
+                elapsed_seconds INTEGER NOT NULL CHECK(elapsed_seconds >= 0)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_gate_decisions_feature_layer
+                ON gate_decisions(feature_id, layer);
+            CREATE INDEX IF NOT EXISTS idx_gate_decisions_requested_at
+                ON gate_decisions(requested_at);
+
+            INSERT INTO schema_version (version) VALUES (4);
+            ",
+                )
+                .context("failed to run v4 migration")?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .context("failed to commit migrate_v4 transaction")?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
     /// Phase 3 — create the `seam_findings` table with CHECK constraints
     /// and FK-cascade on `evaluations`. Idempotent via `IF NOT EXISTS`.
     fn migrate_v2(&self) -> Result<()> {
@@ -382,18 +465,18 @@ mod tests {
     fn migration_is_idempotent() {
         let db = MetricsDb::open_in_memory().unwrap();
         let v = db.current_schema_version().unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
 
         // Running init again should not fail or duplicate version rows
         db.init().unwrap();
         let v_again = db.current_schema_version().unwrap();
-        assert_eq!(v_again, 3);
+        assert_eq!(v_again, 4);
     }
 
     #[test]
     fn schema_version_matches_current() {
         let db = MetricsDb::open_in_memory().unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -409,7 +492,7 @@ mod tests {
 
         // Reopen
         let db = MetricsDb::open(&db_path).unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -563,24 +646,25 @@ mod tests {
         assert!(tables.contains(&"pass_events".to_string()));
     }
 
-    /// Re-running `init()` on a v3 database is a no-op: schema_version stays
-    /// at 3, no duplicate columns are added, and `pass_events` still exists.
+    /// Re-running `init()` on a current-version database is a no-op:
+    /// schema_version stays at 4, no duplicate columns are added, and
+    /// `pass_events` + `gate_decisions` still exist.
     #[test]
     fn migrate_v3_is_idempotent() {
         let db = MetricsDb::open_in_memory().unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
 
         // `init()` gates at `if current < N` so it's a proper no-op.
         db.init().unwrap();
         db.init().unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
 
-        // The gated version rows are: 1, 2, 3 — one per migration, no dupes.
+        // The gated version rows are: 1, 2, 3, 4 — one per migration, no dupes.
         let rows: i64 = db
             .conn()
             .query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(rows, 3, "init should never duplicate version rows");
+        assert_eq!(rows, 4, "init should never duplicate version rows");
 
         // Adaptive columns still exist exactly once (no ALTER ... duplicate error).
         let passes_used_count: i64 = db
@@ -615,11 +699,11 @@ mod tests {
             assert_eq!(stub.current_schema_version().unwrap(), 1);
         }
 
-        // Open via the public API — should run v2 and v3 migrations.
+        // Open via the public API — should run v2, v3 AND v4 migrations.
         let db = MetricsDb::open(&db_path).unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
 
-        // All v3 artifacts present.
+        // All v3/v4 artifacts present.
         let tables: Vec<String> = db
             .conn()
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -630,10 +714,11 @@ mod tests {
             .collect();
         assert!(tables.contains(&"seam_findings".to_string()));
         assert!(tables.contains(&"pass_events".to_string()));
+        assert!(tables.contains(&"gate_decisions".to_string()));
     }
 
     /// Opening a file-DB at v2 and then running the full `init()` flow
-    /// should migrate v2 → v3 without touching v2 tables.
+    /// should migrate v2 → v3 → v4 without touching v2 tables.
     #[test]
     fn migrate_from_v2_to_v3() {
         let dir = tempfile::tempdir().unwrap();
@@ -653,7 +738,7 @@ mod tests {
         }
 
         let db = MetricsDb::open(&db_path).unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
 
         // v2 seam_findings must still be there and still accepting inserts.
         db.conn()
@@ -877,10 +962,11 @@ mod tests {
             );
         }
 
-        // Post-race invariants: schema is at v3, all adaptive columns
-        // are present exactly once, and `pass_events` table exists.
+        // Post-race invariants: schema is at v4, all adaptive columns
+        // are present exactly once, and `pass_events` + `gate_decisions`
+        // tables exist.
         let db = MetricsDb::open(&db_path).unwrap();
-        assert_eq!(db.current_schema_version().unwrap(), 3);
+        assert_eq!(db.current_schema_version().unwrap(), 4);
 
         let cols: Vec<String> = db
             .conn()
@@ -956,6 +1042,170 @@ mod tests {
         assert!(
             !is_duplicate_column_error(&err),
             "no-such-table error must not be classified as duplicate-column; got {err:?}",
+        );
+    }
+
+    // ── Phase 6 — gate_decisions (v4) migration tests ─────────────────
+
+    /// Helper: seed a plain `INSERT INTO gate_decisions` row. Returns the
+    /// auto-generated id.
+    fn insert_gate_decision(
+        db: &MetricsDb,
+        gate_id: &str,
+        decision: &str,
+        reviewer: Option<&str>,
+    ) -> rusqlite::Result<i64> {
+        db.conn().execute(
+            "INSERT INTO gate_decisions (gate_id, feature_id, layer, trigger_expression, \
+             decision, reviewer, reason, requested_at, decided_at, elapsed_seconds) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                gate_id,
+                "feat",
+                "infra",
+                "layer == infra",
+                decision,
+                reviewer,
+                None::<&str>,
+                "2026-04-20T00:00:00Z",
+                "2026-04-20T00:05:00Z",
+                300i64,
+            ],
+        )?;
+        Ok(db.conn().last_insert_rowid())
+    }
+
+    #[test]
+    fn migrate_from_v3_to_v4() {
+        // Stage a v3 DB, then open via public init() and assert v4
+        // lands without regressing v1/v2/v3 artifacts.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v3.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+            )
+            .unwrap();
+            let stub = MetricsDb { conn };
+            stub.migrate_v1().unwrap();
+            stub.migrate_v2().unwrap();
+            stub.migrate_v3().unwrap();
+            assert_eq!(stub.current_schema_version().unwrap(), 3);
+        }
+        let db = MetricsDb::open(&db_path).unwrap();
+        assert_eq!(db.current_schema_version().unwrap(), 4);
+
+        let tables: Vec<String> = db
+            .conn()
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for t in [
+            "evaluations",
+            "seam_findings",
+            "pass_events",
+            "gate_decisions",
+        ] {
+            assert!(tables.contains(&t.to_string()), "missing table: {t}");
+        }
+    }
+
+    #[test]
+    fn gate_decisions_decision_check_rejects_bogus_value() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        // `'foobar'` is not in the CHECK set — the constraint rejects.
+        let err = insert_gate_decision(&db, "g1", "foobar", Some("jacob")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("check"),
+            "expected CHECK constraint error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_decisions_gate_id_uniqueness_check() {
+        // UNIQUE on gate_id is the CAS primitive for concurrent
+        // `ReviewGate::Decide` — the second caller sees a constraint
+        // violation that the handler maps to `ReviewGateConflict`.
+        let db = MetricsDb::open_in_memory().unwrap();
+        insert_gate_decision(&db, "g1", "approve", Some("jacob")).unwrap();
+        let err = insert_gate_decision(&db, "g1", "reject", Some("alice")).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("unique"),
+            "expected UNIQUE constraint error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_decisions_elapsed_seconds_nonneg_check() {
+        let db = MetricsDb::open_in_memory().unwrap();
+        let err = db
+            .conn()
+            .execute(
+                "INSERT INTO gate_decisions (gate_id, feature_id, layer, trigger_expression, \
+                 decision, reviewer, reason, requested_at, decided_at, elapsed_seconds) \
+                 VALUES ('g2', 'f', 'l', 't', 'approve', 'r', NULL, '2026-04-20T00:00:00Z', \
+                 '2026-04-20T00:05:00Z', -1)",
+                [],
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("check"),
+            "expected CHECK error on negative elapsed_seconds, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn migration_v4_is_idempotent_across_reopens() {
+        // Open, close, reopen — schema stays at v4 with one row per
+        // version in `schema_version`.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("idem.db");
+        let _ = MetricsDb::open(&db_path).unwrap();
+        let db = MetricsDb::open(&db_path).unwrap();
+        assert_eq!(db.current_schema_version().unwrap(), 4);
+        let v4_rows: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM schema_version WHERE version = 4",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v4_rows, 1, "v4 version row must not duplicate on reopen");
+    }
+
+    #[test]
+    fn gate_decisions_indexes_exist() {
+        // Index existence is load-bearing for `pice audit gates --since`
+        // performance; this test locks the `CREATE INDEX` statements
+        // in the migration against silent removal.
+        let db = MetricsDb::open_in_memory().unwrap();
+        let indexes: Vec<String> = db
+            .conn()
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' \
+                 AND tbl_name='gate_decisions'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            indexes.contains(&"idx_gate_decisions_feature_layer".to_string()),
+            "missing feature+layer index; got {indexes:?}"
+        );
+        assert!(
+            indexes.contains(&"idx_gate_decisions_requested_at".to_string()),
+            "missing requested_at index; got {indexes:?}"
         );
     }
 }

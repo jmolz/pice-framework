@@ -24,6 +24,7 @@
 //! `Completions` is NOT a handler (handled by `clap_complete` at the CLI
 //! layer). The `Daemon` subcommand (T24) is also CLI-only.
 
+pub mod audit;
 pub mod benchmark;
 pub mod commit;
 pub mod evaluate;
@@ -35,6 +36,7 @@ pub mod metrics;
 pub mod plan;
 pub mod prime;
 pub mod review;
+pub mod review_gate;
 pub mod status;
 pub mod validate;
 
@@ -105,6 +107,8 @@ pub async fn dispatch(
         CommandRequest::Benchmark(r) => benchmark::run(r, ctx, sink).await,
         CommandRequest::Layers(r) => layers::run(r, ctx, sink).await,
         CommandRequest::Validate(r) => validate::run(r, ctx, sink).await,
+        CommandRequest::ReviewGate(r) => review_gate::run(r, ctx, sink).await,
+        CommandRequest::Audit(r) => audit::run(r, ctx, sink).await,
     }
 }
 
