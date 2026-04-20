@@ -1369,15 +1369,6 @@ mod tests {
         GateEntry, GateStatus, LayerResult, LayerStatus, ManifestStatus, VerificationManifest,
         SCHEMA_VERSION,
     };
-    use std::sync::Mutex;
-
-    /// Serialize tests that mutate `PICE_STATE_DIR` (process-global).
-    fn state_dir_lock() -> &'static Mutex<()> {
-        use std::sync::OnceLock;
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     /// Contract criterion #2: "Evaluate releases per-manifest locks between
     /// cohort boundaries so decide RPCs never self-deadlock." Implemented
     /// in Phase 6 via early-return on gate fire (handler return drops the
@@ -1395,7 +1386,10 @@ mod tests {
     async fn evaluate_releases_locks_between_cohorts() {
         use std::time::Duration;
 
-        let _g = state_dir_lock().lock().unwrap_or_else(|p| p.into_inner());
+        // No `state_dir_lock` here — this test doesn't mutate
+        // PICE_STATE_DIR (it only exercises the per-manifest
+        // MutexGuard lifecycle via manifest_lock_for, which is
+        // DaemonContext-local, not process-global).
         let tmp = tempfile::tempdir().unwrap();
         let project_root = tmp.path().to_path_buf();
         let ctx = DaemonContext::new("tok".to_string(), project_root.clone());
