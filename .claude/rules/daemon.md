@@ -125,11 +125,11 @@ All of these go through the daemon. The CLI is an adapter, not a participant.
 
 ## Channel ownership invariant (Phase 6+)
 
-**Interactive prompt text is CLI-owned and written to stderr**; daemon-emitted streaming text and normal command output go to stdout (unchanged). This preserves the stdout-as-JSON invariant in `--json` mode and lets `DecisionSource` implementations write prompts without branching on `req.json`.
+**Interactive prompt text is CLI-owned and written to stderr**; daemon-emitted streaming text and normal command output go to stdout (unchanged). This preserves the stdout-as-JSON invariant in `--json` mode — a concurrent `pice evaluate --json` run is parseable because prompt bytes never touch stdout.
 
 Concrete consequences:
-- The review-gate TTY prompt (`crates/pice-cli/src/input/decision_source.rs::TtyDecisionSource`) writes the box-drawing prompt to a `Write` writer that the caller wires to `std::io::stderr()`. The daemon never sees or emits prompt bytes.
-- `pice evaluate` in TTY mode on a pending-review response prints the prompt to stderr via `DecisionSource` and continues writing the evaluate summary to stdout. A concurrent `pice evaluate --json` run is therefore parseable — any text on stderr is non-contaminating.
+- The review-gate box-drawing prompt is produced by the pure helper `crates/pice-cli/src/input/decision_source.rs::render_prompt(body, details)` and written to `std::io::stderr()` by the CLI. The daemon never sees or emits prompt bytes.
+- Production prompt call sites (`crates/pice-cli/src/commands/review_gate.rs::prompt_tty_for_decision` + `crates/pice-cli/src/commands/evaluate.rs::prompt_decision_for_gate`) read stdin directly via `std::io::stdin().read_line(...)`. Phase 6 initially shipped a `DecisionSource` trait abstraction, but `StdinLock: !Send` blocked it from being wired through the async handler path — the Pass-3 review removed the trait as unused scaffolding (only `render_prompt` survives). If Phase 7 re-introduces an input abstraction (e.g. `tokio::task::spawn_blocking`-wrapped TTY source for the PTY test harness), do it once a real consumer exists — don't ship the trait ahead of a user.
 - The daemon's `ReviewGate::Decide` handler NEVER reads environment variables for the reviewer name. `ReviewGateSubcommand::Decide.reviewer` is resolved CLI-side (`$USER` / `$USERNAME` / `unknown` fallback) and threaded through the RPC.
 
 ## Structured JSON failure responses

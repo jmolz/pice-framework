@@ -157,7 +157,7 @@ pnpm test
 | `pice-core/src/workflow/merge.rs::tests` (Phase 6 additions: `retry_on_reject` floor-merge tests) | `retry_on_reject` raise-only floor | User overlay can raise but not lower the project-committed reject budget; per-layer override floors to `max(project_review.retry_on_reject, project_layer.retry_on_reject)`; approve/skip don't trigger floor logic |
 | `pice-daemon/src/clock.rs::tests` (Phase 6 new, 4 inline tests) | MockClock + Clock trait | `system_clock_now_returns_utc`, `mock_clock_advance_wakes_sleepers`, `mock_clock_set_jumps_time`, `mock_clock_trait_object_works` — `MockClock` gated `#[cfg(test)]` to keep `expect()` out of production code (clippy::expect_used deny) |
 | `pice-cli/src/commands/evaluate.rs::tests` (Phase 6 additions) | TTY auto-resume loop | `is_review_gate_pending_detects_status_discriminant`, `extract_pending_gates_from_response` shape, CLI exits 1 after 10-iteration cap reached |
-| `pice-cli/src/input/decision_source.rs::tests` (Phase 6 new, ~5 inline tests) | `DecisionSource` trait | `TtyDecisionSource::prompt_single_char` reads first char via `BufReader<StdinLock>` (unit-test only — production uses direct stdin due to `!Send`), `ScriptedDecisionSource` returns pre-baked decisions in order, `NonInteractiveDecisionSource` always errors with `MissingDecision` variant |
+| `pice-cli/src/input/decision_source.rs::tests` (Phase 6, 2 inline tests) | `render_prompt` pure helper | `render_prompt_includes_details_when_provided`, `render_prompt_omits_detail_separator_when_none`. The original `DecisionSource` trait was Phase-6 scaffolding that `StdinLock: !Send` blocked from wiring into the async handler path; the Pass-3 review removed it along with the `Scripted`/`Piped`/`Tty` impl structs. Only the pure `render_prompt` helper survived — both production prompt call sites read stdin directly while using this helper for the box-drawing string |
 
 ### Source files these tests protect
 
@@ -210,12 +210,13 @@ pnpm test
 - `crates/pice-cli/src/commands/review_gate.rs` — Phase 6 `pice review-gate` CLI (list/decide modes, TTY prompt via direct stdin reads due to `StdinLock: !Send`, `$USER`/`$USERNAME` reviewer fallback, MissingDecision exit)
 - `crates/pice-cli/src/commands/audit.rs` — Phase 6 `pice audit gates` CLI (CSV/JSON output, feature_id + since filters)
 - `crates/pice-cli/src/commands/evaluate.rs` — Phase 6 TTY auto-resume loop: detects exit-3 review-gate-pending, prompts via `DecisionSource`, re-invokes evaluate, bounded at 10 iterations
-- `crates/pice-cli/src/input/decision_source.rs` — Phase 6 `DecisionSource` trait (`TtyDecisionSource`, `ScriptedDecisionSource`, `NonInteractiveDecisionSource`), `MissingDecision` / `ReadError` error variants (trait is dead-code in production evaluate loop due to `!Send`; used by unit tests)
+- `crates/pice-cli/src/input/decision_source.rs` — Phase 6 `render_prompt` pure helper for the Unicode box-drawing reviewer prompt (writes to stderr per the Channel ownership invariant). Earlier trait-based abstraction was removed after the Pass-3 review flagged it as unused scaffolding
+- `crates/pice-daemon/src/test_support.rs` — Phase 6 `StateDirGuard` RAII helper for `PICE_STATE_DIR` mutation across the lib-test binary and integration-test binaries. Shared `pub` module so the struct definition can't drift; each binary gets its own static `Mutex<()>` via `OnceLock`
 - `templates/pice/workflow.yaml` — Phase 6 `review.retry_on_reject` default + per-layer `require_review` examples
 
 ### Expected results
 
-All tests should pass. Baseline: **938 Rust tests (1 ignored — doc-test in `crates/pice-daemon/src/handlers/mod.rs` line 5), 96 TypeScript tests, 0 lint errors, 0 warnings, clean release build.** (Phase 6 ships at 938; pre-Phase-6 was 903; pre-Phase-5 was 836; pre-Phase-4 was 829.)
+All tests should pass. Baseline: **931 Rust tests (1 ignored — doc-test in `crates/pice-daemon/src/handlers/mod.rs` line 5), 96 TypeScript tests, 0 lint errors, 0 warnings, clean release build.** (Phase 6 ships at 938; pre-Phase-6 was 903; pre-Phase-5 was 836; pre-Phase-4 was 829.)
 
 If any fail after your changes:
 
@@ -260,7 +261,7 @@ pnpm build
 cargo build --release
 ```
 
-Expected baseline: **938 Rust tests passing (1 ignored — doc-test in `pice-daemon/src/handlers/mod.rs`), 96 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.**
+Expected baseline: **931 Rust tests passing (1 ignored — doc-test in `pice-daemon/src/handlers/mod.rs`), 96 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.**
 
 ## Phase 3: Code Review of Current Changes
 
@@ -357,7 +358,7 @@ Phase 6 review gates:
   - pice-core workflow/merge::tests retry_on_reject floor-merge: ✓ / ✗
   - clock.rs inline tests (MockClock gated `#[cfg(test)]`): ✓ / ✗
 
-Full Suite: 938 / 96 tests passing (Phase 6 ships at 938 Rust tests; 830 was pre-Phase-4 baseline)
+Full Suite: 938 / 96 tests passing (Phase 6 ships at 931 Rust tests; 830 was pre-Phase-4 baseline)
 Lint: 0 errors, 0 warnings (workspace + lib unwrap/expect denies)
 Build: PASS / FAIL
 ```

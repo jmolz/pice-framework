@@ -123,3 +123,27 @@ Minimum coverage when introducing or modifying a `pice-core` pure function consu
 2. **Add `#[allow(clippy::await_holding_lock)]`** with a comment naming the single-consumer invariant and why the lock never contends.
 
 **Prefer option 1** when the test also needs env cleanup on panic, which is almost always. The struct-field pattern is structural, not a suppression — a future refactor that moves the guard around can't accidentally expose it. NEVER swap the `std::sync::Mutex` for `tokio::sync::Mutex` as a lint-dodge: `std::env::set_var` is synchronous, and yielding mid-critical-section defeats the "this block runs atomically" semantic. The lint is about scheduler fairness, not correctness — our single-consumer tests satisfy the real concern either way.
+
+## Share RAII env-guard structs across test binaries via a `pub` module
+
+When more than ONE test binary (lib-level `#[cfg(test)]` inline tests AND integration tests under `tests/*.rs`) needs the same env-guard RAII struct, promote the struct to a crate-level `pub mod test_support` rather than duplicating it. Rust statics are binary-local (cargo-test compiles each integration file + the lib as SEPARATE processes), so the `OnceLock<Mutex<()>>` inside the module still produces a distinct lock per binary — which is the correct semantic, since each test binary runs in its own OS process. Centralizing the STRUCT prevents definition drift (e.g., one copy forgets to restore the prior env var on Drop while another remembers).
+
+Pattern from Phase 6: `crates/pice-daemon/src/test_support.rs` exposes `StateDirGuard` (RAII `PICE_STATE_DIR` swap) + `state_dir_lock()`. Both `handlers::review_gate::tests` (inline) and `tests/review_gate_lifecycle_integration.rs` (integration binary) `use pice_daemon::test_support::StateDirGuard;`. The Pass-3 adversarial review of Phase 6 flagged two uncoordinated copies of this struct as a drift risk; consolidation closed it.
+
+Cross-binary struct sharing WORKS despite Rust statics being binary-local because the binary boundary IS the process boundary — lock sharing across binaries wouldn't help anyway (each cargo-test binary spawns as its own OS process and doesn't share memory). The shared struct is for DEFINITION hygiene, not runtime mutex sharing.
+
+## Gate test-only helpers that use `.expect()` behind `#[cfg(test)]`
+
+`pice-daemon` enforces `-D clippy::unwrap_used -D clippy::expect_used` on its library surface. A documented-panic test helper (e.g., `MockClock` whose `expect("MockClock mutex poisoned")` is load-bearing — poisoning means an earlier assertion panicked with the lock held, and the test SHOULD fail loud) still trips the lint if it lives in non-gated `pub` code.
+
+Rule: gate test-only types that legitimately use `.expect()` behind `#[cfg(test)]` (or a `test-utils` feature if integration-test binaries need them). When the gated type moves behind `#[cfg(test)]`, any imports that ONLY the gated type references (e.g. `use tokio::sync::Notify;` / `use std::sync::Arc;`) must also move behind the same cfg — otherwise they surface as `unused import` warnings in `cargo build --release`.
+
+Phase 6 example: `crates/pice-daemon/src/clock.rs` gates `MockClock` + its `Clock` impl behind `#[cfg(test)]`. `SystemClock` (production) remains unconditionally `pub`. The `Notify` + `Arc` imports used only by `MockClock` sit behind `#[cfg(test)]` too. If Phase 6.1's background reconciler needs `MockClock` from an integration-test binary, widen the gate to `#[cfg(any(test, feature = "test-utils"))]` and expose via a dev-dependencies feature flag — don't ungate back to production.
+
+## Don't ship trait-based scaffolding ahead of a real consumer
+
+A generic trait + impl set added speculatively ("future consumers will plug in here") that nothing in production currently calls becomes scaffolding debt: unit tests exercise it but the real code path bypasses it, which creates a silent testability gap — a refactor to the bypassed path ships with zero coverage.
+
+Phase 6 example: the initial `DecisionSource` trait + 3 impls (`Scripted` / `Piped` / `Tty`) shipped before the production prompt path was written. The production paths at `commands/review_gate.rs::prompt_tty_for_decision` and `commands/evaluate.rs::prompt_decision_for_gate` ended up reading stdin directly because `StdinLock: !Send` blocked the trait from being wired into the async handler — the trait's unit tests passed but exercised no real code. Pass-3 review removed the trait. Only the pure `render_prompt` helper (actually shared by both call sites) survived.
+
+Rule: when adding a trait + impls, the PR that lands the trait must also wire at least one production call site through it. If the production wiring can't land yet (type-system blocker, missing async primitive, etc.), keep the trait design in a plan doc and ship the production path first — THEN reintroduce the trait when a second consumer needs the abstraction.
