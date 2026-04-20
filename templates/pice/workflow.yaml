@@ -68,10 +68,27 @@ layer_overrides: {}
 
 # Review gates are disabled by framework default. Projects opt in via
 # `.pice/workflow.yaml` with a `trigger` expression.
+#
+# Example — require a human sign-off on every tier-3 or infrastructure
+# change, with 24h timeout and one reject-with-retry cycle:
+#
+#   review:
+#     enabled: true
+#     trigger: "tier >= 3 OR layer == infrastructure"
+#     timeout_hours: 24
+#     on_timeout: reject
+#     retry_on_reject: 1
+#     notification: stdout
+#
+# `retry_on_reject` (Phase 6): number of reject-with-retry cycles the
+# reviewer gets before the gate halts the feature with `gate_rejected`.
+# `0` means "one reject is final"; `1` allows one retry after reject.
+# Floor-merged: a user overlay cannot lower a project-required value.
 review:
   enabled: false
   timeout_hours: 24
   on_timeout: reject        # reject | approve | skip
+  retry_on_reject: 0        # count of re-reviews allowed after a reject
   notification: stdout
 
 # Seam verification — per-boundary static checks. See PRDv2 § Feature 6 and
