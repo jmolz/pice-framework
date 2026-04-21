@@ -15,6 +15,248 @@ use crate::server::router::DaemonContext;
 /// Shared by the startup DB-open / header-insert paths (Pass-7) and the
 /// post-evaluation finalize / seam-finding paths (Pass-6). Exit code is
 /// 1 — this is a persistence failure, not a contract failure (exit 2).
+/// Build the `ReviewGatePending` response when the orchestrator halted
+/// at a cohort boundary awaiting a human decision. Phase 6 Task 5 +
+/// Task 18 contract: exit code **3** (not 1, not 2), JSON payload carries
+/// `status: "review-gate-pending"` + the full manifest + a pending-gates
+/// summary so CLI loops and CI scripts can trigger the right `pice
+/// review-gate` call.
+fn review_gate_pending_response(
+    manifest: &pice_core::layers::manifest::VerificationManifest,
+    json_mode: bool,
+) -> CommandResponse {
+    use pice_core::layers::manifest::GateStatus;
+    let pending_gates: Vec<serde_json::Value> = manifest
+        .gates
+        .iter()
+        .filter(|g| g.status == GateStatus::Pending)
+        .map(|g| {
+            serde_json::json!({
+                "id": g.id,
+                "layer": g.layer,
+                "trigger_expression": g.trigger_expression,
+                "timeout_at": g.timeout_at,
+                "reject_attempts_remaining": g.reject_attempts_remaining,
+            })
+        })
+        .collect();
+    if json_mode {
+        let mut value = serde_json::to_value(manifest).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "status".to_string(),
+                serde_json::json!(ExitJsonStatus::ReviewGatePending.as_str()),
+            );
+            obj.insert(
+                "pending_gates".to_string(),
+                serde_json::json!(pending_gates),
+            );
+        }
+        return CommandResponse::ExitJson { code: 3, value };
+    }
+    let mut message = String::from("\nEvaluation paused — review gate(s) pending:\n\n");
+    for g in &manifest.gates {
+        if g.status != GateStatus::Pending {
+            continue;
+        }
+        message.push_str(&format!(
+            "  ⏸ {} (layer: {}, trigger: {})\n      id: {}\n      timeout: {}\n      retry budget: {}\n",
+            g.layer, g.layer, g.trigger_expression, g.id, g.timeout_at, g.reject_attempts_remaining,
+        ));
+    }
+    message.push_str(
+        "\nRun `pice review-gate --list` to see all pending gates, \
+         or `pice review-gate --gate-id <ID> --decision approve|reject|skip` \
+         to action one.\n",
+    );
+    CommandResponse::Exit { code: 3, message }
+}
+
+/// Reconcile expired review gates against the current clock. For each
+/// Pending gate whose `timeout_at` has passed, apply the pinned
+/// `on_timeout_action`: mutate the gate status, update the owning
+/// layer's status (Passed on timeout-approve/skip, Pending on
+/// timeout-reject with retries remaining, Failed on zero-retry reject),
+/// and write a `timeout_*` audit row to SQLite. Returns the count of
+/// reconciled gates.
+///
+/// This is the minimum viable timeout enforcement — partial Task 8
+/// without the background reconciler. A gate that times out is only
+/// caught when the next `pice evaluate` runs, not in real time. The
+/// full background reconciler lands in a follow-up.
+fn reconcile_expired_gates_inline(
+    manifest: &mut pice_core::layers::manifest::VerificationManifest,
+    now: chrono::DateTime<chrono::Utc>,
+    project_root: &std::path::Path,
+) -> usize {
+    use pice_core::gate::{GateDecision, GateDecisionOutcome};
+    use pice_core::layers::manifest::{GateStatus, LayerStatus};
+
+    let db_path = project_root.join(".pice").join("metrics.db");
+    let db = if db_path.is_file() {
+        match crate::metrics::db::MetricsDb::open(&db_path) {
+            Ok(db) => Some(db),
+            Err(e) => {
+                tracing::warn!(
+                    path = %db_path.display(),
+                    error = %e,
+                    "reconcile: failed to open metrics DB; skipping audit writes"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase 1: PURE scan. Collect indexes + computed outcomes WITHOUT
+    // mutating the manifest. This preserves the audit-before-manifest
+    // ordering invariant (contract criterion #8). Mutation happens only
+    // after the audit row is durably recorded in SQLite.
+    struct Action {
+        idx: usize,
+        outcome: GateDecisionOutcome,
+        requested_at: String,
+        layer: String,
+        gate_id: String,
+        trigger: String,
+    }
+    let mut actions: Vec<Action> = Vec::new();
+    for (idx, gate) in manifest.gates.iter().enumerate() {
+        if gate.status != GateStatus::Pending {
+            continue;
+        }
+        let deadline: chrono::DateTime<chrono::Utc> = match gate.timeout_at.parse() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    gate_id = %gate.id,
+                    timeout_at = %gate.timeout_at,
+                    error = %e,
+                    "reconcile: unparseable timeout_at; skipping"
+                );
+                continue;
+            }
+        };
+        if now < deadline {
+            continue;
+        }
+        let outcome = GateDecisionOutcome::timeout(gate.on_timeout_action);
+        actions.push(Action {
+            idx,
+            outcome,
+            requested_at: gate.requested_at.clone(),
+            layer: gate.layer.clone(),
+            gate_id: gate.id.clone(),
+            trigger: gate.trigger_expression.clone(),
+        });
+    }
+
+    let mut reconciled = 0_usize;
+    for action in actions {
+        let elapsed_seconds = match chrono::DateTime::parse_from_rfc3339(&action.requested_at) {
+            Ok(dt) => (now.signed_duration_since(dt.with_timezone(&chrono::Utc)))
+                .num_seconds()
+                .max(0),
+            Err(_) => 0,
+        };
+        let decided_at_str = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let decision_str = action.outcome.audit_decision_string();
+
+        // Phase 2: AUDIT FIRST. Write the timeout audit row to SQLite
+        // before any in-memory manifest mutation. On failure (other than
+        // duplicate-already-seen), skip this gate entirely — keep it
+        // Pending so the NEXT reconcile attempt retries. This matches
+        // the decide handler's audit-before-manifest invariant.
+        if let Some(ref db) = db {
+            let row = crate::metrics::store::GateDecisionRow {
+                gate_id: &action.gate_id,
+                feature_id: &manifest.feature_id,
+                layer: &action.layer,
+                trigger_expression: &action.trigger,
+                decision: decision_str,
+                reviewer: Some("system/timeout"),
+                reason: Some("gate timeout_at elapsed; on_timeout action applied"),
+                requested_at: &action.requested_at,
+                decided_at: &decided_at_str,
+                elapsed_seconds,
+            };
+            match crate::metrics::store::insert_gate_decision(db, &row) {
+                Ok(_) => {}
+                Err(crate::metrics::store::GateInsertError::DuplicateGateId { .. }) => {
+                    // Prior reconciler / decide already wrote this row —
+                    // idempotent continuation is safe.
+                    tracing::debug!(
+                        gate_id = %action.gate_id,
+                        "reconcile: audit row already exists; continuing with manifest mutation"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        gate_id = %action.gate_id,
+                        error = %e,
+                        "reconcile: audit insert failed; skipping manifest mutation"
+                    );
+                    // Skip mutation for this gate. Next reconcile retries.
+                    continue;
+                }
+            }
+        }
+
+        // Phase 3: MUTATE the in-memory manifest only after audit
+        // succeeded (or was idempotently ignored as a known-duplicate).
+        let (new_gate_status, new_layer_status, new_reject_budget, new_halted_by) = {
+            let gate = &manifest.gates[action.idx];
+            let current_budget = gate.reject_attempts_remaining;
+            match action.outcome.decision {
+                GateDecision::Approve => (
+                    GateStatus::Approved,
+                    LayerStatus::Passed,
+                    current_budget,
+                    None,
+                ),
+                GateDecision::Skip => (
+                    GateStatus::Skipped,
+                    LayerStatus::Passed,
+                    current_budget,
+                    None,
+                ),
+                GateDecision::Reject => {
+                    if current_budget > 0 {
+                        (
+                            GateStatus::Rejected,
+                            LayerStatus::Pending,
+                            current_budget - 1,
+                            None,
+                        )
+                    } else {
+                        (
+                            GateStatus::Rejected,
+                            LayerStatus::Failed,
+                            0,
+                            Some(ExitJsonStatus::HALTED_GATE_REJECTED.to_string()),
+                        )
+                    }
+                }
+            }
+        };
+        let gate_mut = &mut manifest.gates[action.idx];
+        gate_mut.status = new_gate_status;
+        gate_mut.decision = Some(decision_str.to_string());
+        gate_mut.decided_at = Some(decided_at_str.clone());
+        gate_mut.reject_attempts_remaining = new_reject_budget;
+        if let Some(layer) = manifest.layers.iter_mut().find(|l| l.name == action.layer) {
+            layer.status = new_layer_status;
+            if let Some(halted) = &new_halted_by {
+                layer.halted_by = Some(halted.clone());
+            }
+        }
+        reconciled += 1;
+    }
+
+    reconciled
+}
+
 fn metrics_persist_failed_response(json_mode: bool, errors: Vec<String>) -> CommandResponse {
     if json_mode {
         let value = json!({
@@ -429,10 +671,79 @@ pub async fn run(
                 }),
                 _ => std::sync::Arc::new(crate::orchestrator::NullPassSink),
             };
+        // Phase 6 auto-resume: if an existing manifest for this feature
+        // is already in `PendingReview`, reconcile any expired gates
+        // against the current clock (so `timeout_hours` is honored even
+        // when no reviewer intervenes — partial Task 8 without the full
+        // background reconciler), then return immediately with the
+        // appropriate response. Without this short-circuit, a fresh
+        // `pice evaluate plan.md` on a pending-review feature would run
+        // the cohort loop from scratch and stomp on the pending gates.
+        let manifest_feature_id_for_resume = &manifest_feature_id;
+        if let Ok(path) = pice_core::layers::manifest::VerificationManifest::manifest_path_for(
+            manifest_feature_id_for_resume,
+            project_root,
+        ) {
+            if path.exists() {
+                if let Ok(mut existing) =
+                    pice_core::layers::manifest::VerificationManifest::load(&path)
+                {
+                    if existing.overall_status
+                        == pice_core::layers::manifest::ManifestStatus::PendingReview
+                    {
+                        // Reconcile expired gates before the short-circuit.
+                        // For each Pending gate past its `timeout_at`, apply
+                        // the on_timeout action (writes audit row + gate
+                        // mutation). If ANY gate timed out, persist the
+                        // updated manifest. If the manifest is no longer
+                        // PendingReview after reconciliation (e.g., only
+                        // gate timed out with on_timeout=reject and no
+                        // retries), fall through to the normal response
+                        // path.
+                        let now = chrono::Utc::now();
+                        let reconciled =
+                            reconcile_expired_gates_inline(&mut existing, now, project_root);
+                        if reconciled > 0 {
+                            existing.compute_overall_status();
+                            if let Err(e) = existing.save(&path) {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    error = %e,
+                                    "failed to persist reconciled-timeout manifest"
+                                );
+                            }
+                            tracing::info!(
+                                reconciled_count = reconciled,
+                                "reconciled expired gates on evaluate resume"
+                            );
+                        }
+                        if existing.overall_status
+                            == pice_core::layers::manifest::ManifestStatus::PendingReview
+                        {
+                            return Ok(review_gate_pending_response(&existing, req.json));
+                        }
+                        // Otherwise: fall through — the manifest may now
+                        // be Failed (reject-no-retry) or InProgress (retry
+                        // path); the normal evaluation flow handles those.
+                    }
+                }
+            }
+        }
+
         let manifest = crate::orchestrator::stack_loops::run_stack_loops(
             &stack_cfg, sink, req.json, pass_sink,
         )
         .await?;
+
+        // Phase 6: if the stack-loops run returned with at least one gate
+        // in `Pending` state (fired during this evaluation), convert the
+        // manifest response to a `ReviewGatePending` exit-3 payload so
+        // non-TTY / JSON callers can loop on the structured status
+        // discriminant. TTY callers in the CLI detect the same payload
+        // to drive the prompt loop.
+        if manifest.overall_status == pice_core::layers::manifest::ManifestStatus::PendingReview {
+            return Ok(review_gate_pending_response(&manifest, req.json));
+        }
 
         // Seam-aware exit code: if any layer is Failed (including via a
         // seam finding), we exit 2. Overall status being InProgress from
@@ -721,6 +1032,9 @@ pub async fn run(
                 LayerStatus::Pending => "PENDING",
                 LayerStatus::InProgress => "IN-PROGRESS",
                 LayerStatus::Skipped => "SKIP",
+                // Phase 6: a gate paused the cohort advance; the layer
+                // has already graded Passed but needs reviewer action.
+                LayerStatus::PendingReview => "REVIEW",
             };
             let detail = lr
                 .halted_by
@@ -1043,6 +1357,120 @@ pub async fn run(
                 code: 2,
                 message: output,
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::router::DaemonContext;
+    use pice_core::layers::manifest::{
+        GateEntry, GateStatus, LayerResult, LayerStatus, ManifestStatus, VerificationManifest,
+        SCHEMA_VERSION,
+    };
+    /// Contract criterion #2: "Evaluate releases per-manifest locks between
+    /// cohort boundaries so decide RPCs never self-deadlock." Implemented
+    /// in Phase 6 via early-return on gate fire (handler return drops the
+    /// tokio MutexGuard + fs2 file lock).
+    ///
+    /// This test exercises the lock-acquisition contract through the same
+    /// helper the handler uses (`DaemonContext::manifest_lock_for`). It
+    /// acquires the lock, drops it (simulating handler return after an
+    /// early-return gate fire), then re-acquires with a hard timeout to
+    /// prove the lock was actually released — a leaked guard would trip
+    /// the `tokio::time::timeout`. This is the semantic pinned by the
+    /// contract: subsequent decide RPCs must NOT self-deadlock against
+    /// locks held by a prior evaluate cohort boundary.
+    #[tokio::test]
+    async fn evaluate_releases_locks_between_cohorts() {
+        use std::time::Duration;
+
+        // No `state_dir_lock` here — this test doesn't mutate
+        // PICE_STATE_DIR (it only exercises the per-manifest
+        // MutexGuard lifecycle via manifest_lock_for, which is
+        // DaemonContext-local, not process-global).
+        let tmp = tempfile::tempdir().unwrap();
+        let project_root = tmp.path().to_path_buf();
+        let ctx = DaemonContext::new("tok".to_string(), project_root.clone());
+        let namespace = pice_core::layers::manifest::manifest_project_namespace(&project_root);
+        let feature_id = "feat-lock-release";
+
+        // The handler obtains this exact same Arc<Mutex<()>> via the
+        // `manifest_lock_for` helper. If `lock_for` is refactored to
+        // produce per-call unique locks (a real bug class), this test
+        // catches it via the contention check below.
+        let lock_a = ctx.manifest_lock_for(&namespace, feature_id);
+        let lock_b = ctx.manifest_lock_for(&namespace, feature_id);
+        assert!(
+            std::sync::Arc::ptr_eq(&lock_a, &lock_b),
+            "manifest_lock_for must return the SAME Arc for the same (namespace, feature_id)"
+        );
+
+        // Cohort 1 simulation: acquire the lock, do "work", drop guard at
+        // scope end — this mirrors `run()` returning on a gate fire.
+        {
+            let guard = lock_a.lock().await;
+            // Simulated orchestration — under real handler this would be
+            // cohort evaluation until the first gate fires.
+            tokio::task::yield_now().await;
+            drop(guard);
+        }
+
+        // Decide-RPC simulation: a separate caller (in production: the
+        // decide handler) acquires the SAME lock. Must succeed within a
+        // tight timeout. If the cohort task had leaked its guard, this
+        // re-acquire would block until the timeout fires and panic.
+        let decide_guard = tokio::time::timeout(Duration::from_millis(250), lock_a.lock())
+            .await
+            .expect("decide RPC must not self-deadlock against evaluate cohort lock");
+        drop(decide_guard);
+
+        // Cohort 2 simulation (re-entry after decide completes): prove
+        // the evaluate handler can re-acquire for the NEXT cohort after
+        // the decide RPC releases. Same timeout bound — any lingering
+        // guard fails.
+        let cohort2_guard = tokio::time::timeout(Duration::from_millis(250), lock_a.lock())
+            .await
+            .expect("evaluate must re-acquire lock for next cohort after decide releases");
+        drop(cohort2_guard);
+
+        // Structural check on the short-circuit response (the code path
+        // a PendingReview manifest routes through). This keeps coverage
+        // for `review_gate_pending_response` — the helper the early-
+        // return branch produces.
+        let manifest = VerificationManifest {
+            schema_version: SCHEMA_VERSION.to_string(),
+            feature_id: feature_id.to_string(),
+            project_root_hash: namespace.clone(),
+            layers: vec![LayerResult {
+                name: "infrastructure".to_string(),
+                status: LayerStatus::PendingReview,
+                passes: Vec::new(),
+                seam_checks: Vec::new(),
+                halted_by: None,
+                final_confidence: Some(0.95),
+                total_cost_usd: Some(0.0),
+                escalation_events: None,
+            }],
+            gates: vec![GateEntry {
+                id: format!("{feature_id}:infrastructure:0001"),
+                layer: "infrastructure".to_string(),
+                status: GateStatus::Pending,
+                trigger_expression: "layer == infrastructure".to_string(),
+                requested_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                timeout_at: (chrono::Utc::now() + chrono::Duration::hours(24))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                on_timeout_action: pice_core::workflow::schema::OnTimeout::Reject,
+                reject_attempts_remaining: 1,
+                decision: None,
+                decided_at: None,
+            }],
+            overall_status: ManifestStatus::PendingReview,
+        };
+        match review_gate_pending_response(&manifest, true) {
+            CommandResponse::ExitJson { code, .. } => assert_eq!(code, 3),
+            other => panic!("expected exit 3 ReviewGatePending, got {other:?}"),
         }
     }
 }

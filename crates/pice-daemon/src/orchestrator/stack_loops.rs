@@ -219,21 +219,13 @@ pub async fn run_stack_loops_with_cancel(
     // Build DAG for ordering
     let dag = config.build_dag().context("failed to build layer DAG")?;
 
-    // Create manifest and persist initial state
-    let mut manifest = VerificationManifest::new(&feature_id, project_root);
-    manifest.overall_status = ManifestStatus::InProgress;
-
-    // Ensure state directory exists and persist the in-progress manifest.
-    // On crash/retry, the daemon can resume from this checkpoint.
+    // Compute manifest path up front so we can attempt to resume from disk.
     let manifest_path = match VerificationManifest::manifest_path_for(&feature_id, project_root) {
         Ok(path) => {
             if let Some(parent) = path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     warn!("failed to create manifest state dir: {e}");
                 }
-            }
-            if let Err(e) = manifest.save(&path) {
-                warn!("failed to persist initial manifest: {e}");
             }
             Some(path)
         }
@@ -242,6 +234,50 @@ pub async fn run_stack_loops_with_cancel(
             None
         }
     };
+
+    // Resume-from-disk (Phase 6): if a manifest already exists on disk for
+    // this feature, load it so previously decided layers (Passed / Failed /
+    // Skipped / PendingReview) and prior gates (including reject counters)
+    // survive across `pice evaluate` re-invocations driven by the CLI auto-
+    // resume loop. Without this, every re-invocation would start from a
+    // fresh manifest, wipe all reviewer decisions, and re-fire the same
+    // gates indefinitely. Pending/InProgress layer entries are stale (a
+    // retry-after-reject, or a crash-interrupted run) and get re-evaluated
+    // in this invocation — their stale entries are dropped in the per-
+    // cohort layer loop below.
+    let mut manifest = manifest_path
+        .as_ref()
+        .filter(|p| p.exists())
+        .and_then(|p| match VerificationManifest::load(p) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!(
+                    path = %p.display(),
+                    error = %e,
+                    "failed to load existing manifest; starting fresh"
+                );
+                None
+            }
+        })
+        .inspect(|loaded| {
+            info!(
+                feature_id = %feature_id,
+                existing_layers = loaded.layers.len(),
+                existing_gates = loaded.gates.len(),
+                prior_status = ?loaded.overall_status,
+                "resuming from existing manifest"
+            );
+        })
+        .unwrap_or_else(|| VerificationManifest::new(&feature_id, project_root));
+    manifest.overall_status = ManifestStatus::InProgress;
+
+    // Persist the in-progress checkpoint (fresh or resumed) so that a
+    // mid-run crash leaves the manifest discoverable by the next evaluate.
+    if let Some(ref path) = manifest_path {
+        if let Err(e) = manifest.save(path) {
+            warn!("failed to persist initial manifest: {e}");
+        }
+    }
 
     // Phase 5 cohort parallelism: compute the concurrency cap once per
     // evaluation. `defaults.max_parallelism: None` → `num_cpus::get()`
@@ -296,6 +332,44 @@ pub async fn run_stack_loops_with_cancel(
         let mut work_inputs: Vec<LayerInputs> = Vec::new();
 
         for layer_name in cohort {
+            // Resume-preserve: if a prior run's manifest already carries a
+            // decided result for this layer (Passed / Failed / Skipped /
+            // PendingReview), move it into `immediate_results` so the DAG-
+            // order emission carries it forward unchanged. We do NOT re-
+            // evaluate. Pending/InProgress entries are stale (retry path
+            // or crash-interrupted) and are dropped here so the cohort
+            // processes them as new work.
+            if let Some(idx) = manifest.layers.iter().position(|l| &l.name == layer_name) {
+                let existing_status = manifest.layers[idx].status.clone();
+                if matches!(
+                    existing_status,
+                    LayerStatus::Passed
+                        | LayerStatus::Failed
+                        | LayerStatus::Skipped
+                        | LayerStatus::PendingReview
+                ) {
+                    debug!(
+                        layer = %layer_name,
+                        status = ?existing_status,
+                        "resume: preserving decided layer result"
+                    );
+                    let preserved = manifest.layers.remove(idx);
+                    immediate_results.insert(layer_name.clone(), preserved);
+                    immediate_chunks.insert(
+                        layer_name.clone(),
+                        vec![format!("  [{layer_name}] resumed ({existing_status:?})\n")],
+                    );
+                    continue;
+                }
+                // Stale Pending/InProgress — drop it; we're about to re-run.
+                debug!(
+                    layer = %layer_name,
+                    status = ?existing_status,
+                    "resume: dropping stale non-terminal layer entry; will re-evaluate"
+                );
+                manifest.layers.remove(idx);
+            }
+
             if !active.contains(layer_name) {
                 debug!(layer = %layer_name, "skipping inactive layer");
                 immediate_results.insert(
@@ -611,6 +685,52 @@ pub async fn run_stack_loops_with_cancel(
         if cancel.is_cancelled() {
             warn!("cancellation observed between cohorts; aborting remaining cohorts");
             break;
+        }
+
+        // Phase 6 review-gate cohort-boundary check (Task 5):
+        // For every layer in this cohort that just graded Passed, consult
+        // the workflow's review trigger and any per-layer override. If any
+        // gate fires, record it on the manifest, transition the affected
+        // layer(s) to `PendingReview`, set `overall_status = PendingReview`,
+        // persist the manifest, and break out of the cohort loop so the
+        // evaluate handler returns control to the caller. The per-manifest
+        // locks (tokio mutex + fs2 flock) are released naturally when the
+        // handler returns — subsequent `ReviewGate::Decide` RPCs acquire
+        // them without contention. This is the "lock release between
+        // cohorts" invariant from plan Task 5, implemented via handler
+        // early-return rather than intra-run lock juggling.
+        let gate_check = pice_core::gate::check_gates_for_cohort(
+            cfg.workflow,
+            &manifest.layers,
+            &manifest.gates,
+            cohort,
+            &feature_id,
+            cfg.workflow.defaults.tier,
+            "", // change_scope — filled by a later phase when real scope detection lands.
+            chrono::Utc::now(),
+        );
+        if gate_check.any() {
+            // Transition the named layers Passed → PendingReview.
+            for name in &gate_check.layers_pending_review {
+                if let Some(layer) = manifest.layers.iter_mut().find(|l| l.name == *name) {
+                    layer.status = LayerStatus::PendingReview;
+                }
+            }
+            // Append gates and recompute overall status.
+            manifest.gates.extend(gate_check.new_gates);
+            manifest.compute_overall_status();
+            // Persist so the decide handler sees the gates.
+            if let Some(ref path) = manifest_path {
+                if let Err(e) = manifest.save(path) {
+                    warn!("failed to persist pending-review manifest: {e}");
+                }
+            }
+            info!(
+                cohort_index = cohort_idx,
+                pending_layers = ?gate_check.layers_pending_review,
+                "review gate(s) fired; pausing evaluation"
+            );
+            return Ok(manifest);
         }
     }
 
@@ -2018,6 +2138,142 @@ mod tests {
         assert_eq!(
             effective_adaptive_algo_for(&wf, "frontend"),
             pice_core::workflow::schema::AdaptiveAlgo::BayesianSprt
+        );
+    }
+
+    /// Phase 6 cohort-boundary gate check — orchestrator-side test that
+    /// exercises the same pure `pice_core::gate::check_gates_for_cohort`
+    /// helper the orchestrator calls at the cohort boundary. Contract
+    /// criterion #1 names this exact test location (the pure helper's
+    /// deep tests live in `pice-core::gate::tests`; this alias pins the
+    /// orchestrator-side integration to the same named assertion).
+    #[test]
+    fn check_gates_for_cohort_with_matching_trigger_enqueues_gate_with_pinned_fields() {
+        use pice_core::layers::manifest::{LayerResult, LayerStatus};
+        use pice_core::workflow::schema::{OnTimeout, ReviewConfig};
+        use std::collections::BTreeMap;
+
+        let workflow = pice_core::workflow::WorkflowConfig {
+            schema_version: "0.2".to_string(),
+            defaults: pice_core::workflow::schema::Defaults {
+                tier: 2,
+                min_confidence: 0.9,
+                max_passes: 5,
+                model: "sonnet".to_string(),
+                budget_usd: 0.0,
+                cost_cap_behavior: pice_core::workflow::schema::CostCapBehavior::Halt,
+                max_parallelism: None,
+            },
+            phases: pice_core::workflow::schema::Phases::default(),
+            layer_overrides: BTreeMap::new(),
+            review: Some(ReviewConfig {
+                enabled: true,
+                trigger: Some("layer == infrastructure".to_string()),
+                timeout_hours: 24,
+                on_timeout: OnTimeout::Reject,
+                notification: "stdout".to_string(),
+                retry_on_reject: 1,
+            }),
+            seams: None,
+        };
+        let layers = vec![LayerResult {
+            name: "infrastructure".to_string(),
+            status: LayerStatus::Passed,
+            passes: Vec::new(),
+            seam_checks: Vec::new(),
+            halted_by: None,
+            final_confidence: Some(0.95),
+            total_cost_usd: Some(0.01),
+            escalation_events: None,
+        }];
+        let now: chrono::DateTime<chrono::Utc> = "2026-04-20T00:00:00Z".parse().unwrap();
+        let out = pice_core::gate::check_gates_for_cohort(
+            &workflow,
+            &layers,
+            &[],
+            &["infrastructure".to_string()],
+            "feat-6",
+            2,
+            "",
+            now,
+        );
+        assert_eq!(out.new_gates.len(), 1);
+        assert_eq!(out.layers_pending_review, vec!["infrastructure"]);
+        let g = &out.new_gates[0];
+        assert_eq!(g.layer, "infrastructure");
+        assert_eq!(g.reject_attempts_remaining, 1);
+        assert_eq!(g.on_timeout_action, OnTimeout::Reject);
+    }
+
+    /// Phase 6: cohort-boundary check preserves the reject counter
+    /// across re-gate events within one feature run. Contract
+    /// criterion #7 names this exact test location.
+    #[test]
+    fn check_gates_for_cohort_reuses_reject_counter_from_prior_gate() {
+        use pice_core::layers::manifest::{GateEntry, GateStatus, LayerResult, LayerStatus};
+        use pice_core::workflow::schema::{OnTimeout, ReviewConfig};
+        use std::collections::BTreeMap;
+
+        let workflow = pice_core::workflow::WorkflowConfig {
+            schema_version: "0.2".to_string(),
+            defaults: pice_core::workflow::schema::Defaults {
+                tier: 2,
+                min_confidence: 0.9,
+                max_passes: 5,
+                model: "sonnet".to_string(),
+                budget_usd: 0.0,
+                cost_cap_behavior: pice_core::workflow::schema::CostCapBehavior::Halt,
+                max_parallelism: None,
+            },
+            phases: pice_core::workflow::schema::Phases::default(),
+            layer_overrides: BTreeMap::new(),
+            review: Some(ReviewConfig {
+                enabled: true,
+                trigger: Some("layer == infrastructure".to_string()),
+                timeout_hours: 24,
+                on_timeout: OnTimeout::Reject,
+                notification: "stdout".to_string(),
+                retry_on_reject: 2,
+            }),
+            seams: None,
+        };
+        let layers = vec![LayerResult {
+            name: "infrastructure".to_string(),
+            status: LayerStatus::Passed,
+            passes: Vec::new(),
+            seam_checks: Vec::new(),
+            halted_by: None,
+            final_confidence: Some(0.95),
+            total_cost_usd: Some(0.01),
+            escalation_events: None,
+        }];
+        let prior = GateEntry {
+            id: "feat-6:infrastructure:aaaa".to_string(),
+            layer: "infrastructure".to_string(),
+            status: GateStatus::Rejected,
+            trigger_expression: "layer == infrastructure".to_string(),
+            requested_at: "2026-04-20T00:00:00Z".to_string(),
+            timeout_at: "2026-04-21T00:00:00Z".to_string(),
+            on_timeout_action: OnTimeout::Reject,
+            reject_attempts_remaining: 0,
+            decision: Some("reject".to_string()),
+            decided_at: Some("2026-04-20T00:05:00Z".to_string()),
+        };
+        let now: chrono::DateTime<chrono::Utc> = "2026-04-20T00:10:00Z".parse().unwrap();
+        let out = pice_core::gate::check_gates_for_cohort(
+            &workflow,
+            &layers,
+            &[prior],
+            &["infrastructure".to_string()],
+            "feat-6",
+            2,
+            "",
+            now,
+        );
+        assert_eq!(out.new_gates.len(), 1);
+        assert_eq!(
+            out.new_gates[0].reject_attempts_remaining, 0,
+            "reject budget must persist from prior gate (0), not reset to 2"
         );
     }
 }

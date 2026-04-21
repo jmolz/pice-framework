@@ -234,6 +234,70 @@ pub fn csv_escape(s: &str) -> String {
     }
 }
 
+/// Phase 6: CSV export of `gate_decisions` rows matching `filter`.
+///
+/// Column order mirrors the table schema for easy spreadsheet import.
+/// Re-uses [`csv_escape`] so reviewer names / reasons with commas or
+/// quotes roundtrip cleanly. Empty `Option<String>` fields emit `""`
+/// (a quoted empty cell) rather than blank to keep the CSV parse-stable.
+pub fn format_gate_decisions_csv(
+    db: &MetricsDb,
+    filter: &crate::metrics::store::GateDecisionsFilter,
+) -> Result<String> {
+    let rows = crate::metrics::store::query_gate_decisions(db, filter)?;
+    let mut csv = String::from(
+        "id,gate_id,feature_id,layer,trigger_expression,decision,reviewer,reason,\
+         requested_at,decided_at,elapsed_seconds\n",
+    );
+    for r in rows {
+        csv.push_str(&format!(
+            "{id},{gate_id},{feature_id},{layer},{trigger},{decision},{reviewer},{reason},\
+             {requested_at},{decided_at},{elapsed}\n",
+            id = r.id,
+            gate_id = csv_escape(&r.gate_id),
+            feature_id = csv_escape(&r.feature_id),
+            layer = csv_escape(&r.layer),
+            trigger = csv_escape(&r.trigger_expression),
+            decision = csv_escape(&r.decision),
+            reviewer = csv_escape(r.reviewer.as_deref().unwrap_or("")),
+            reason = csv_escape(r.reason.as_deref().unwrap_or("")),
+            requested_at = csv_escape(&r.requested_at),
+            decided_at = csv_escape(&r.decided_at),
+            elapsed = r.elapsed_seconds,
+        ));
+    }
+    Ok(csv)
+}
+
+/// Phase 6: JSON export of `gate_decisions` rows (for `--json` mode).
+/// Returns a `serde_json::Value` array so the handler can embed it
+/// under a top-level `{"decisions": [...]}` without re-parsing.
+pub fn format_gate_decisions_json(
+    db: &MetricsDb,
+    filter: &crate::metrics::store::GateDecisionsFilter,
+) -> Result<serde_json::Value> {
+    let rows = crate::metrics::store::query_gate_decisions(db, filter)?;
+    let arr: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "gate_id": r.gate_id,
+                "feature_id": r.feature_id,
+                "layer": r.layer,
+                "trigger_expression": r.trigger_expression,
+                "decision": r.decision,
+                "reviewer": r.reviewer,
+                "reason": r.reason,
+                "requested_at": r.requested_at,
+                "decided_at": r.decided_at,
+                "elapsed_seconds": r.elapsed_seconds,
+            })
+        })
+        .collect();
+    Ok(serde_json::Value::Array(arr))
+}
+
 pub fn format_csv(db: &MetricsDb) -> Result<String> {
     let conn = db.conn();
     let mut stmt = conn

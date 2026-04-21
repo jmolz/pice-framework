@@ -83,6 +83,10 @@ cargo test -p pice-daemon --test parallel_cohort_integration --test parallel_coh
 # Phase 5 criterion bench (advisory — does NOT fail CI on regression; speedup gate lives in the assertion test above)
 cargo bench -p pice-daemon --bench parallel_cohort_speedup -- --quick
 
+# Phase 6 review gates (lifecycle scenarios, resume-from-disk, timeout reconciliation, idempotent recovery, project scoping)
+cargo test -p pice-daemon --test review_gate_lifecycle_integration
+cargo test -p pice-cli --test evaluate_review_gate_pending --test audit_gates_csv_roundtrip
+
 # TS provider stack
 pnpm test
 ```
@@ -136,6 +140,25 @@ pnpm test
 | `provider-stub/__tests__/atomic-scores.test.ts` (8 tests) | Per-layer score isolation contract | `perLayerScoreEnvName` normalization, `parseStubScores` independence, 6 concurrent `Promise.all` interleaved (backend → [8,9,10], frontend → [7,7,7]), 50-iteration stress test across two layers, read-only array semantics |
 | `provider-stub/__tests__/latency.test.ts` (10 tests) | `PICE_STUB_LATENCY_MS` real-clock wait | env variants (unset, `200`, invalid), elapsed ≥ 190 ms at 200 ms env (documents ~50 ms jitter tolerance) |
 
+**Phase 6 review gates (branch feature/phase-6-review-gates, 938 tests total after Phase 6 ships)**
+
+| Test File | Feature | What It Validates |
+| --------- | ------- | ----------------- |
+| `pice-daemon/tests/review_gate_lifecycle_integration.rs` (11 tests) | End-to-end gate scenarios | `scenario_1_trigger_fires` (pure `check_gates_for_cohort` fires gate with pinned `timeout_at` + `reject_budget`), `scenario_2_list_returns_pinned_fields`, `scenario_3_approve_completes` (audit + layer back to Passed), `scenario_4a/4b` (reject-with-retry decrements, reject-no-retry halts exit 2) + `scenario_4_reject_retry_cycle` (full retry cycle chained), `scenario_5_skip_keeps_layer_passed`, `scenario_7_concurrent_decide` (UNIQUE CAS → `ReviewGateConflict`), `scenario_8_cancellation_during_pending_review` (cancelled token + PendingReview manifest must not deadlock), `approve_does_not_decrement_reject_counter` + `skip_does_not_decrement_reject_counter` (counter invariants for contract criterion #7) |
+| `pice-cli/tests/evaluate_review_gate_pending.rs` (1 test) | Non-TTY/JSON exit 3 | `evaluate_json_mode_returns_review_gate_pending_exit_three` — seeds pending-review manifest via project hash, runs `pice evaluate --json`, asserts exit 3 + `status: "review-gate-pending"` + `pending_gates[0].layer`; uses `project_root.canonicalize()` for macOS `/var/folders/` symlink handling |
+| `pice-cli/tests/audit_gates_csv_roundtrip.rs` (3 tests) | `pice audit gates` export | `csv_has_header_plus_three_data_rows`, `csv_filters_by_feature`, `json_mode_emits_decisions_array` — contract criterion #11 exportable audit trail |
+| `pice-daemon/src/handlers/review_gate.rs::tests` (11 inline tests) | Decide handler unit coverage | `decide_approve_records_audit_and_updates_manifest`, `decide_skip_keeps_layer_passed_records_audit`, `decide_reject_with_retry_decrements_counter_layer_returns_pending`, `decide_reject_without_retry_halts_with_gate_rejected`, `decide_on_already_decided_gate_returns_review_gate_conflict`, `decide_unique_violation_on_gate_id_surfaces_as_conflict` (mismatched decisions → Conflict), `decide_same_decision_recovers_idempotently` (matching decisions → reuse prior audit_id, no duplicate insert), `decide_writes_audit_before_manifest_on_success`, `decide_audit_failure_does_not_mutate_manifest` (DB-open failure), `decide_audit_insert_failure_preserves_manifest_state` (chmod 0o444 mid-insert failure), `list_returns_pending_gates_across_features` |
+| `pice-daemon/src/handlers/evaluate.rs::tests::evaluate_releases_locks_between_cohorts` (1 inline test) | Per-manifest lock release invariant | Exercises `DaemonContext::manifest_lock_for` with `tokio::time::timeout(250ms)` on sequential acquires; leaked guard would trip the timeout. Also asserts same `Arc<Mutex<_>>` for same `(namespace, feature_id)` — catches lock-identity regressions |
+| `pice-daemon/src/handlers/audit.rs::tests` (~5 inline tests) | Audit RPC | Query filters (feature_id, since), CSV export shape, corrupt-DB surfaces as error (not empty result — Codex bug #4 regression guard), fresh-repo returns empty result |
+| `pice-daemon/src/metrics/store.rs::tests` (Phase 6 additions: +8 tests) | gate_decisions SQLite surface | `insert_gate_decision` canonicalizes RFC3339 (`+00:00` → `Z`), UNIQUE(gate_id) surfaces as typed `DuplicateGateId`, `find_gate_decision_by_id` roundtrip (idempotent-recovery helper), `query_gate_decisions` ordering + filtering, `canonicalize_rfc3339_normalizes_plus_zero_to_z` + `canonicalize_rfc3339_passes_through_unparseable_with_warn` (Codex bug #5 regression guard), CHECK constraint on `decision` column |
+| `pice-daemon/src/metrics/db.rs::tests` (Phase 6 additions: `migrate_from_v3_to_v4`, `migration_v4_is_idempotent_across_reopens`) | v4 SQLite migration | `gate_decisions` table created with full schema; `UNIQUE(gate_id)` + `CHECK(decision IN (...))` + `CHECK(elapsed_seconds >= 0)` constraints; indexes exist; idempotent across reopens |
+| `pice-core/src/gate.rs::tests` (~18 inline tests) | Pure gate state-machine | `resolve_timeout_action_returns_none_when_status_not_pending` (Codex C3 decide/reap race), `apply_timeout_if_expired_*` (Approve/Reject/Skip branches), `from_audit_decision_string` roundtrip coverage for all 6 decision strings, `check_gates_for_cohort_with_matching_trigger_enqueues_gate_with_pinned_fields`, `check_gates_for_cohort_reuses_reject_counter_from_prior_gate` (Codex C6 persistence), `require_review_override_forces_gate_regardless_of_trigger_expression`, `check_gates_for_cohort_skips_non_passed_layers`, `new_gate_id_uniqueness_stress_16x128_threads` |
+| `pice-core/src/layers/manifest.rs::tests` (Phase 6 additions: +4 tests) | Schema v0.2 → v0.3 migration | `load_accepts_v0_2_manifest_with_empty_gates_default` (soft migration in-memory upgrade), `save_always_writes_v0_3`, `schema_version_unknown_rejects_with_named_error` (typed `ManifestError::UnsupportedSchema`), `compute_overall_status_pending_review_wins_over_in_progress` (PendingReview > InProgress rule, Failed > PendingReview rule) |
+| `pice-core/src/workflow/merge.rs::tests` (Phase 6 additions: `retry_on_reject` floor-merge tests) | `retry_on_reject` raise-only floor | User overlay can raise but not lower the project-committed reject budget; per-layer override floors to `max(project_review.retry_on_reject, project_layer.retry_on_reject)`; approve/skip don't trigger floor logic |
+| `pice-daemon/src/clock.rs::tests` (Phase 6 new, 4 inline tests) | MockClock + Clock trait | `system_clock_now_returns_utc`, `mock_clock_advance_wakes_sleepers`, `mock_clock_set_jumps_time`, `mock_clock_trait_object_works` — `MockClock` gated `#[cfg(test)]` to keep `expect()` out of production code (clippy::expect_used deny) |
+| `pice-cli/src/commands/evaluate.rs::tests` (Phase 6 additions) | TTY auto-resume loop | `is_review_gate_pending_detects_status_discriminant`, `extract_pending_gates_from_response` shape, CLI exits 1 after 10-iteration cap reached |
+| `pice-cli/src/input/decision_source.rs::tests` (Phase 6, 2 inline tests) | `render_prompt` pure helper | `render_prompt_includes_details_when_provided`, `render_prompt_omits_detail_separator_when_none`. The original `DecisionSource` trait was Phase-6 scaffolding that `StdinLock: !Send` blocked from wiring into the async handler path; the Pass-3 review removed it along with the `Scripted`/`Piped`/`Tty` impl structs. Only the pure `render_prompt` helper survived — both production prompt call sites read stdin directly while using this helper for the box-drawing string |
+
 ### Source files these tests protect
 
 - `crates/pice-cli/src/main.rs` — CLI entrypoint
@@ -172,10 +195,28 @@ pnpm test
 - `crates/pice-daemon/Cargo.toml` — Phase 5 `[target.'cfg(unix)'.dev-dependencies] libc = "0.2"` for orphan-PID liveness probe in cancellation test; `tokio-util` with `rt` feature for `CancellationToken`
 - `packages/provider-stub/src/deterministic.ts` — Phase 5 `perLayerScoreEnvName` + `PICE_STUB_SCORES_<LAYER>` per-layer isolation (disjoint score arrays, zero shared-iterator contention)
 - `packages/provider-stub/src/index.ts` — Phase 5 `PICE_STUB_LATENCY_MS` real-clock setTimeout, `PICE_STUB_ALIVE_FILE` alive/done PID sentinel, `PICE_STUB_REQUEST_LOG` per-request JSONL capture
+- `crates/pice-core/src/gate.rs` — Phase 6 pure gate state-machine: `GateDecision`, `GateDecisionOutcome` (with `from_audit_decision_string` reverse-parse for crash recovery), `resolve_timeout_action`, `apply_timeout_if_expired` (in-place mutator), `check_gates_for_cohort` (cohort-boundary firing + already-resolved skip), `effective_retry_on_reject`, `new_gate_id` (stress-tested for uniqueness)
+- `crates/pice-core/src/layers/manifest.rs` — Phase 6 schema v0.3 with `gates: Vec<GateEntry>`, `GateStatus` (Pending/Approved/Rejected/Skipped/TimedOut), `LayerStatus::PendingReview`, `ManifestStatus::PendingReview`, `compute_overall_status` (PendingReview > InProgress, Failed > PendingReview), soft-migration v0.2 load with `gates: []` default, typed `ManifestError::UnsupportedSchema`
+- `crates/pice-core/src/cli/mod.rs` — Phase 6 `CommandRequest::{ReviewGate, Audit}` variants, `ReviewGateRequest` + `ReviewGateSubcommand::{List, Decide}`, `AuditRequest` + `AuditSubcommand::Gates`, `GateDecideResponse` / `GateListEntry` / `GateListResponse` DTOs, `ExitJsonStatus` variants (`ReviewGatePending` exit 3, `ReviewGateRejected` exit 2, `ReviewGateConflict` exit 1) with `HALTED_GATE_REJECTED` / `HALTED_GATE_TIMEOUT_REJECT` prefix constants + `is_gate_halt()` helper
+- `crates/pice-core/src/workflow/schema.rs` — Phase 6 `ReviewConfig.retry_on_reject: u32` raise-only floor, `LayerOverride.{require_review, retry_on_reject}` per-layer grants
+- `crates/pice-core/src/workflow/merge.rs` — Phase 6 `retry_on_reject` raise-only floor-merge (user overlay can raise but never lower)
+- `crates/pice-daemon/src/clock.rs` — Phase 6 `Clock` trait + `SystemClock` production impl + `MockClock` `#[cfg(test)]` test impl (gated to keep `.expect()` out of production per clippy::expect_used deny). Scaffolding for the Task 8 background reconciler
+- `crates/pice-daemon/src/handlers/review_gate.rs` — Phase 6 `pice review-gate` handler: project-scoped `resolve_project_scoped_state_dir` (prevents cross-project gate mutation + split-brain audit), `run_list` (filters Pending gates in caller's project namespace), `run_decide` with audit-before-manifest ordering, idempotent crash-recovery via `find_gate_decision_by_id` (same-decision retry reuses prior audit_id; mismatched decision surfaces `ReviewGateConflict`), UNIQUE CAS race-loser re-fetch fallback
+- `crates/pice-daemon/src/handlers/audit.rs` — Phase 6 `pice audit gates` handler: CSV/JSON export, feature_id + since filters, fresh-repo returns empty (missing DB file), corrupt-DB surfaces error (Codex bug #4 fix)
+- `crates/pice-daemon/src/handlers/evaluate.rs` — Phase 6 `review_gate_pending_response` (exit 3 + `pending_gates[]` array), `reconcile_expired_gates_inline` (pure scan → audit first → mutate on success; partial Task 8), auto-resume short-circuit on existing PendingReview manifest (before `run_stack_loops`), PendingReview post-run routing to exit 3
+- `crates/pice-daemon/src/orchestrator/stack_loops.rs` — Phase 6 resume-from-disk: `VerificationManifest::load(manifest_path)` on entry preserves decided layers (Passed/Failed/Skipped/PendingReview) + prior gates; per-cohort layer loop moves terminal/PendingReview entries into `immediate_results` unchanged, drops stale Pending/InProgress entries; cohort-boundary `check_gates_for_cohort` call with early-return on gate fire (natural lock release via handler return — the "release between cohorts" invariant implementation)
+- `crates/pice-daemon/src/metrics/db.rs` — Phase 6 v4 migration adding `gate_decisions` table with `UNIQUE(gate_id)`, `CHECK(decision IN ('approve','reject','skip','timeout_approve','timeout_reject','timeout_skip'))`, `CHECK(elapsed_seconds >= 0)`, indexes on `(feature_id, decided_at)`; idempotent across reopens
+- `crates/pice-daemon/src/metrics/store.rs` — Phase 6 `insert_gate_decision` with RFC3339 canonicalization at write boundary, typed `GateInsertError::{DuplicateGateId, Other}`, `find_gate_decision_by_id` (crash-recovery helper), `query_gate_decisions` with filters + LIMIT, `GateDecisionRecord` owned-row shape; `canonicalize_rfc3339` normalizes `+00:00`/`Z` → `Z` (Codex bug #5 fix)
+- `crates/pice-cli/src/commands/review_gate.rs` — Phase 6 `pice review-gate` CLI (list/decide modes, TTY prompt via direct stdin reads due to `StdinLock: !Send`, `$USER`/`$USERNAME` reviewer fallback, MissingDecision exit)
+- `crates/pice-cli/src/commands/audit.rs` — Phase 6 `pice audit gates` CLI (CSV/JSON output, feature_id + since filters)
+- `crates/pice-cli/src/commands/evaluate.rs` — Phase 6 TTY auto-resume loop: detects exit-3 review-gate-pending, prompts via `DecisionSource`, re-invokes evaluate, bounded at 10 iterations
+- `crates/pice-cli/src/input/decision_source.rs` — Phase 6 `render_prompt` pure helper for the Unicode box-drawing reviewer prompt (writes to stderr per the Channel ownership invariant). Earlier trait-based abstraction was removed after the Pass-3 review flagged it as unused scaffolding
+- `crates/pice-daemon/src/test_support.rs` — Phase 6 `StateDirGuard` RAII helper for `PICE_STATE_DIR` mutation across the lib-test binary and integration-test binaries. Shared `pub` module so the struct definition can't drift; each binary gets its own static `Mutex<()>` via `OnceLock`
+- `templates/pice/workflow.yaml` — Phase 6 `review.retry_on_reject` default + per-layer `require_review` examples
 
 ### Expected results
 
-All tests should pass. Baseline: **829 Rust tests (1 ignored — doc-test in `crates/pice-daemon/src/handlers/mod.rs` line 5), 96 TypeScript tests, 0 lint errors, 0 warnings, clean release build.**
+All tests should pass. Baseline: **931 Rust tests (1 ignored — doc-test in `crates/pice-daemon/src/handlers/mod.rs` line 5), 96 TypeScript tests, 0 lint errors, 0 warnings, clean release build.** (Phase 6 ships at 938; pre-Phase-6 was 903; pre-Phase-5 was 836; pre-Phase-4 was 829.)
 
 If any fail after your changes:
 
@@ -220,7 +261,7 @@ pnpm build
 cargo build --release
 ```
 
-Expected baseline: **829 Rust tests passing (1 ignored — doc-test in `pice-daemon/src/handlers/mod.rs`), 96 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.**
+Expected baseline: **931 Rust tests passing (1 ignored — doc-test in `pice-daemon/src/handlers/mod.rs`), 96 TypeScript tests passing, 0 lint errors, 0 clippy warnings (workspace + lib unwrap/expect denies), clean release build.**
 
 ## Phase 3: Code Review of Current Changes
 
@@ -304,7 +345,20 @@ Phase 5 cohort parallelism:
   - metrics/store db_backed_pass_sink_concurrent_record_no_lost_writes (1 test): ✓ / ✗
   - TS atomic-scores + latency (18 tests): ✓ / ✗
 
-Full Suite: 829 / 96 tests passing
+Phase 6 review gates:
+  - review_gate_lifecycle_integration (11 tests — trigger fires, list/pinned fields, approve/reject/skip, retry cycle, concurrent decide, cancellation during PendingReview): ✓ / ✗
+  - evaluate_review_gate_pending (1 test — JSON mode exit 3 with pending_gates payload): ✓ / ✗
+  - audit_gates_csv_roundtrip (3 tests — CSV header+rows, filter, JSON mode): ✓ / ✗
+  - handlers::review_gate::tests (11 inline tests — decide lifecycle, UNIQUE CAS, idempotent recovery, audit-insert-failure ordering): ✓ / ✗
+  - handlers::evaluate::tests::evaluate_releases_locks_between_cohorts (1 test — per-manifest lock release via tokio timeout): ✓ / ✗
+  - metrics/db::tests v4 migration (migrate_from_v3_to_v4 + idempotency-across-reopens): ✓ / ✗
+  - metrics/store::tests gate_decisions (~8 tests — canonicalize_rfc3339, UNIQUE error typing, find_gate_decision_by_id roundtrip, query filters, CHECK constraint): ✓ / ✗
+  - pice-core gate::tests (~18 tests — timeout resolution, check_gates_for_cohort cohort firing + already-resolved skip + reject-counter persistence, GateDecisionOutcome roundtrip): ✓ / ✗
+  - pice-core manifest::tests schema-v0.3 (4 tests — soft-migration v0.2→v0.3, typed UnsupportedSchema, PendingReview overall-status precedence): ✓ / ✗
+  - pice-core workflow/merge::tests retry_on_reject floor-merge: ✓ / ✗
+  - clock.rs inline tests (MockClock gated `#[cfg(test)]`): ✓ / ✗
+
+Full Suite: 938 / 96 tests passing (Phase 6 ships at 931 Rust tests; 830 was pre-Phase-4 baseline)
 Lint: 0 errors, 0 warnings (workspace + lib unwrap/expect denies)
 Build: PASS / FAIL
 ```

@@ -43,6 +43,15 @@ pub enum CommandRequest {
     Benchmark(BenchmarkRequest),
     Layers(LayersRequest),
     Validate(ValidateRequest),
+    /// Phase 6: list pending review gates or record a reviewer decision.
+    /// Subcommand-dispatched so the CLI binds `pice review-gate --list`
+    /// and `pice review-gate --gate-id … --decision …` to different
+    /// fields without requiring two RPC method names.
+    ReviewGate(ReviewGateRequest),
+    /// Phase 6: export the `gate_decisions` audit trail (CSV / JSON).
+    /// First subcommand is `Gates`; additional audit surfaces (e.g.,
+    /// `Seams`) can extend the enum without a new RPC variant.
+    Audit(AuditRequest),
     // NOTE: Completions is handled entirely by clap at the CLI layer.
     // NOTE: Daemon subcommand (start/stop/etc.) is also CLI-only.
 }
@@ -126,6 +135,41 @@ pub enum ExitJsonStatus {
     /// from "evaluation succeeded but metrics didn't land" — both have
     /// operator-observable consequences but very different remediations.
     MetricsPersistFailed,
+
+    /// Phase 6 review gates: a gate was rejected with no retries remaining
+    /// (or the `on_timeout: reject` branch fired on an expired gate). The
+    /// layer is `Failed` and the overall manifest is `Failed` — exit 2,
+    /// treated like a contract failure because the reviewer explicitly
+    /// declined the change.
+    ReviewGateRejected,
+
+    /// Phase 6 review gates: a gate with `on_timeout: reject` expired
+    /// without a decision and the reconciler fired the timeout action.
+    /// Distinct from `ReviewGateRejected` so dashboards can surface
+    /// timeout rates separately from manual-reject rates. Exit 2.
+    ReviewGateTimeout,
+
+    /// Phase 6 review gates: a concurrent `pice review-gate --decision`
+    /// call raced another reviewer — the second caller's SQLite write
+    /// hit the `gate_decisions.gate_id` UNIQUE constraint, or the gate
+    /// had already transitioned out of `Pending` before the handler
+    /// acquired the manifest locks. Exit 1 (operator-actionable; the
+    /// first reviewer's decision is the source of truth).
+    ReviewGateConflict,
+
+    /// Phase 6 review gates: `pice evaluate` ran to a gate boundary in
+    /// a non-TTY (CI / `--json`) context. The pending gates are reported
+    /// on stdout and the process exits with **3** so shell loops can
+    /// distinguish "work not done, needs reviewer action" from exit 1
+    /// (failure) / exit 2 (rejected). New exit code — extends the
+    /// existing 0/1/2 surface without overlap.
+    ReviewGatePending,
+
+    /// Phase 6 review gates: `pice review-gate` invoked without the
+    /// flag combination needed to identify a decision target (e.g.,
+    /// neither `--list` nor `--gate-id` supplied; or `--gate-id` with
+    /// no `--decision` and stdin is not a TTY). Exit 1.
+    MissingDecision,
 }
 
 impl ExitJsonStatus {
@@ -139,6 +183,28 @@ impl ExitJsonStatus {
     /// updates ONE site and both consumers pick it up automatically —
     /// closes Pass-11.1 W2 (duplicated routing logic).
     pub const METRICS_PERSIST_FAILED_PREFIX: &'static str = "metrics_persist_failed:";
+
+    /// Phase 6 review gates: `halted_by` prefix for a layer that was
+    /// rejected at a review gate with no retries remaining. Emitted by
+    /// the `ReviewGate::Decide` handler; consumers map to exit code 2
+    /// (`LayerStatus::Failed`, `ManifestStatus::Failed`).
+    pub const HALTED_GATE_REJECTED: &'static str = "gate_rejected";
+
+    /// Phase 6 review gates: `halted_by` prefix for a layer that timed
+    /// out at a review gate with `on_timeout: reject`. Emitted by the
+    /// `GateReconciler` and the `gate/decide` timeout prelude. Maps to
+    /// exit code 2 alongside [`Self::HALTED_GATE_REJECTED`].
+    pub const HALTED_GATE_TIMEOUT_REJECT: &'static str = "gate_timeout_reject";
+
+    /// True if `halted_by` represents a review-gate halt (either manual
+    /// reject-without-retries or timeout_reject). Used by both the
+    /// orchestrator's halt router and the CLI's exit-code mapper. Flat
+    /// underscore convention matches `sprt_*` — a future switch to
+    /// prefix-family (`gate_rejected:manual` / `gate_rejected:timeout`)
+    /// would only touch this module.
+    pub fn is_gate_halt(halted_by: &str) -> bool {
+        halted_by == Self::HALTED_GATE_REJECTED || halted_by == Self::HALTED_GATE_TIMEOUT_REJECT
+    }
 
     /// Wire prefix carried in the per-layer `LayerResult.halted_by` string
     /// when a parallel cohort task is cancelled (via
@@ -170,6 +236,43 @@ impl ExitJsonStatus {
             Self::MergedSeamValidationFailed => "merged-seam-validation-failed",
             Self::EvaluationFailed => "evaluation-failed",
             Self::MetricsPersistFailed => "metrics-persist-failed",
+            Self::ReviewGateRejected => "review-gate-rejected",
+            Self::ReviewGateTimeout => "review-gate-timeout",
+            Self::ReviewGateConflict => "review-gate-conflict",
+            Self::ReviewGatePending => "review-gate-pending",
+            Self::MissingDecision => "missing-decision",
+        }
+    }
+
+    /// Conventional process exit code for a given structured status.
+    ///
+    /// | Family | Exit | Semantics |
+    /// |--------|------|-----------|
+    /// | contract failure (reviewer reject, grading fail) | 2 | the change does not meet the bar |
+    /// | operational failure (parse, validation, persistence, conflict, missing decision) | 1 | tooling / config / race |
+    /// | `ReviewGatePending` | 3 | work paused pending human decision (Phase 6) |
+    ///
+    /// Centralizing the mapping here — instead of hardcoding `code: 1|2`
+    /// at each `ExitJson` construction site — lets a future release retire
+    /// an exit code with a single edit instead of N handler touches.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            // Contract/reviewer-level rejection family.
+            Self::EvaluationFailed
+            | Self::NoContractSection
+            | Self::ReviewGateRejected
+            | Self::ReviewGateTimeout => 2,
+            // Work-paused-waiting-for-human-review family (Phase 6).
+            Self::ReviewGatePending => 3,
+            // Operational failure family (everything else).
+            Self::PlanNotFound
+            | Self::PlanParseFailed
+            | Self::WorkflowValidationFailed
+            | Self::SeamFloorViolation
+            | Self::MergedSeamValidationFailed
+            | Self::MetricsPersistFailed
+            | Self::ReviewGateConflict
+            | Self::MissingDecision => 1,
         }
     }
 
@@ -314,6 +417,123 @@ pub struct ValidateRequest {
     pub json: bool,
     #[serde(default)]
     pub check_models: bool,
+}
+
+// ─── Phase 6: review-gate + audit request / response DTOs ───────────────────
+
+/// Top-level wire struct for `pice review-gate` commands. Mirrors the
+/// [`LayersRequest`] pattern: the subcommand discriminates list vs
+/// decide so one RPC variant serves both CLI entry points.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewGateRequest {
+    pub subcommand: ReviewGateSubcommand,
+    pub json: bool,
+}
+
+/// `action`-tagged review-gate subcommand enum. `list` returns every
+/// pending gate (optionally filtered to a feature); `decide` records a
+/// reviewer's approve/reject/skip against a specific gate id.
+///
+/// `reviewer` is the caller's resolved username (`$USER` / `$USERNAME`
+/// on the CLI side, never read from process env by the daemon) so the
+/// audit trail attributes every decision to a human or a CI bot name.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ReviewGateSubcommand {
+    List {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feature_id: Option<String>,
+    },
+    Decide {
+        gate_id: String,
+        decision: crate::gate::GateDecision,
+        reviewer: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+/// Response DTO for `ReviewGateSubcommand::List`. A cross-feature
+/// snapshot so `pice review-gate --list` can enumerate every gate
+/// blocking the user without per-feature RPC round-trips.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateListResponse {
+    pub gates: Vec<GateListEntry>,
+}
+
+/// Flattened view of a pending gate for the list RPC. Distinct from
+/// [`crate::layers::manifest::GateEntry`] because the list surfaces
+/// CROSS-feature data (it includes `feature_id`) while the manifest
+/// gate is always scoped to its owning feature.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GateListEntry {
+    pub id: String,
+    pub feature_id: String,
+    pub layer: String,
+    pub trigger_expression: String,
+    pub requested_at: String,
+    pub timeout_at: String,
+    pub reject_attempts_remaining: u32,
+}
+
+/// Response DTO for `ReviewGateSubcommand::Decide`. Includes the
+/// remaining `pending_gates` on the feature so a TTY-driven prompt
+/// loop on the CLI side can surface "2 of 3 gates decided" without an
+/// extra `List` round-trip — this closes the Claude Cycle-2 multi-gate
+/// race finding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GateDecideResponse {
+    /// The audit-decision string (one of `approve`, `reject`, `skip`,
+    /// `timeout_reject`, `timeout_approve`, `timeout_skip`). Distinct
+    /// from the requested `decision` because a timeout prelude may
+    /// have fired first — the response returns the outcome that
+    /// actually landed.
+    pub decision: String,
+    pub layer_status: crate::layers::manifest::LayerStatus,
+    pub manifest_status: crate::layers::manifest::ManifestStatus,
+    pub reject_attempts_remaining: u32,
+    /// Remaining gates on the same feature that still need a decision
+    /// after this one. Empty vec → the CLI loop can now re-invoke
+    /// `pice evaluate` to resume the cohort loop.
+    pub pending_gates: Vec<crate::layers::manifest::GateEntry>,
+    /// SQLite `gate_decisions.id` of the audit row inserted by this
+    /// decision. Operationally useful for linking dashboard events to
+    /// the audit trail without a SELECT scan.
+    pub audit_id: i64,
+}
+
+/// Top-level wire struct for `pice audit`. First subcommand is
+/// `Gates`; future audit surfaces (seam findings, cost events) add
+/// variants without needing a new RPC method.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRequest {
+    pub subcommand: AuditSubcommand,
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum AuditSubcommand {
+    Gates {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        feature_id: Option<String>,
+        /// RFC3339 lower bound on `requested_at`. Stored as a string
+        /// (not `DateTime<Utc>`) so the CLI can pass `--since 2026-04-20T00:00:00Z`
+        /// directly without parsing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<String>,
+        /// CSV vs JSON output — orthogonal to the `json` field on
+        /// [`AuditRequest`] because `--csv` and `--json` are mutually
+        /// exclusive human/machine format knobs, not "human vs RPC"
+        /// shapes. Both flags suppress human-friendly `println!`.
+        #[serde(default)]
+        csv: bool,
+    },
 }
 
 #[cfg(test)]
@@ -749,6 +969,11 @@ mod tests {
             ExitJsonStatus::MergedSeamValidationFailed,
             ExitJsonStatus::EvaluationFailed,
             ExitJsonStatus::MetricsPersistFailed,
+            ExitJsonStatus::ReviewGateRejected,
+            ExitJsonStatus::ReviewGateTimeout,
+            ExitJsonStatus::ReviewGateConflict,
+            ExitJsonStatus::ReviewGatePending,
+            ExitJsonStatus::MissingDecision,
         ];
         for variant in &all_variants {
             let serde_output = serde_json::to_string(variant).unwrap();
@@ -759,5 +984,213 @@ mod tests {
                  update the as_str() match arm or the serde rename to stay in sync"
             );
         }
+    }
+
+    /// Phase 6 Task 3: lock the exit-code mapping so a rename or new
+    /// variant can't silently misroute. Exit 3 is NEW in Phase 6 —
+    /// reserved for `ReviewGatePending` and nothing else.
+    #[test]
+    fn exit_code_family_mapping_is_stable() {
+        // Contract/reviewer-reject family → 2
+        assert_eq!(ExitJsonStatus::EvaluationFailed.exit_code(), 2);
+        assert_eq!(ExitJsonStatus::NoContractSection.exit_code(), 2);
+        assert_eq!(ExitJsonStatus::ReviewGateRejected.exit_code(), 2);
+        assert_eq!(ExitJsonStatus::ReviewGateTimeout.exit_code(), 2);
+        // Pause-for-review family → 3 (Phase 6 new exit code)
+        assert_eq!(ExitJsonStatus::ReviewGatePending.exit_code(), 3);
+        // Operational family → 1
+        assert_eq!(ExitJsonStatus::PlanNotFound.exit_code(), 1);
+        assert_eq!(ExitJsonStatus::ReviewGateConflict.exit_code(), 1);
+        assert_eq!(ExitJsonStatus::MissingDecision.exit_code(), 1);
+        assert_eq!(ExitJsonStatus::MetricsPersistFailed.exit_code(), 1);
+        // Exhaustive sweep: every variant's exit code is one of {1, 2, 3}.
+        for v in [
+            ExitJsonStatus::PlanNotFound,
+            ExitJsonStatus::PlanParseFailed,
+            ExitJsonStatus::NoContractSection,
+            ExitJsonStatus::WorkflowValidationFailed,
+            ExitJsonStatus::SeamFloorViolation,
+            ExitJsonStatus::MergedSeamValidationFailed,
+            ExitJsonStatus::EvaluationFailed,
+            ExitJsonStatus::MetricsPersistFailed,
+            ExitJsonStatus::ReviewGateRejected,
+            ExitJsonStatus::ReviewGateTimeout,
+            ExitJsonStatus::ReviewGateConflict,
+            ExitJsonStatus::ReviewGatePending,
+            ExitJsonStatus::MissingDecision,
+        ] {
+            let code = v.exit_code();
+            assert!(
+                (1..=3).contains(&code),
+                "{v:?} returned exit code {code} outside {{1, 2, 3}} — \
+                 extending the surface requires explicit CLI conventions update"
+            );
+        }
+    }
+
+    // ── Phase 6: review-gate + audit RPC roundtrips ──────────────────
+
+    #[test]
+    fn review_gate_list_request_roundtrip() {
+        let req = CommandRequest::ReviewGate(ReviewGateRequest {
+            subcommand: ReviewGateSubcommand::List {
+                feature_id: Some("feat-abc".to_string()),
+            },
+            json: true,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"command\":\"review-gate\""));
+        assert!(wire.contains("\"action\":\"list\""));
+        assert!(wire.contains("\"feature_id\":\"feat-abc\""));
+        let parsed: CommandRequest = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandRequest::ReviewGate(r) => {
+                assert!(r.json);
+                match r.subcommand {
+                    ReviewGateSubcommand::List { feature_id } => {
+                        assert_eq!(feature_id.as_deref(), Some("feat-abc"));
+                    }
+                    _ => panic!("expected List subcommand"),
+                }
+            }
+            _ => panic!("expected ReviewGate variant"),
+        }
+    }
+
+    #[test]
+    fn review_gate_decide_request_roundtrip() {
+        let req = CommandRequest::ReviewGate(ReviewGateRequest {
+            subcommand: ReviewGateSubcommand::Decide {
+                gate_id: "feat:infra:01".to_string(),
+                decision: crate::gate::GateDecision::Reject,
+                reviewer: "jacob".to_string(),
+                reason: Some("blocked on staging deploy".to_string()),
+            },
+            json: false,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"action\":\"decide\""));
+        assert!(wire.contains("\"decision\":\"reject\""));
+        assert!(wire.contains("\"reviewer\":\"jacob\""));
+        let parsed: CommandRequest = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandRequest::ReviewGate(r) => match r.subcommand {
+                ReviewGateSubcommand::Decide {
+                    gate_id,
+                    decision,
+                    reviewer,
+                    reason,
+                } => {
+                    assert_eq!(gate_id, "feat:infra:01");
+                    assert_eq!(decision, crate::gate::GateDecision::Reject);
+                    assert_eq!(reviewer, "jacob");
+                    assert_eq!(reason.as_deref(), Some("blocked on staging deploy"));
+                }
+                _ => panic!("expected Decide"),
+            },
+            _ => panic!("expected ReviewGate"),
+        }
+    }
+
+    #[test]
+    fn audit_gates_request_roundtrip() {
+        let req = CommandRequest::Audit(AuditRequest {
+            subcommand: AuditSubcommand::Gates {
+                feature_id: None,
+                since: Some("2026-04-01T00:00:00Z".to_string()),
+                csv: true,
+            },
+            json: false,
+        });
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(wire.contains("\"command\":\"audit\""));
+        assert!(wire.contains("\"action\":\"gates\""));
+        assert!(wire.contains("\"csv\":true"));
+        let parsed: CommandRequest = serde_json::from_str(&wire).unwrap();
+        match parsed {
+            CommandRequest::Audit(r) => match r.subcommand {
+                AuditSubcommand::Gates {
+                    feature_id,
+                    since,
+                    csv,
+                } => {
+                    assert!(feature_id.is_none());
+                    assert_eq!(since.as_deref(), Some("2026-04-01T00:00:00Z"));
+                    assert!(csv);
+                }
+            },
+            _ => panic!("expected Audit"),
+        }
+    }
+
+    #[test]
+    fn gate_list_response_roundtrip() {
+        let resp = GateListResponse {
+            gates: vec![GateListEntry {
+                id: "feat:infra:01".to_string(),
+                feature_id: "feat".to_string(),
+                layer: "infra".to_string(),
+                trigger_expression: "always".to_string(),
+                requested_at: "2026-04-20T00:00:00Z".to_string(),
+                timeout_at: "2026-04-21T00:00:00Z".to_string(),
+                reject_attempts_remaining: 1,
+            }],
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        let back: GateListResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn gate_decide_response_roundtrip() {
+        use crate::layers::manifest::{LayerStatus, ManifestStatus};
+        let resp = GateDecideResponse {
+            decision: "approve".to_string(),
+            layer_status: LayerStatus::Passed,
+            manifest_status: ManifestStatus::InProgress,
+            reject_attempts_remaining: 2,
+            pending_gates: vec![],
+            audit_id: 42,
+        };
+        let wire = serde_json::to_string(&resp).unwrap();
+        assert!(wire.contains("\"layer_status\":\"passed\""));
+        assert!(wire.contains("\"manifest_status\":\"in-progress\""));
+        let back: GateDecideResponse = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn phase_6_request_dtos_deny_unknown_fields() {
+        // All new DTOs carry `deny_unknown_fields`. Exercise the
+        // rejection so a rename like `gate_id` → `gateId` can't
+        // silently no-op in a user's stale CLI call.
+        let bad = r#"{"subcommand":{"action":"list","bogusField":1},"json":false}"#;
+        let err = serde_json::from_str::<ReviewGateRequest>(bad).unwrap_err();
+        assert!(
+            err.to_string().contains("bogusField") || err.to_string().contains("unknown field")
+        );
+    }
+
+    /// Phase 6 Task 3: lock the gate-halt prefix constants against the
+    /// `is_gate_halt` predicate. Flat-underscore convention (matching
+    /// `sprt_*`) is the agreed style; refactoring to a prefix family
+    /// (`gate_rejected:*`) in a later phase must update ONE file.
+    #[test]
+    fn gate_halt_prefixes_agree_with_is_gate_halt() {
+        assert!(ExitJsonStatus::is_gate_halt(
+            ExitJsonStatus::HALTED_GATE_REJECTED
+        ));
+        assert!(ExitJsonStatus::is_gate_halt(
+            ExitJsonStatus::HALTED_GATE_TIMEOUT_REJECT
+        ));
+        // Adjacent halt families must not be misrouted through the gate
+        // predicate — e.g., a future `gate_approved` halt (there is
+        // none) must not match, nor a `sprt_rejected`.
+        assert!(!ExitJsonStatus::is_gate_halt("sprt_rejected"));
+        assert!(!ExitJsonStatus::is_gate_halt("gate_approved"));
+        assert!(!ExitJsonStatus::is_gate_halt(""));
+        assert!(!ExitJsonStatus::is_gate_halt(
+            ExitJsonStatus::METRICS_PERSIST_FAILED_PREFIX
+        ));
     }
 }

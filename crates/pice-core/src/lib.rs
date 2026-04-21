@@ -33,6 +33,7 @@
 pub mod adaptive;
 pub mod cli;
 pub mod config;
+pub mod gate;
 pub mod layers;
 pub mod paths;
 pub mod plan_parser;

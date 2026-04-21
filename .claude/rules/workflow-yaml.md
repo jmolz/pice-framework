@@ -167,7 +167,8 @@ Complements SPRT when the posterior is neither strongly accepted nor rejected. S
 - Every pass writes `cost_usd` to `cost_events` (see `.claude/rules/metrics.md`)
 - Before spawning pass N+1, the adaptive controller checks if adding the projected cost would exceed `workflow.defaults.budget_usd` (or layer-specific override)
 - If yes, halt with `halted_by: budget` regardless of confidence state
-- The `halted_by` field must be one of: `sprt_confidence_reached` | `sprt_rejected` | `budget` | `max_passes` | `vec_entropy` | `gate_rejected` | `adts_escalation_exhausted`
+- The `halted_by` field must be one of: `sprt_confidence_reached` | `sprt_rejected` | `budget` | `max_passes` | `vec_entropy` | `gate_rejected` | `gate_timeout_reject` | `adts_escalation_exhausted`
+- **(Phase 6+)** `gate_rejected` (manual reject with no retries remaining) and `gate_timeout_reject` (timeout fired with `on_timeout: reject`) are whitelisted halt families. Both map to `LayerStatus::Failed` + exit code 2. Constants live in `pice_core::cli::ExitJsonStatus::HALTED_GATE_REJECTED` / `HALTED_GATE_TIMEOUT_REJECT`; consumers MUST use `ExitJsonStatus::is_gate_halt()` rather than inlining the literal strings.
 
 ### Testing
 
@@ -186,8 +187,17 @@ review:
   trigger: "tier >= 3 OR layer == infrastructure OR confidence < 0.95"
   timeout_hours: 24
   on_timeout: reject        # reject | approve | skip
+  retry_on_reject: 1        # Phase 6: reject-with-retry budget (0 = reject is final)
   notification: stdout      # stdout | slack (v0.3+) | webhook (v0.3+)
 ```
+
+### `retry_on_reject` floor semantics (Phase 6)
+
+`retry_on_reject` is a **raise-only floor**: a user workflow overlay may grant reviewers MORE retries than the project committed to, but never fewer. Rationale: the project baseline is the minimum reviewer budget the team has agreed is sufficient; lowering it locally would silently shrink reviewer scrutiny.
+
+The floor extends to per-layer overrides (`layer_overrides.<layer>.retry_on_reject`): the floor is whichever is higher between the project-level `review.retry_on_reject` and the project-level `layer_overrides.<layer>.retry_on_reject`. A fresh per-layer user override that undercuts either surface is a floor violation.
+
+The counter **persists across re-gate events within a single feature run**: rejecting a layer decrements the counter on the existing `GateEntry` and keeps the same entry; a subsequent cohort-boundary re-fire inherits the decremented count rather than resetting. `approve` and `skip` do NOT consume the reject budget.
 
 ### Gate state machine
 
